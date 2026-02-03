@@ -1,5 +1,3 @@
-# Feb 3 Update: Deprecated; make changes to https://user.git.corp.google.com/jessecarah/accelerate_context_engineering_workshop/ 
-
 # Agent Optimization & Evaluation Workshop
 
 **Google Cloud Accelerate '26**
