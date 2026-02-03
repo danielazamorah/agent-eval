@@ -78,12 +78,12 @@ Step 1: Run Interactions  →  Step 2: Run Evaluation  →  Step 3: Analyze Resu
 
 We use two agents to demonstrate different optimization challenges:
 
-| | Retail AI Agent | Customer Service Agent |
+| | Customer Service Agent | Retail AI Agent |
 |---|---|---|
-| **Problem** | Processes massive datasets. Token bloat, high latency. | Single agent with 12+ tools. Logic errors, hallucinations. |
-| **Conversation Type** | Single-turn pipeline | Multi-turn (back-and-forth) |
-| **Evaluation Mode** | DIY Interactions | ADK User Sim |
-| **Key Metrics** | `general_quality`, `pipeline_integrity` | `trajectory_accuracy`, `tool_use_quality` |
+| **Problem** | Single agent with 12+ tools. Logic errors, hallucinations. | Processes massive datasets. Token bloat, high latency. |
+| **Conversation Type** | Multi-turn (back-and-forth) | Single-turn pipeline |
+| **Evaluation Mode** | ADK User Sim | DIY Interactions |
+| **Key Metrics** | `trajectory_accuracy`, `tool_use_quality` | `general_quality`, `pipeline_integrity` |
 
 ## Context Engineering Principles
 
@@ -159,10 +159,24 @@ cd accelerate
 
 ### 1.4 Configure Agent Credentials
 
+**Customer Service Agent:**
+
+```bash
+cd customer-service
+cp .env.example .env
+```
+
+Edit `.env` and set:
+```
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=us-central1
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
+```
+
 **Retail AI Agent:**
 
 ```bash
-cd retail-ai-location-strategy
+cd ../retail-ai-location-strategy
 cp .env.example .env
 ```
 
@@ -175,20 +189,6 @@ MAPS_API_KEY=your-maps-api-key
 ```
 
 > **Note:** `MAPS_API_KEY` is required for competitor mapping. Get it from [Google Cloud Console](https://console.cloud.google.com/apis/credentials) and enable "Places API".
-
-**Customer Service Agent:**
-
-```bash
-cd ../customer-service
-cp .env.example .env
-```
-
-Edit `.env` and set:
-```
-GOOGLE_CLOUD_PROJECT=your-project-id
-GOOGLE_CLOUD_LOCATION=us-central1
-GOOGLE_GENAI_USE_VERTEXAI=TRUE
-```
 
 ### 1.5 Install Evaluation CLI
 
@@ -220,28 +220,77 @@ To test an agent, we need traffic. We need to capture traces of agent interactio
 
 | Method | When to Use | Agent |
 |--------|-------------|-------|
-| **DIY Interactions** | Single-turn agents, deployed agents, or when you have a golden dataset | Retail AI |
 | **ADK User Sim** | Multi-turn conversations, or when you don't have test data yet | Customer Service |
+| **DIY Interactions** | Single-turn agents, deployed agents, or when you have a golden dataset | Retail AI |
 
 ---
 
-### Step 2A: Retail AI - DIY Interactions
+### Step 2A: Customer Service - ADK User Sim
+
+Writing golden datasets by hand is tedious - you end up needing to hand-write JSON logs or manually simulate multi-turn conversations.
+
+**ADK User Sim solves this.** Instead of writing conversation data, you write *scenarios* - a starting prompt and a conversation plan. The simulator uses another model to act as a user following your plan.
+
+#### 2A.1 Set Up the Simulation
+
+```bash
+cd customer-service
+uv sync
+
+# Create eval set
+uv run adk eval_set create customer_service eval_set_with_scenarios
+
+# Add test scenarios (these define HOW the simulated user behaves)
+uv run adk eval_set add_eval_case customer_service eval_set_with_scenarios \
+  --scenarios_file eval/scenarios/conversation_scenarios.json \
+  --session_input_file eval/scenarios/session_input.json
+```
+
+#### 2A.2 Run the Simulation
+
+```bash
+uv run adk eval customer_service eval_set_with_scenarios
+```
+
+This runs for 2-3 minutes. You'll see simulated conversations in real-time.
+
+> **What's happening:** The simulator reads your scenarios, spawns a "user" model that follows the conversation plan, and interacts with your agent. All traces are captured automatically.
+
+#### 2A.3 Convert Traces to Evaluation Format
+
+The `convert` command takes raw ADK traces and standardizes them for the evaluation step.
+
+```bash
+cd ../evaluation
+
+uv run agent-eval convert \
+  --agent-dir ../customer-service/customer_service \
+  --output-dir ../customer-service/eval/results
+```
+
+Note the output folder path - you'll use it in the next steps.
+
+---
+
+### Step 2B: Retail AI - DIY Interactions
+
+For single-turn agents or when you already have a golden dataset, you can run **DIY Interactions** - querying the agent directly with test inputs.
 
 The Retail AI agent is a single-turn pipeline. We run it against a **Golden Dataset** - a JSON file with test queries and expected behaviors.
 
 > **Note:** This requires **two terminals** - one for the agent server, one for evaluation.
 
-#### 2A.1 Start the Agent (Terminal 1)
+#### 2B.1 Start the Agent (Terminal 1)
 
 ```bash
-cd retail-ai-location-strategy
+cd ../retail-ai-location-strategy
 uv sync
 make dev  # Starts on port 8502
 ```
 
 **Keep this terminal running.** Open a new terminal for the next steps.
 
-#### 2A.2 Run Test Queries (Terminal 2)
+#### 2B.2 Run Test Queries (Terminal 2)
 
 The `interact` command sends queries from your golden dataset to the running agent and collects traces.
 
@@ -261,53 +310,6 @@ This runs for 3-5 minutes. Note the output folder path - you'll use it later.
 
 ---
 
-### Step 2B: Customer Service - ADK User Sim
-
-Writing golden datasets by hand is tedious - you end up needing to hand-write JSON logs or manually simulate multi-turn conversations.
-
-**ADK User Sim solves this.** Instead of writing conversation data, you write *scenarios* - a starting prompt and a conversation plan. The simulator uses another model to act as a user following your plan.
-
-#### 2B.1 Set Up the Simulation
-
-```bash
-cd ../customer-service
-uv sync
-
-# Create eval set
-uv run adk eval_set create customer_service eval_set_with_scenarios
-
-# Add test scenarios (these define HOW the simulated user behaves)
-uv run adk eval_set add_eval_case customer_service eval_set_with_scenarios \
-  --scenarios_file eval/scenarios/conversation_scenarios.json \
-  --session_input_file eval/scenarios/session_input.json
-```
-
-#### 2B.2 Run the Simulation
-
-```bash
-uv run adk eval customer_service eval_set_with_scenarios
-```
-
-This runs for 2-3 minutes. You'll see simulated conversations in real-time.
-
-> **What's happening:** The simulator reads your scenarios, spawns a "user" model that follows the conversation plan, and interacts with your agent. All traces are captured automatically.
-
-#### 2B.3 Convert Traces to Evaluation Format
-
-The `convert` command takes raw ADK traces and standardizes them for the evaluation step.
-
-```bash
-cd ../evaluation
-
-uv run agent-eval convert \
-  --agent-dir ../customer-service/customer_service \
-  --output-dir ../customer-service/eval/results
-```
-
-Note the output folder path.
-
----
-
 ## Workshop Step 3: Run Evaluation
 
 **Goal:** Score the interactions using deterministic and LLM-as-judge metrics.
@@ -318,32 +320,32 @@ Now that we have traces, we score them. The `evaluate` command:
 
 ---
 
-### Step 3A: Evaluate Retail AI
+### Step 3A: Evaluate Customer Service
 
 ```bash
 cd evaluation
 
-# Use the folder path from Step 2A
-RUN_DIR=../retail-ai-location-strategy/eval/results/<your-folder-name>
+# Use the folder path from Step 2A.3
+RUN_DIR=../customer-service/eval/results/<your-folder-name>
 
 uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_app.jsonl \
-  --metrics-files ../retail-ai-location-strategy/eval/metrics/metric_definitions.json \
+  --interaction-file $RUN_DIR/raw/processed_interaction_sim.jsonl \
+  --metrics-files ../customer-service/eval/metrics/metric_definitions.json \
   --results-dir $RUN_DIR \
   --input-label baseline
 ```
 
 ---
 
-### Step 3B: Evaluate Customer Service
+### Step 3B: Evaluate Retail AI
 
 ```bash
-# Use the folder path from Step 2B.3
-RUN_DIR=../customer-service/eval/results/<your-folder-name>
+# Use the folder path from Step 2B.2
+RUN_DIR=../retail-ai-location-strategy/eval/results/<your-folder-name>
 
 uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_sim.jsonl \
-  --metrics-files ../customer-service/eval/metrics/metric_definitions.json \
+  --interaction-file $RUN_DIR/raw/processed_interaction_app.jsonl \
+  --metrics-files ../retail-ai-location-strategy/eval/metrics/metric_definitions.json \
   --results-dir $RUN_DIR \
   --input-label baseline
 ```
@@ -393,14 +395,14 @@ Each metric has:
 
 ---
 
-### Step 4A: Analyze Retail AI
+### Step 4A: Analyze Customer Service
 
 ```bash
-RUN_DIR=../retail-ai-location-strategy/eval/results/<your-folder-name>
+RUN_DIR=../customer-service/eval/results/<your-folder-name>
 
 uv run agent-eval analyze \
   --results-dir $RUN_DIR \
-  --agent-dir ../retail-ai-location-strategy \
+  --agent-dir ../customer-service \
   --location global
 ```
 
@@ -420,6 +422,35 @@ cat $RUN_DIR/eval_summary.json
 
 > **Coming Soon:** A Gradio dashboard for visual comparison of evaluation runs.
 
+**What to Look For (Customer Service):**
+
+| Metric | Typical Value | What It Means |
+|--------|---------------|---------------|
+| `trajectory_accuracy` | ~3.6/5 | Agent sometimes takes wrong paths |
+| `tool_use_quality` | ~5.0/5 | Tools are called correctly when used |
+| `capability_honesty` | ~2.2/5 | Agent may misrepresent what it can do |
+| `cache_efficiency.cache_hit_rate` | ~35% | Some caching, room for improvement |
+| `latency_metrics.total_latency_seconds` | ~40s | Total conversation duration |
+
+---
+
+### Step 4B: Analyze Retail AI
+
+```bash
+RUN_DIR=../retail-ai-location-strategy/eval/results/<your-folder-name>
+
+uv run agent-eval analyze \
+  --results-dir $RUN_DIR \
+  --agent-dir ../retail-ai-location-strategy \
+  --location global
+```
+
+#### Review Results
+
+```bash
+cat $RUN_DIR/gemini_analysis.md
+```
+
 **What to Look For (Retail AI):**
 
 | Metric | Typical Value | What It Means |
@@ -432,35 +463,6 @@ cat $RUN_DIR/eval_summary.json
 | `cache_efficiency.cache_hit_rate` | ~8% | Very low caching - opportunity for optimization |
 
 You can now stop the agent in Terminal 1 (`Ctrl+C`).
-
----
-
-### Step 4B: Analyze Customer Service
-
-```bash
-RUN_DIR=../customer-service/eval/results/<your-folder-name>
-
-uv run agent-eval analyze \
-  --results-dir $RUN_DIR \
-  --agent-dir ../customer-service \
-  --location global
-```
-
-#### Review Results
-
-```bash
-cat $RUN_DIR/gemini_analysis.md
-```
-
-**What to Look For (Customer Service):**
-
-| Metric | Typical Value | What It Means |
-|--------|---------------|---------------|
-| `trajectory_accuracy` | ~3.6/5 | Agent sometimes takes wrong paths |
-| `tool_use_quality` | ~5.0/5 | Tools are called correctly when used |
-| `capability_honesty` | ~2.2/5 | Agent may misrepresent what it can do |
-| `cache_efficiency.cache_hit_rate` | ~35% | Some caching, room for improvement |
-| `latency_metrics.total_latency_seconds` | ~40s | Total conversation duration |
 
 > **Tip:** See [REFERENCE.md - Deterministic Metrics](REFERENCE.md#deterministic-metrics) for a complete glossary of all available metrics.
 
@@ -604,35 +606,6 @@ git checkout optimizations/05-prefix-caching      # Retail AI
 
 ## Quick Reference
 
-### Full Pipeline: Retail AI (DIY Interactions)
-
-```bash
-# Terminal 1: Start agent
-cd retail-ai-location-strategy && make dev
-
-# Terminal 2: Run evaluation
-cd evaluation
-
-uv run agent-eval interact \
-  --app-name app \
-  --questions-file ../retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
-  --base-url http://localhost:8502 \
-  --results-dir ../retail-ai-location-strategy/eval/results
-
-# Use the output folder path
-RUN_DIR=../retail-ai-location-strategy/eval/results/<folder>
-
-uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_app.jsonl \
-  --metrics-files ../retail-ai-location-strategy/eval/metrics/metric_definitions.json \
-  --results-dir $RUN_DIR
-
-uv run agent-eval analyze \
-  --results-dir $RUN_DIR \
-  --agent-dir ../retail-ai-location-strategy \
-  --location global
-```
-
 ### Full Pipeline: Customer Service (ADK User Sim)
 
 ```bash
@@ -663,6 +636,35 @@ uv run agent-eval evaluate \
 uv run agent-eval analyze \
   --results-dir $RUN_DIR \
   --agent-dir ../customer-service \
+  --location global
+```
+
+### Full Pipeline: Retail AI (DIY Interactions)
+
+```bash
+# Terminal 1: Start agent
+cd retail-ai-location-strategy && make dev
+
+# Terminal 2: Run evaluation
+cd evaluation
+
+uv run agent-eval interact \
+  --app-name app \
+  --questions-file ../retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
+  --base-url http://localhost:8502 \
+  --results-dir ../retail-ai-location-strategy/eval/results
+
+# Use the output folder path
+RUN_DIR=../retail-ai-location-strategy/eval/results/<folder>
+
+uv run agent-eval evaluate \
+  --interaction-file $RUN_DIR/raw/processed_interaction_app.jsonl \
+  --metrics-files ../retail-ai-location-strategy/eval/metrics/metric_definitions.json \
+  --results-dir $RUN_DIR
+
+uv run agent-eval analyze \
+  --results-dir $RUN_DIR \
+  --agent-dir ../retail-ai-location-strategy \
   --location global
 ```
 
