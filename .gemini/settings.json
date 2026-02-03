@@ -1,7 +1,6 @@
 {
   "context": {
     "fileName": ["GEMINI.md"],
-    "includeDirectories": true,
     "respectGitignore": true
   }
 }

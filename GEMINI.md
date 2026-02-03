@@ -99,6 +99,32 @@ Save optimization logs to: `[agent]/eval/results/OPTIMIZATION_LOG.md`
 
 ### How to Generate
 
+**Option A: The AI Assist Method (Recommended)**
+
+Use this prompt to have your AI assistant generate the log for you.
+
+```text
+Role: You are a Senior Agent Architect and QA Analyst.
+Objective: Update the OPTIMIZATION_LOG.md file to prove whether the applied strategy worked.
+
+Inputs:
+1. Strategy Applied: [e.g., "Iteration 1: Tool Hardening"]
+2. New Evaluation Data: [Paste metrics from eval_summary.json]
+3. Qualitative Analysis: [Paste key insights from gemini_analysis.md]
+4. Current Log: [Paste current OPTIMIZATION_LOG.md content]
+
+Instructions:
+1. Update Metrics Table: Calculate deltas between previous iteration and this one. Use 🟢/🔴/⚪.
+2. Append Iteration History:
+   - Create a new section for this Iteration.
+   - Optimization Pillar: (Offload, Reduce, Retrieve, Isolate, Cache).
+   - Analysis of Variance: Did quality/trust/scale improve? Quote specific metrics.
+   - Evidence: Extract 1-2 specific conversation examples from the analysis to back up the scores.
+   - Conclusion: One sentence summary of the strategic pivot for the next step.
+```
+
+**Option B: The Manual Method**
+
 **Step 1: Extract ALL metrics from eval_summary.json files**
 
 The `eval_summary.json` contains two metric categories:

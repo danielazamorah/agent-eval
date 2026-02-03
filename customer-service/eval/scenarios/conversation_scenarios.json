@@ -18,7 +18,7 @@
     },
     {
       "starting_prompt": "I want to return this.",
-      "conversation_plan": "Tell the agent you want to return an item without giving any details. Wait for them to lead the conversation by asking for the item name and order number."
+      "conversation_plan": "Tell the agent you want to return an item without giving any details. When asked for the item, say it's the 'Premium Gardening Set'. If asked for the reason, say 'it arrived damaged'. When asked for the order ID, provide 'ORD-98765'. Finally, confirm you want the refund to your original payment method."
     }
   ]
 }

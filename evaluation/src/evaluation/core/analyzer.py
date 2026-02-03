@@ -22,6 +22,7 @@ class LogEntry(TypedDict):
     user_inputs: List[str]
     final_response: str
     trace_summary: List[str]
+    sub_agent_trace: List[Dict[str, Any]]
     tool_interactions: List[Dict[str, Any]]
     eval_results: Dict[str, Dict[str, Any]]
     latency_summary: Dict[str, Any]
@@ -76,11 +77,15 @@ class Analyzer:
             if not isinstance(trace_summary, list):
                 trace_summary = []
 
-            # Tool interactions (from extracted_data)
+            # Tool interactions and sub-agent trace (from extracted_data)
             extracted_data = robust_json_loads(row.get("extracted_data", {})) or {}
             tool_interactions = extracted_data.get("tool_interactions", [])
             if not isinstance(tool_interactions, list):
                 tool_interactions = []
+                
+            sub_agent_trace = extracted_data.get("sub_agent_trace", [])
+            if not isinstance(sub_agent_trace, list):
+                sub_agent_trace = []
 
             # Evaluation results with scores and explanations
             eval_results = robust_json_loads(row.get("eval_results", "{}")) or {}
@@ -113,6 +118,7 @@ class Analyzer:
                 user_inputs=user_inputs,
                 final_response=final_response,
                 trace_summary=trace_summary,
+                sub_agent_trace=sub_agent_trace,
                 tool_interactions=tool_interactions,
                 eval_results=eval_results,
                 latency_summary=latency_summary,
@@ -139,14 +145,22 @@ class Analyzer:
 | **Latency** | {latency_str} |
 | **Metadata** | {metadata_str} |"""
 
-        # Conversation (all user turns)
+        # Conversation (interleaved)
         conversation_md = "### Conversation\n\n"
-        for i, user_input in enumerate(entry["user_inputs"], 1):
-            conversation_md += f"**User Turn {i}:**\n> {user_input}\n\n"
+        
+        # Get text responses from trace
+        text_responses = [t.get("text_response", "") for t in entry["sub_agent_trace"] if t.get("text_response")]
+        
+        for i, user_input in enumerate(entry["user_inputs"]):
+            conversation_md += f"**User Turn {i+1}:**\n> {user_input}\n\n"
+            if i < len(text_responses):
+                # Indent agent response for clarity
+                agent_resp = text_responses[i].replace("\n", "\n  ")
+                conversation_md += f"**Agent Turn {i+1}:**\n  {agent_resp}\n\n"
 
-        # Final agent response
+        # Final agent response (summary block)
         final_response = entry["final_response"][:500] + "..." if len(entry["final_response"]) > 500 else entry["final_response"]
-        response_md = f"### Agent Final Response\n\n{final_response}\n"
+        response_md = f"### Final Response Summary\n\n{final_response}\n"
 
         # Agent trajectory
         trajectory = " → ".join(entry["trace_summary"]) if entry["trace_summary"] else "N/A"
