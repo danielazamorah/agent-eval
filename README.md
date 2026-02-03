@@ -129,7 +129,6 @@ Run these commands to verify your setup:
 ```bash
 python3 --version  # Must be 3.10, 3.11, or 3.12 (NOT 3.13+)
 uv --version       # Must be installed
-gcloud auth list   # Must show authenticated account
 ```
 
 **Missing something?**
@@ -138,16 +137,32 @@ gcloud auth list   # Must show authenticated account
 |---------|------------|
 | Python 3.10-3.12 | Install from [python.org](https://www.python.org/downloads/) |
 | uv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| gcloud auth | `gcloud auth login && gcloud auth application-default login` |
 
-### 1.2 Set Your Project
+### 1.2 Authenticate with Google Cloud (Important!)
+
+This step is **critical** for the evaluation pipeline to work:
+
+```bash
+# Check if you're already authenticated
+gcloud auth list
+
+# If not authenticated, login:
+gcloud auth login
+
+# Set up Application Default Credentials (ADC) - REQUIRED for Vertex AI
+gcloud auth application-default login
+```
+
+> **Why both commands?** `gcloud auth login` authenticates the CLI. `gcloud auth application-default login` creates credentials that Python libraries (like the evaluation CLI) use to call Vertex AI APIs. **You need both.**
+
+### 1.3 Set Your Project
 
 ```bash
 export GOOGLE_CLOUD_PROJECT="your-project-id"
 gcloud auth application-default set-quota-project $GOOGLE_CLOUD_PROJECT
 ```
 
-### 1.3 Clone and Verify
+### 1.4 Clone and Verify
 
 ```bash
 git clone <repo-url>
@@ -157,7 +172,7 @@ cd accelerate
 ./setup_workshop.sh
 ```
 
-### 1.4 Configure Agent Credentials
+### 1.5 Configure Agent Credentials
 
 **Customer Service Agent:**
 
@@ -190,7 +205,7 @@ MAPS_API_KEY=your-maps-api-key
 
 > **Note:** `MAPS_API_KEY` is required for competitor mapping. Get it from [Google Cloud Console](https://console.cloud.google.com/apis/credentials) and enable "Places API".
 
-### 1.5 Install Evaluation CLI
+### 1.6 Install Evaluation CLI
 
 ```bash
 cd ../evaluation
@@ -198,6 +213,19 @@ uv sync
 ```
 
 **Checkpoint:** You should see no errors. You're ready for the next step.
+
+---
+
+### 1.7 (Optional) Set Up AI Assistant
+
+For faster iteration during the workshop, consider setting up an AI coding assistant:
+
+| Tool | Install | Why Use It |
+|------|---------|------------|
+| **Gemini CLI** | `npm install -g @google/gemini-cli` | Compare eval results, generate optimization logs |
+| **Claude Code** | `npm install -g @anthropic-ai/claude-code` | Code exploration, debugging |
+
+> **Setup details:** See [REFERENCE.md - AI Assistant Setup](REFERENCE.md#ai-assistant-setup-optional) for full configuration with Vertex AI.
 
 ---
 
