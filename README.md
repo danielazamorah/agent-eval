@@ -147,7 +147,13 @@ Run these commands to verify your setup:
 ```bash
 python3 --version  # Must be 3.10, 3.11, or 3.12 (NOT 3.13+)
 uv --version       # Must be installed
+gcloud --version   # Must be installed
 ```
+
+**Missing gcloud?**
+Install the Google Cloud SDK: [cloud.google.com/sdk/docs/install](https://cloud.google.com/sdk/docs/install)
+
+After installation, run `gcloud init` to configure your default project and region.
 
 **Missing uv?**
 ```bash
