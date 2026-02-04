@@ -136,7 +136,7 @@ We use two agents to demonstrate different optimization challenges:
 | M2 | `02-context-compaction` | Context rot → Summarization |
 | M3 | `03-functional-isolation` | Wrong tool selection → Sub-agents |
 | M4 | `04-offload-and-reduce` | Token bloat → Offload to code |
-| M5 | `05-prefix-caching` | High latency → Prefix caching |
+| M5 | `05-circuit-breaker` | Hallucinated data → Fail-fast validation |
 
 ---
 
@@ -566,7 +566,7 @@ We'll work through the branches in order. Each branch builds on concepts from th
 | 2 | `optimizations/02-context-compaction` | Customer Service | Context Compaction |
 | 3 | `optimizations/03-functional-isolation` | Customer Service | Functional Isolation (Sub-Agents) |
 | 4 | `optimizations/04-offload-and-reduce` | Retail AI | Offload & Reduce |
-| 5 | `optimizations/05-prefix-caching` | Retail AI | Prefix Caching |
+| 5 | `optimizations/05-circuit-breaker` | Retail AI | Circuit Breaker |
 
 ---
 
@@ -617,7 +617,7 @@ cat README.md
 ### Continue with Branch 05: Prefix Caching
 
 ```bash
-git checkout optimizations/05-prefix-caching
+git checkout optimizations/05-circuit-breaker
 cat README.md
 ```
 
@@ -633,7 +633,7 @@ git checkout optimizations/01-tool-definition    # Customer Service
 git checkout optimizations/02-context-compaction  # Customer Service
 git checkout optimizations/03-functional-isolation # Customer Service
 git checkout optimizations/04-offload-and-reduce  # Retail AI
-git checkout optimizations/05-prefix-caching      # Retail AI
+git checkout optimizations/05-circuit-breaker      # Retail AI
 ```
 
 ---
