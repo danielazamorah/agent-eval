@@ -28,22 +28,9 @@ If you don't already have a GCP project with Vertex AI enabled, use **Argolis** 
    - Choose a descriptive name (e.g., `accelerate-workshop-yourname`)
    - Select your organization
 
-3. **Enable required APIs:**
-   ```bash
-   # Vertex AI (required for both agents and evaluation)
-   gcloud services enable aiplatform.googleapis.com --project=YOUR_PROJECT_ID
-
-   # Places API (required for Retail AI competitor mapping)
-   gcloud services enable places.googleapis.com --project=YOUR_PROJECT_ID
-   ```
-
-4. **Set environment variables:**
-   ```bash
-   export GOOGLE_CLOUD_PROJECT="your-argolis-project-id"
-   export GOOGLE_CLOUD_LOCATION="us-central1"
-   ```
-
 > **Important:** Argolis projects have quotas and are intended for demos/testing. For production workloads, use a standard GCP project.
+>
+> **Note:** The API enablement and environment setup happen in [Part 2: Workshop Steps](#part-2-workshop-steps) after you install gcloud.
 
 ---
 
@@ -135,6 +122,7 @@ We use two agents to demonstrate different optimization challenges:
 | M1 | `01-tool-definition` | Tool errors → Stricter schemas |
 | M2 | `02-context-compaction` | Context rot → Summarization |
 | M3 | `03-functional-isolation` | Wrong tool selection → Sub-agents |
+| M3a | `03-functional-isolation-v2` | Sub-agents → Stateless routing |
 | M4 | `04-offload-and-reduce` | Token bloat → Offload to code |
 | M5 | `05-circuit-breaker` | Hallucinated data → Fail-fast validation |
 
@@ -192,11 +180,18 @@ gcloud auth application-default login
 
 > **Why both commands?** `gcloud auth login` authenticates the CLI. `gcloud auth application-default login` creates credentials that Python libraries (like the evaluation CLI) use to call Vertex AI APIs. **You need both.**
 
-### 1.3 Set Your Project
+### 1.3 Set Your Project and Enable APIs
 
 ```bash
 export GOOGLE_CLOUD_PROJECT="your-project-id"
+export GOOGLE_CLOUD_LOCATION="us-central1"
 gcloud auth application-default set-quota-project $GOOGLE_CLOUD_PROJECT
+
+# Enable required APIs
+gcloud services enable aiplatform.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
+
+# Places API (required for Retail AI competitor mapping)
+gcloud services enable places.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
 ```
 
 ### 1.4 Clone and Verify
@@ -564,7 +559,8 @@ We'll work through the branches in order. Each branch builds on concepts from th
 |-------|--------|-------|--------------|
 | 1 | `optimizations/01-tool-definition` | Customer Service | Tool Schema Hardening |
 | 2 | `optimizations/02-context-compaction` | Customer Service | Context Compaction |
-| 3 | `optimizations/03-functional-isolation` | Customer Service | Functional Isolation (Sub-Agents) |
+| 3 | `optimizations/03-functional-isolation` | Customer Service | Functional Isolation |
+| 3a | `optimizations/03-functional-isolation-v2` | Customer Service | Functional Isolation (Iteration) |
 | 4 | `optimizations/04-offload-and-reduce` | Retail AI | Offload & Reduce |
 | 5 | `optimizations/05-circuit-breaker` | Retail AI | Circuit Breaker |
 
@@ -609,6 +605,13 @@ git checkout optimizations/03-functional-isolation
 cat README.md
 ```
 
+After exploring branch 03, continue to the iteration:
+
+```bash
+git checkout optimizations/03-functional-isolation-v2
+cat README.md
+```
+
 ---
 
 ### Continue with Branch 04: Offload & Reduce
@@ -635,11 +638,12 @@ If you want to jump ahead or focus on a specific optimization:
 
 ```bash
 # Jump to any branch
-git checkout optimizations/01-tool-definition    # Customer Service
-git checkout optimizations/02-context-compaction  # Customer Service
-git checkout optimizations/03-functional-isolation # Customer Service
-git checkout optimizations/04-offload-and-reduce  # Retail AI
-git checkout optimizations/05-circuit-breaker      # Retail AI
+git checkout optimizations/01-tool-definition       # Customer Service
+git checkout optimizations/02-context-compaction    # Customer Service
+git checkout optimizations/03-functional-isolation  # Customer Service
+git checkout optimizations/03-functional-isolation-v2  # Customer Service (iteration)
+git checkout optimizations/04-offload-and-reduce    # Retail AI
+git checkout optimizations/05-circuit-breaker       # Retail AI
 ```
 
 ---
