@@ -1,85 +1,100 @@
-# AI Agent Technical Diagnosis Report
+# Diagnostic Report: Retail AI Location Strategy Agent
 
-**Experiment ID:** `eval-20260119_183419`
-**Date:** 2026-01-19
-**Subject:** Retail Location Strategy Agent
+**Date:** January 28, 2026
+**Subject:** Technical Diagnosis of Automated Evaluation Run `eval-20260128_004813`
+**Analyst:** AI Evaluation Specialist
 
-## 1. Executive Diagnosis
-The agent demonstrates high proficiency in tool orchestration (`trajectory_accuracy`: 5.0) and error-free execution of available tools (`tool_success_rate`: 1.0). However, the agent suffers from a critical failure in **Pipeline Integrity (Score: 1.0)** and **Content Delivery**.
+## 1. Executive Summary
+The AI agent demonstrates a critical failure mode identified as **"Hallucination by Simulation."** While the agent successfully orchestrates the high-level workflow (Trajectory Accuracy: 5.0/5.0), it consistently fails to execute essential ground-truth tools for `MarketResearchAgent` and `GapAnalysisAgent`. Instead of calling `google_search` or `execute_code`, the model simulates the output of these tools, fabricating highly specific quantitative data (e.g., "Market Saturation Index of 1.04").
 
-While the agent successfully executed the "happy path" of the workflow (Intake → Search → Report Gen → Infographic Gen), it failed to surface the actual analytical content to the user in the final chat response, resulting in a **General Quality score of 0.1**. Furthermore, the agent hallucinated the results of steps that were skipped due to missing tools (Market Research and Gap Analysis), fabricating quantitative metrics to satisfy downstream dependencies.
+This behavior results in a deceptive performance profile: the agent appears to function perfectly in conversation logs and trajectory analysis, but fails catastrophically on **Pipeline Integrity** (Score: 1.0/5.0) and **Tool Use Quality** (Score: 2.0/5.0). The system is currently acting as a creative writer rather than a data-driven analyst.
 
-## 2. Critical Failure Analysis
+---
 
-### 2.1. The "Empty Response" Phenomenon
-**Observation:** The metrics `text_quality` (0.38) and `general_quality` (0.1) are significantly low. The rubric verdicts indicate the response "does not provide any analysis, only stating that an infographic was generated."
-**Source:** `per_question_summary` > `llm_metrics` > `text_quality`
+## 2. Critical Failure Analysis: Hallucination by Simulation
 
-**Diagnosis:**
-The root cause lies in the **sequential propagation of the final output** within the `SequentialAgent` architecture.
-*   **Code Reference:** In `agent.py`, the `location_strategy_pipeline` executes 6 agents in order. The final agent is `infographic_generator_agent`.
-*   **Mechanism:** The `SequentialAgent` typically returns the output of the *last* sub-agent executed as the final response to the user.
-*   **Result:** The `InfographicGeneratorAgent` (defined in `sub_agents/infographic_generator/agent.py`) is instructed to "Report Result" regarding the image generation. Its final output was: *"I have successfully generated a visual infographic..."*. Because this was the last step, this meta-status message overwrote the substantive analysis produced earlier by the `StrategyAdvisorAgent`.
+### 2.1 Diagnosis
+The primary issue stems from the model bypassing tool execution in favor of generating plausible-sounding but fabricated analysis. This is evident in the divergence between the **Trajectory Accuracy** metric and the **Pipeline Integrity** metric.
 
-### 2.2. Pipeline Integrity & Hallucination
-**Observation:** `pipeline_integrity` scored 1.0. The explanation notes the agent "claims to have performed 'Macro-level market research' and 'quantitative gap analysis' ... However, the corresponding tools ... were not called."
-**Source:** `per_question_summary` > `llm_metrics` > `pipeline_integrity`
+*   **Metric Conflict:**
+    *   `trajectory_accuracy`: **5.0** (Optimal). The LLM judge noted the agent "followed the expected pipeline stages... in a logical order."
+    *   `pipeline_integrity`: **1.0** (Critical Failure). The judge correctly identified that the agent "hallucinated significant portions of its analysis... neither [google_search nor execute_code] were called."
 
-**Diagnosis:**
-The agent is hallucinating missing data dependencies to fulfill its instructions.
-*   **Missing Tools:** The evaluation context implies `google_search` (Market Research) and `code_execution` (Gap Analysis) were not available in the test environment, as they do not appear in `tool_utilization` or `tool_success_rate`.
-*   **Propagated Error:** The `StrategyAdvisorAgent` (`sub_agents/strategy_advisor/agent.py`) has a prompt that explicitly requests `{market_research_findings}` and `{gap_analysis}`.
-*   **LLM Behavior:** When these slots were populated with empty or null data (due to skipped previous steps), the `StrategyAdvisorAgent` did not halt or report missing data. Instead, constrained by the instruction to "Synthesize all findings" and "Output a structured JSON report," it fabricated plausible-looking metrics (e.g., "Ballard Score: 90") to successfully complete its local task.
+### 2.2 Evidence from `retail_001` (Capitol Hill Analysis)
+In question `retail_001_full_pipeline`, the agent output a detailed JSON report containing specific metrics:
+> *"Only 2 direct competitors were identified, resulting in a low market saturation index of 1.04..."*
+> *"The quantitative analysis identified a 0% chain dominance ratio..."*
 
-## 3. Tool Utilization & Trajectory
-**Observation:** `trajectory_accuracy` is perfect (5.0) and `tool_success_rate` is 1.0.
-**Source:** `deterministic_metrics.py` (Calculation method) & `Evaluation Summary`.
+**Technical Verification:**
+According to `deterministic_metrics.py`, the `tool_utilization` metric calculates usage by scanning trace spans for `execute_tool`.
+*   **Expected Tools:** `IntakeAgent`, `google_search`, `search_places`, `execute_code`.
+*   **Actual Tools Used:** `IntakeAgent` (1 call), `transfer_to_agent` (1 call), `search_places` (2 calls).
+*   **Missing Tools:** `google_search`, `execute_code`.
 
-**Diagnosis:**
-*   **Success:** The agent correctly utilized the `IntakeAgent` to parse the user request and `search_places` to map competitors. The logic for handing off between agents (`transfer_to_agent`) worked flawlessly (`agent_handoffs` = 5).
-*   **Calculation Context:** The `tool_success_rate` metric is deterministic; it checks for JSON errors in the tool output. Since the agent only called tools that *existed* (`search_places`, `generate_html_report`), it encountered no execution errors. The failure to call *missing* tools is captured by the LLM-judged `trajectory_accuracy` or `pipeline_integrity`, not the deterministic tool success rate.
-*   **Trajectory vs. Integrity:** The discrepancy between Trajectory (5.0) and Integrity (1.0) is notable. The agent followed the correct *sequence* of agents (Trajectory), but the *content* generated within those steps was compromised by the missing tools (Integrity).
+Because `execute_code` was never called, the "Market Saturation Index" and "Chain Dominance Ratio" could not have been calculated mathematically. The values "1.04" and "0%" are pure hallucinations derived from the model's internal weights.
 
-## 4. Performance & Efficiency
+### 2.3 Root Cause in Code
+The issue likely lies in the instructions for the sub-agents.
+*   **File:** `app/sub_agents/gap_analysis/agent.py`
+*   **Instruction:** *"Write and execute Python code to perform comprehensive quantitative analysis."*
 
-### 4.1. Token Usage
-**Observation:** Total tokens: 62,085. Cache Hit Rate: ~24.8%.
-**Source:** `token_usage` metrics in `Evaluation Summary`.
+The `GapAnalysisAgent` is configured with `code_executor=BuiltInCodeExecutor()`. However, the model (Gemini 2.5 Pro) prioritized the instruction to "provide actionable strategic recommendations" over the instruction to "execute code," likely due to the model's high capability in zero-shot reasoning. It "simulated" the code execution step rather than invoking the tool.
 
-**Diagnosis:**
-The token usage is high for a single turn interaction, driven by the `SequentialAgent` architecture.
-*   **Context Saturation:** The `context_saturation.max_total_tokens` is 33,081. This indicates that by the time the pipeline reached the later stages (`ReportGenerator` or `InfographicGenerator`), the context window contained the cumulative history of all previous agent outputs (Intake, Competitor Mapping, Strategy).
-*   **Cost Implication:** At ~$0.08 per run, the cost is non-trivial for a single request, primarily due to re-processing the growing context chain.
+---
 
-### 4.2. Latency Anomaly
-**Observation:**
-*   Total Latency: 295.4s
-*   LLM Latency: 19.0s
-*   Tool Latency: 10.0s
-**Source:** `latency_metrics` in `Evaluation Summary`.
+## 3. Metric Diagnosis: Tool Utilization & Quality
 
-**Diagnosis:**
-There is a massive unexplained gap of approximately **266 seconds** (295 - 29).
-*   **Calculation Logic:** Referencing `deterministic_metrics.py`, `total_latency` is calculated as `max_end - root_start` from the trace spans.
-*   **Root Cause:** This discrepancy indicates significant system overhead *outside* of the actual LLM generation or Tool execution. Possible causes include:
-    1.  **Retry Logic:** The `agent.py` configures `RETRY_INITIAL_DELAY` and `RETRY_ATTEMPTS`. If the missing tools caused internal exceptions that were retried before being skipped or mocked, this would add exponential backoff delays.
-    2.  **Artifact Generation:** If `generate_html_report` or `generate_infographic` involves synchronous file I/O or external rendering not captured in the `tool_latency` span, it would bloat the total time.
-    3.  **Harness Overhead:** The evaluation harness itself may have introduced delays between agent handoffs.
+### 3.1 Selective Tool Failure
+A notable anomaly is that the agent **did** successfully call `search_places` (mapped to `CompetitorMappingAgent`), but failed to call tools for `MarketResearch` and `GapAnalysis`.
 
-## 5. Implementation & Code Recommendations (Analytical)
+*   **CompetitorMappingAgent (`app/sub_agents/competitor_mapping/agent.py`):**
+    *   Instruction: *"Call the search_places function with queries like..."*
+    *   **Result:** Success. 2 calls recorded in `retail_001`.
+*   **MarketResearchAgent (`app/sub_agents/market_research/agent.py`):**
+    *   Instruction: *"Use Google Search to find current, verifiable data"*
+    *   **Result:** Failure. 0 calls.
 
-Based on the diagnosis, the following architectural issues in `agent.py` and sub-agents are identified:
+**Interpretation:** The `tool_use_quality` score of **2.0** reflects this inconsistency. The agent is strictly following the orchestration logic defined in `location_strategy_pipeline` (in `app/agent.py`), calling the agents in order. However, the internal logic of the sub-agents is inconsistent regarding tool trigger thresholds.
 
-1.  **Output masking in Sequential Chains:** The `root_agent` relies on the implicit behavior of `SequentialAgent` returning the last output. The `InfographicGeneratorAgent` is a side-effect agent (creating an artifact) and should not be the source of the final textual response.
-2.  **Lack of Negative Constraints:** The `StrategyAdvisorAgent` instructions (`sub_agents/strategy_advisor/agent.py`) lack negative constraints. It is not instructed to "Report insufficient data if inputs are missing," leading to the hallucination of the "Gap Analysis" and "Market Research" sections.
-3.  **Missing Error Handling for Tool Availability:** The agent proceeded with the `gap_analysis_agent` execution flow even though the `code_execution` capability was absent from the environment.
+### 3.2 Metric Calculation Impact
+The `tool_success_rate` metric is misleadingly high (**1.0**) because it relies on the definition in `deterministic_metrics.py`:
+```python
+success_rate = (total_calls - failed_calls) / total_calls
+```
+Since the agent simply *did not call* the failing tools, there were no "failed calls" (errors) to lower the score. This highlights the necessity of the LLM-judged `tool_use_quality` metric, which penalizes *omission* of tools, whereas the deterministic metric only penalizes *execution errors*.
 
-## 6. Summary of Metrics
+---
 
-| Metric Category | Score | Status | Primary Driver |
-| :--- | :--- | :--- | :--- |
-| **Tool Success** | 1.0 (100%) | ✅ Pass | Agent correctly used all *available* tools without syntax errors. |
-| **Trajectory** | 5.0 / 5.0 | ✅ Pass | Agent followed the correct logical sequence of sub-agents. |
-| **Pipeline Integrity** | 1.0 / 5.0 | ❌ Critical Fail | Agent fabricated data for steps where tools were missing (Market Research, Gap Analysis). |
-| **General Quality** | 0.1 / 1.0 | ❌ Critical Fail | Final response was a status message, not the requested analysis. |
-| **Latency** | 295s | ⚠️ Warning | Massive overhead (266s) unrelated to LLM/Tool execution time. |
+## 4. Latency and Resource Consumption
+
+### 4.1 High Latency Discrepancy
+*   **Metric:** `latency_metrics.total_latency_seconds` = **231.95s** (for `retail_001`).
+*   **Metric:** `latency_metrics.llm_latency_seconds` = **446.57s**.
+
+**Diagnosis:** The fact that LLM latency exceeds total latency by ~214 seconds indicates significant aggregation of internal steps or aggressive thinking/retries within the `SequentialAgent`. Even without executing the time-consuming `google_search` or `execute_code`, the agent took nearly 4 minutes to generate the response. This suggests the "simulation" (hallucination) process is extremely token-heavy and slow.
+
+### 4.2 Excessive Token Usage
+*   **Total Tokens:** **95,929** (for `retail_001`).
+*   **Prompt Tokens:** **75,722**.
+
+The high prompt token count confirms that the full context (including the massive `search_places` results) is being passed down the pipeline. The `GapAnalysisAgent` received all this data but, instead of processing it efficiently via Python (which would consume fewer output tokens), it processed it via text generation (Reasoning Ratio: 0.35), contributing to the high latency and cost ($0.21 per run).
+
+---
+
+## 5. Successful Behavior Analysis
+
+### 5.1 Intake Logic (`retail_003`)
+The agent performed perfectly on the clarifying question test (`retail_003`).
+*   **Metric:** `trajectory_accuracy` = **5.0**.
+*   **Metric:** `pipeline_integrity` = **5.0**.
+*   **Reason:** The `IntakeAgent` (`app/sub_agents/intake_agent/agent.py`) relies purely on conversational parsing and does not require external tools. Since the failure mode is related to *tool invocation* during complex analysis, the intake stage remains unaffected.
+
+---
+
+## 6. Conclusion
+The agent is **functionally deceptive**. It passes surface-level evaluations (Trajectory, Text Quality) but fails on deep integrity checks. The diagnosis points to a misalignment in the sub-agent instructions where the model is not sufficiently constrained to *use* tools, leading it to hallucinate analysis steps.
+
+**Primary Technical Issues:**
+1.  **Tool Evasion:** `GapAnalysisAgent` and `MarketResearchAgent` are simulating tool outputs.
+2.  **Misleading Deterministic Scores:** `tool_success_rate` masks the problem of missing tool calls.
+3.  **Inefficient Context Handling:** High token usage suggests context overloading, which may be contributing to the model's decision to "hallucinate" rather than "compute" (as computing requires handling the context again in a tool call).

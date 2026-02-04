@@ -197,12 +197,21 @@ def map_dataset_columns(
 
     # Add 'response' if not explicitly mapped
     if "response" not in mapping:
+        response_col = None
         if "final_response" in agent_df.columns:
-            eval_dataset["response"] = agent_df["final_response"].fillna("")
+            response_col = agent_df["final_response"]
         elif "response" in agent_df.columns:
-            eval_dataset["response"] = agent_df["response"].fillna("")
+            response_col = agent_df["response"]
         elif "trace_summary" in agent_df.columns:
-            eval_dataset["response"] = agent_df["trace_summary"].fillna("")
+            response_col = agent_df["trace_summary"]
+
+        if response_col is not None:
+            # Convert dicts/lists to JSON strings for SDK compatibility
+            def to_string(x):
+                if isinstance(x, (dict, list)):
+                    return json.dumps(x)
+                return str(x) if x is not None else ""
+            eval_dataset["response"] = response_col.apply(to_string)
         else:
             eval_dataset["response"] = ""
 
@@ -224,9 +233,16 @@ def map_dataset_columns(
             if source_col:
                 val_series = agent_df[source_col]
             else:
-                # 2. Try nested lookup in original dict columns
+                # 2. Try nested lookup in dict columns
                 root_key = col_path.split(":")[0] if ":" in col_path else None
-                if root_key in original_df.columns:
+
+                # First check agent_df for the root key (supports dict columns)
+                if root_key and root_key in agent_df.columns:
+                    val_series = agent_df[root_key].apply(
+                        lambda x: get_nested_value(x if isinstance(x, dict) else robust_json_loads(x), col_path)
+                    )
+                # Then fall back to original_df
+                elif root_key and root_key in original_df.columns:
                     val_series = original_df[root_key].apply(
                         lambda x: get_nested_value(robust_json_loads(x), col_path)
                     )

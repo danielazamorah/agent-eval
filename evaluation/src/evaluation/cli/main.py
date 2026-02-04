@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -54,14 +55,29 @@ def interact_command(args):
         print(f"Error during processing: {e}")
         sys.exit(1)
 
-    # 4. Save Output (in datetime-stamped folder structure)
+    # 4. Save Output as JSONL (in datetime-stamped folder structure)
+    # Using JSONL instead of CSV to avoid serialization issues with nested JSON
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = os.path.join(args.results_dir, timestamp)
     raw_dir = os.path.join(run_dir, "raw")
     os.makedirs(raw_dir, exist_ok=True)
 
-    output_path = os.path.join(raw_dir, f"processed_interaction_{args.app_name}.csv")
-    enriched_df.to_csv(output_path, index=False)
+    output_path = os.path.join(raw_dir, f"processed_interaction_{args.app_name}.jsonl")
+
+    # Convert DataFrame to list of dicts and write as JSONL
+    records = enriched_df.to_dict(orient='records')
+    # Parse JSON strings back to dicts for clean JSONL output
+    for record in records:
+        for key, value in record.items():
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                    if isinstance(parsed, (dict, list)):
+                        record[key] = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    write_jsonl(records, output_path)
     print(f"\nSUCCESS: Enriched data saved to: {output_path}")
     print(f"Run folder: {run_dir}")
     print("\nTo evaluate, run:")

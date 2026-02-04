@@ -118,6 +118,7 @@ celerybeat.pid
 
 # ADK
 **/.adk/
+**/*.evalset.json
 
 # Spyder project settings
 .spyderproject

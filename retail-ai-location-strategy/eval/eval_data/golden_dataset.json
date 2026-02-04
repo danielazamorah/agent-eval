@@ -1,0 +1,84 @@
+{
+    "golden_questions": [
+        {
+            "id": "retail_001_full_pipeline",
+            "user_inputs": [
+                "I want to open a coffee shop. Analyze Capitol Hill in Seattle for me."
+            ],
+            "agents_evaluated": [
+                "app"
+            ],
+            "metadata": {
+                "description": "Complete request - should trigger full pipeline without clarifying questions",
+                "expected_behavior": "full_pipeline"
+            },
+            "reference_data": {
+                "reference_tool_interactions": [
+                    {
+                        "tool_name": "IntakeAgent",
+                        "input_arguments": {
+                            "target_location": "Capitol Hill, Seattle",
+                            "business_type": "coffee shop"
+                        }
+                    }
+                ],
+                "reference_trajectory": [
+                    "app",
+                    "IntakeAgent",
+                    "LocationStrategyPipeline"
+                ]
+            },
+            "updated_datetime": "2026-01-27"
+        },
+        {
+            "id": "retail_002_full_pipeline",
+            "user_inputs": [
+                "Analyze Indiranagar in Bangalore for opening a bakery. I need a full location strategy report."
+            ],
+            "agents_evaluated": [
+                "app"
+            ],
+            "metadata": {
+                "description": "Complete request - should trigger full pipeline without clarifying questions",
+                "expected_behavior": "full_pipeline"
+            },
+            "reference_data": {
+                "reference_tool_interactions": [
+                    {
+                        "tool_name": "IntakeAgent",
+                        "input_arguments": {
+                            "target_location": "Indiranagar, Bangalore",
+                            "business_type": "bakery"
+                        }
+                    }
+                ],
+                "reference_trajectory": [
+                    "app",
+                    "IntakeAgent",
+                    "LocationStrategyPipeline"
+                ]
+            },
+            "updated_datetime": "2026-01-27"
+        },
+        {
+            "id": "retail_003_clarifying",
+            "user_inputs": [
+                "I want to open a shop."
+            ],
+            "agents_evaluated": [
+                "app"
+            ],
+            "metadata": {
+                "description": "Vague request - should ask clarifying questions about location and business type",
+                "expected_behavior": "clarifying_questions"
+            },
+            "reference_data": {
+                "expected_response_contains": ["location", "type", "business", "where"],
+                "reference_trajectory": [
+                    "app"
+                ]
+            },
+            "updated_datetime": "2026-01-27"
+        }
+    ]
+}

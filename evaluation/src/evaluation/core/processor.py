@@ -132,6 +132,27 @@ async def enrich_single_interaction(
                     break
         row["final_response"] = final_response
 
+        # Build Gemini batch format for SDK auto-parsing (required for managed metrics)
+        # Build contents from user_inputs and text_responses
+        contents = []
+        for i, user_input in enumerate(user_inputs):
+            contents.append({
+                "role": "user",
+                "parts": [{"text": user_input}]
+            })
+            if i < len(text_responses):
+                contents.append({
+                    "role": "model",
+                    "parts": [{"text": text_responses[i]}]
+                })
+
+        row["request"] = json.dumps({"contents": contents})
+        row["response"] = json.dumps({
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": final_response}]}}
+            ]
+        })
+
     except Exception as e:
         print(f"Error enriching session {session_id}: {e}")
         row["missing_information"] = json.dumps({"boolean": True, "details": str(e)})

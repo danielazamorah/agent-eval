@@ -1,9 +1,0 @@
-{
-  "_documentation": "Single scenario for quick testing. Use this with eval_set_single.evalset.json",
-  "scenarios": [
-    {
-      "starting_prompt": "I want to open a coffee shop in Seattle, WA. Please analyze the location viability.",
-      "conversation_plan": "Request a location analysis for a coffee shop in Seattle. Expect the agent to research the market, find competitors, and provide a strategic recommendation."
-    }
-  ]
-}

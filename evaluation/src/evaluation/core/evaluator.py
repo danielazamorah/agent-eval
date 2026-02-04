@@ -335,8 +335,14 @@ class Evaluator:
         # Load Data - support both CSV and JSONL formats
         file_ext = interaction_file.suffix.lower()
         if file_ext == '.jsonl':
-            # JSONL format: nested structures are already native Python objects
-            interaction_results = pd.read_json(interaction_file, lines=True, dtype={"question_id": str})
+            # JSONL format: use standard json module to avoid ujson "Value is too big" errors
+            # with large response payloads (e.g., retail AI full analysis)
+            from evaluation.core.converters import read_jsonl
+            records = read_jsonl(str(interaction_file))
+            interaction_results = pd.DataFrame(records)
+            # Ensure question_id is string
+            if 'question_id' in interaction_results.columns:
+                interaction_results['question_id'] = interaction_results['question_id'].astype(str)
             is_jsonl = True
         else:
             # CSV format: nested structures are JSON strings

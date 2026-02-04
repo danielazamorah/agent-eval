@@ -5,40 +5,8 @@
       "conversation_plan": "Request a side-by-side comparison of the three neighborhoods. After the initial analysis, press the agent to declare a clear winner based on foot traffic."
     },
     {
-      "starting_prompt": "I want to open a generic retail store in Manhattan, NY. I need you to find at least 50 specific competitors, list their exact addresses and ratings, and then calculate the average rating of the top 10 versus the bottom 10.",
-      "conversation_plan": "Ask for the massive list of competitors. If the agent tries to summarize, refuse and demand the full list of 50 addresses and the manual calculation."
-    },
-    {
-      "starting_prompt": "Find a location for a vegan bakery in Berlin. CRITICAL CONSTRAINT: The location must have a 'Viability Score' above 85 AND be within 1km of a university. If the first location you find doesn't match this, you MUST keep searching until you find one that does.",
-      "conversation_plan": "State your strict requirements for score and distance. Scrutinize the agent's recommendation; if it misses the mark (score < 85), reject it and order a new search until the criteria are met."
-    },
-    {
-      "starting_prompt": "I have a prime spot in Austin, Texas. Run a full feasibility study for four completely different concepts: a High-End Gym, a Drive-Thru Coffee Stand, a Pet Grooming Salon, and a Vintage Clothing Store. I need a decision by 5 PM.",
-      "conversation_plan": "Submit the four distinct concepts for analysis. Once the feasibility reports are in, ask the agent to force rank them and pick the single best option."
-    },
-    {
-      "starting_prompt": "Okay, focusing on Indiranagar: what are the demographic trends there?",
-      "conversation_plan": "Pivot the conversation to demographic trends. If the agent loses the 'Indiranagar' context, gently remind them of the location and ask them to retrieve the data from the earlier research."
-    },
-    {
       "starting_prompt": "I want to open a shop.",
       "conversation_plan": "Start with a vague request to open a shop. Let the agent lead the intake process, providing 'Coffee Shop' and 'Seattle' only when asked."
-    },
-    {
-      "starting_prompt": "Generate an infographic for a high-end luxury watch store in Zurich. I want the data to include specific foot traffic numbers and competitor revenue estimates.",
-      "conversation_plan": "Order the infographic with specific data requirements. Once generated, question the source of the data to verify it came from the research phase."
-    },
-    {
-      "starting_prompt": "Analyze a 'Quiet Library' in the middle of Times Square, NY.",
-      "conversation_plan": "Propose the 'Quiet Library' idea. When the agent raises concerns about noise, admit the issue but ask if soundproofing could solve it and make the project viable."
-    },
-    {
-      "starting_prompt": "Act as a brutally honest financial risk assessor. Analyze a bubble tea shop in a saturated market like Taipei.",
-      "conversation_plan": "Set the 'Risk Assessor' persona. If the agent pulls punches, correct them and demand a harsher, failure-focused analysis of the bankruptcy risks."
-    },
-    {
-      "starting_prompt": "Analyze a store in Atlantis, Ocean.",
-      "conversation_plan": "Ask for the fictional location. When the agent fails to find it, apologize and correct the record to 'Miami, Florida' for the actual analysis."
     }
   ]
 }

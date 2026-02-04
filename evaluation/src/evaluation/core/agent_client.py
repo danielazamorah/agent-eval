@@ -36,11 +36,17 @@ class AgentClient:
         self._token = token
 
     @property
-    def token(self) -> str:
-        """Returns the current token, fetching it if necessary."""
+    def token(self) -> Optional[str]:
+        """Returns the current token, fetching it if necessary. Returns None for localhost."""
+        if self._is_localhost():
+            return None
         if not self._token:
             self._token = self._fetch_gcloud_token()
         return self._token
+
+    def _is_localhost(self) -> bool:
+        """Check if the base_url is localhost (no auth needed)."""
+        return "localhost" in self.base_url or "127.0.0.1" in self.base_url
 
     def _fetch_gcloud_token(self) -> str:
         """Fetches the gcloud identity token from the environment."""
@@ -56,12 +62,15 @@ class AgentClient:
             ) from e
 
     def _get_headers(self) -> Dict[str, str]:
-        """Returns the headers for API requests."""
-        return {
+        """Returns the headers for API requests. Skips auth for localhost."""
+        headers = {
             "accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.token}",
         }
+        # Only add Authorization header for non-localhost URLs
+        if not self._is_localhost() and self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
 
     def create_session(self, **session_data) -> str:
         """

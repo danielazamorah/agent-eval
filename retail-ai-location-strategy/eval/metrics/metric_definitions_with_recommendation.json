@@ -1,0 +1,130 @@
+{
+  "metrics": {
+    "_documentation": {
+      "overview": "This file defines evaluation metrics for the retail-location-strategy agent.",
+      "metric_types": {
+        "deterministic": "Calculated automatically from session data (token usage, latency, tool success rate)",
+        "api_predefined": "Built-in Vertex AI metrics - require use_gemini_format: true for multi-turn",
+        "custom_llm": "User-defined metrics with prompt templates"
+      },
+      "api_predefined_metrics": [
+        "general_quality_v1", "text_quality_v1", "instruction_following_v1",
+        "grounding_v1", "safety_v1", "final_response_quality_v1", "hallucination_v1"
+      ],
+      "custom_metric_added": "recommendation_quality - demonstrates fine-grained field evaluation using final_response:top_recommendation"
+    },
+
+    "general_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "GENERAL_QUALITY",
+      "use_gemini_format": true,
+      "score_range": {"min": 0, "max": 1, "description": "Passing rate for general quality rubrics"},
+      "agents": ["retail_location_strategy", "app"],
+
+      "_implementation_note": "API Predefined metric. Single-turn version (use MULTI_TURN_GENERAL_QUALITY for multi-turn conversations).",
+
+      "natural_language_guidelines": "Evaluate if the agent correctly processes location strategy requests and provides coherent, comprehensive analysis for the target location and business type."
+    },
+
+    "text_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "TEXT_QUALITY",
+      "use_gemini_format": true,
+      "score_range": {"min": 0, "max": 1, "description": "Passing rate for text quality rubrics"},
+      "agents": ["retail_location_strategy", "app"],
+
+      "_implementation_note": "API Predefined metric. Single-turn version (use MULTI_TURN_TEXT_QUALITY for multi-turn conversations)."
+    },
+
+    "trajectory_accuracy": {
+      "metric_type": "llm",
+      "agents": ["retail_location_strategy", "app"],
+      "score_range": {"min": 0, "max": 5, "description": "0=Completely wrong, 5=Perfect trajectory"},
+
+      "_implementation_note": "Custom metric. Evaluates if the agent followed the correct sequence of steps given its available tools.",
+
+      "dataset_mapping": {
+        "prompt": {
+          "source_column": "user_inputs"
+        },
+        "response": {
+          "source_column": "trace_summary"
+        },
+        "available_tools": {
+          "source_column": "extracted_data:tool_declarations"
+        },
+        "final_response": {
+          "source_column": "final_response"
+        }
+      },
+      "template": "You are evaluating the execution trajectory of a Retail Location Strategy AI agent.\n\n**User Request:**\n{prompt}\n\n**Agent's Available Tools:**\n{available_tools}\n\n**Agent Execution Trajectory:**\n{response}\n\n**Agent's Final Response to User:**\n{final_response}\n\n**CRITICAL EVALUATION RULES:**\n1. **Only evaluate against AVAILABLE tools.** The agent can ONLY use tools listed above. Do NOT penalize the agent for not using a tool that doesn't exist in its toolset.\n2. **Judge the outcome, not an imaginary ideal path.** If the agent achieved the user's goal using the tools available to it, that is a valid trajectory.\n3. **Credit graceful handling of limitations.** If a tool doesn't exist for a task, the agent correctly communicating this limitation is GOOD behavior.\n\n**EXPECTED PIPELINE for Location Analysis:**\n1. IntakeAgent - Parse user request to extract location and business type\n2. MarketResearchAgent - Uses google_search for market data, demographics, trends\n3. CompetitorMappingAgent - Uses search_places for competitor mapping via Google Maps\n4. GapAnalysisAgent - Uses code execution for quantitative gap analysis\n5. StrategyAdvisorAgent - Synthesizes findings into recommendations\n6. ReportGeneratorAgent - Uses generate_html_report for executive report\n7. InfographicGeneratorAgent - Uses generate_infographic for visual summary\n\n**Evaluation Criteria:**\n1. **Feasibility:** Given the available tools, did the agent take a logical path toward the user's goal?\n2. **Sequence:** Were the tools called in a sensible order (research before synthesis)?\n3. **Efficiency:** Were there unnecessary or redundant tool calls?\n4. **Completeness:** Were all expected pipeline stages invoked?\n\n**Scoring Rubric (0-5):**\n- 5: Optimal trajectory - all pipeline stages executed with corresponding tool calls in correct order\n- 4: Good trajectory - logical path with minor variations that don't affect outcome\n- 3: Acceptable trajectory - core stages completed but some research stages skipped\n- 2: Poor trajectory - significant stages skipped (e.g., no google_search OR no gap analysis)\n- 1: Very poor - major errors in tool selection or sequence that hurt the outcome\n- 0: Failed - pipeline didn't run or trajectory is completely wrong\n\n**Response Format:**\nScore: [0-5]\nExplanation: [Reasoning that references the available tools and whether the agent's path was feasible]"
+    },
+
+    "tool_use_quality": {
+      "metric_type": "llm",
+      "agents": ["retail_location_strategy", "app"],
+      "score_range": {"min": 0, "max": 5, "description": "0=Poor tool usage, 5=Excellent tool usage"},
+
+      "_implementation_note": "Custom metric that evaluates tool usage patterns using detailed tool interaction data.",
+
+      "dataset_mapping": {
+        "prompt": {
+          "source_column": "user_inputs"
+        },
+        "response": {
+          "source_column": "final_response"
+        },
+        "tool_interactions": {
+          "source_column": "extracted_data:tool_interactions"
+        },
+        "available_tools": {
+          "source_column": "extracted_data:tool_declarations"
+        }
+      },
+      "template": "You are evaluating how effectively a Retail Location Strategy AI agent used its available tools to fulfill a user request.\n\n**User Request:**\n{prompt}\n\n**Available Tools:**\n{available_tools}\n\n**Tool Calls Made by Agent:**\n{tool_interactions}\n\n**Agent's Final Response to User:**\n{response}\n\n**IMPORTANT CONTEXT:**\n- Tools may return MOCK data in test environments. Do NOT penalize the agent for correctly relaying mock data.\n- The agent can only use the tools listed above. Do not penalize for missing tools.\n\n**EXPECTED TOOL USAGE for Location Analysis:**\n- `google_search` - For market research (demographics, trends, news)\n- `search_places` - For competitor mapping (Google Maps data)\n- `execute_code` or sandbox - For quantitative gap analysis\n- `generate_html_report` - For final executive report\n- `generate_infographic` - For visual summary\n\n**Evaluation Criteria:**\n\n1. **Tool Selection (Was the right tool chosen?):**\n   - Did the agent select tools appropriate for location analysis?\n   - Were search queries relevant to the business type and location?\n\n2. **Argument Correctness (Were parameters correct?):**\n   - Were all required parameters provided?\n   - Were parameter values accurate based on user input?\n\n3. **Result Handling (Was the output used correctly?):**\n   - Did the agent correctly interpret tool results?\n   - Was the information from tool outputs accurately conveyed to the user?\n\n4. **Efficiency (Was the execution optimal?):**\n   - Were tools called in a logical order?\n   - Were there redundant or unnecessary tool calls?\n\n**Scoring Rubric (0-5):**\n- 5: Excellent - All expected tools used with correct arguments, comprehensive coverage\n- 4: Good - Most tools used correctly, minor gaps in coverage or query specificity\n- 3: Acceptable - Core tools used (search_places, report gen) but some research tools skipped\n- 2: Poor - Significant tools missing (no google_search AND no code execution)\n- 1: Very Poor - Major tool usage errors that impacted the response quality\n- 0: Failed - No tools called when required, or critical failures\n\n**Response Format:**\nScore: [0-5]\nExplanation: [Detailed reasoning]"
+    },
+
+    "pipeline_integrity": {
+      "metric_type": "llm",
+      "agents": ["retail_location_strategy", "app"],
+      "score_range": {"min": 0, "max": 5, "description": "0=Major integrity issues, 5=Perfect integrity"},
+
+      "_implementation_note": "Custom metric. Evaluates whether the agent's claims match its actual execution - catches hallucinated analysis.",
+
+      "dataset_mapping": {
+        "prompt": {
+          "source_column": "user_inputs"
+        },
+        "response": {
+          "source_column": "final_response"
+        },
+        "tool_interactions": {
+          "source_column": "extracted_data:tool_interactions"
+        },
+        "full_conversation": {
+          "source_column": "extracted_data:conversation_history"
+        }
+      },
+      "template": "You are evaluating whether a Retail Location Strategy AI agent's outputs match its actual execution.\n\n**User Request:**\n{prompt}\n\n**Full Conversation:**\n{full_conversation}\n\n**Tool Calls Made:**\n{tool_interactions}\n\n**Agent's Final Response:**\n{response}\n\n**KNOWN PIPELINE STAGES AND THEIR TOOLS:**\n- MarketResearchAgent: Uses google_search - if not called, market research data was NOT gathered live\n- CompetitorMappingAgent: Uses search_places - if not called, competitor data was NOT gathered live\n- GapAnalysisAgent: Uses code execution - if not called, quantitative analysis was NOT performed\n- ReportGeneratorAgent: Uses generate_html_report - required for executive report\n- InfographicGeneratorAgent: Uses generate_infographic - required for visual summary\n\n**Evaluation Criteria:**\n\n1. **Execution Integrity:** Do the agent's claims match tool calls?\n   - FAIL: Report claims 'gap analysis findings' but no code execution tool was called\n   - FAIL: Report claims 'live market research' but google_search was not called\n   - PASS: Claims match actual tool execution\n\n2. **Data Provenance:** Is the data sourced from real tool outputs?\n   - Check if competitor data came from search_places results\n   - Check if market insights came from google_search results\n\n3. **Hallucination Detection:** Did the agent fabricate analysis it didn't perform?\n   - If a stage's tool wasn't called but the report includes that stage's 'findings', that's hallucination\n\n**Scoring Rubric (0-5):**\n- 5: Perfect - All claims match tool execution, no hallucinated analysis\n- 4: Good - Minor discrepancies that don't affect report quality\n- 3: Acceptable - Some claims slightly exaggerated but core data is real\n- 2: Poor - Significant claims without corresponding tool execution\n- 1: Very Poor - Major hallucination of analysis that wasn't performed\n- 0: Failed - Report is entirely fabricated without tool support\n\n**Response Format:**\nScore: [0-5]\nExplanation: [Compare tool_interactions with claims in final response and conversation]"
+    },
+
+    "recommendation_quality": {
+      "metric_type": "llm",
+      "agents": ["retail_location_strategy", "app"],
+      "score_range": {"min": 0, "max": 5, "description": "0=Poor, 5=Excellent recommendation"},
+
+      "_implementation_note": "Custom metric. Evaluates the top_recommendation object from structured JSON response. Demonstrates fine-grained field evaluation using final_response:field_name syntax.",
+
+      "dataset_mapping": {
+        "prompt": {"source_column": "user_inputs"},
+        "response": {"source_column": "trace_summary"},
+        "top_recommendation": {"source_column": "final_response:top_recommendation"},
+        "total_competitors": {"source_column": "final_response:total_competitors_found"},
+        "zones_analyzed": {"source_column": "final_response:zones_analyzed"}
+      },
+      "template": "You are evaluating the quality of a location recommendation from a Retail Location Strategy AI agent.\n\n**User Request:**\n{prompt}\n\n**Agent Execution Path:**\n{response}\n\n**Data Coverage:**\n- Competitors Found: {total_competitors}\n- Zones Analyzed: {zones_analyzed}\n\n**Top Recommendation:**\n{top_recommendation}\n\n**Evaluation Criteria:**\n\n1. **Actionability** - Is the recommendation specific enough to act on?\n   - Does it name a specific location or zone?\n   - Are there clear next steps or considerations?\n   - Would a business owner know what to do with this recommendation?\n\n2. **Evidence-Based** - Are strengths and concerns backed by data?\n   - Are claims supported by the competitor/zone data gathered?\n   - Does it reference specific findings from the analysis?\n   - Are quantitative factors mentioned (e.g., competitor density, foot traffic)?\n\n3. **Practicality** - Are mitigation strategies realistic?\n   - If concerns are noted, are they addressable?\n   - Are the suggested strategies feasible for the target business type?\n\n**Scoring Rubric (0-5):**\n- 5: Excellent - Specific named location, evidence-based strengths/concerns, actionable mitigation strategies\n- 4: Good - Clear recommendation with supporting data, minor gaps in actionability\n- 3: Acceptable - Reasonable recommendation but lacks depth or specific evidence\n- 2: Poor - Vague recommendation, missing key data points\n- 1: Very Poor - Generic advice not tailored to the analysis\n- 0: Failed - No recommendation provided or completely irrelevant\n\n**Special Case:**\nIf the agent correctly asked a clarifying question instead of providing a recommendation (e.g., incomplete user request), respond:\nScore: N/A\nExplanation: Agent appropriately requested clarification before analysis.\n\n**Response Format:**\nScore: [0-5 or N/A]\nExplanation: [Your reasoning based on the criteria above]"
+    }
+  }
+}
