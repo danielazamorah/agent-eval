@@ -843,6 +843,11 @@ uv run adk eval agent_module eval_set_name
 
 ## Troubleshooting
 
+### Cloudtop: Copy/paste not working
+
+**Cause:** Cloudtop terminal uses different keyboard shortcuts.
+**Fix:** Use `Ctrl+Shift+V` to paste (not `Ctrl+V`). For vim, enter insert mode first, then `Ctrl+Shift+V`.
+
 ### "ModuleNotFoundError: No module named 'customer_service'"
 
 **Cause:** Running from wrong directory.

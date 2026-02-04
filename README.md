@@ -17,6 +17,34 @@ Learn to move from trial-and-error prompt engineering to systematic, measurable 
 +------------------------------------------------------------------+
 ```
 
+### Getting a GCP Project (Argolis)
+
+If you don't already have a GCP project with Vertex AI enabled, use **Argolis** - Google's internal GCP environment for demos and testing.
+
+1. **Access Argolis:** Navigate to [go/argolis](http://go/argolis)
+
+2. **Create a new project:**
+   - Click "Create Project"
+   - Choose a descriptive name (e.g., `accelerate-workshop-yourname`)
+   - Select your organization
+
+3. **Enable required APIs:**
+   ```bash
+   # Vertex AI (required for both agents and evaluation)
+   gcloud services enable aiplatform.googleapis.com --project=YOUR_PROJECT_ID
+
+   # Places API (required for Retail AI competitor mapping)
+   gcloud services enable places.googleapis.com --project=YOUR_PROJECT_ID
+   ```
+
+4. **Set environment variables:**
+   ```bash
+   export GOOGLE_CLOUD_PROJECT="your-argolis-project-id"
+   export GOOGLE_CLOUD_LOCATION="us-central1"
+   ```
+
+> **Important:** Argolis projects have quotas and are intended for demos/testing. For production workloads, use a standard GCP project.
+
 ---
 
 ## What You'll Do in This Workshop
@@ -116,6 +144,8 @@ We use two agents to demonstrate different optimization challenges:
 
 > **You're ready to code!** Follow each step in order. If you get stuck, ask for help.
 
+> **Cloudtop Users:** To paste commands into the terminal, use `Ctrl+Shift+V` (not `Ctrl+V`).
+
 ---
 
 ## Workshop Step 1: Environment Setup
@@ -131,12 +161,19 @@ python3 --version  # Must be 3.10, 3.11, or 3.12 (NOT 3.13+)
 uv --version       # Must be installed
 ```
 
-**Missing something?**
+**Missing uv?**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-| Missing | How to Fix |
-|---------|------------|
-| Python 3.10-3.12 | Install from [python.org](https://www.python.org/downloads/) |
-| uv | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+**Have Python 3.13+?** No problem - uv can manage Python versions for you. After cloning the repo, run:
+
+```bash
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+```
+
+This creates a virtual environment with Python 3.12 regardless of your system Python version.
 
 ### 1.2 Authenticate with Google Cloud (Important!)
 
@@ -165,7 +202,11 @@ gcloud auth application-default set-quota-project $GOOGLE_CLOUD_PROJECT
 ### 1.4 Clone and Verify
 
 ```bash
-git clone <repo-url>
+# Ensure you have valid credentials for Git-on-Borg
+gcert
+
+# Clone the repository
+git clone sso://user/jessecarah/accelerate_context_engineering_workshop accelerate
 cd accelerate
 
 # Run verification script
@@ -225,6 +266,11 @@ For faster iteration during the workshop, consider setting up an AI coding assis
 | **Gemini CLI** | `npm install -g @google/gemini-cli` | Compare eval results, generate optimization logs |
 | **Claude Code** | `npm install -g @anthropic-ai/claude-code` | Code exploration, debugging |
 
+**On Cloudtop?** Use the pre-installed Gemini CLI:
+```bash
+alias gemini='/google/bin/releases/gemini-cli/tools/gemini'
+```
+
 > **Setup details:** See [REFERENCE.md - AI Assistant Setup](REFERENCE.md#ai-assistant-setup-optional) for full configuration with Vertex AI.
 
 ---
@@ -262,7 +308,7 @@ Writing golden datasets by hand is tedious - you end up needing to hand-write JS
 #### 2A.1 Set Up the Simulation
 
 ```bash
-cd customer-service
+cd ../customer-service
 uv sync
 
 # Create eval set
@@ -291,12 +337,14 @@ The `convert` command takes raw ADK traces and standardizes them for the evaluat
 ```bash
 cd ../evaluation
 
-uv run agent-eval convert \
+# Convert and capture the output folder path automatically
+export CS_RUN_DIR=$(uv run agent-eval convert \
   --agent-dir ../customer-service/customer_service \
-  --output-dir ../customer-service/eval/results
-```
+  --output-dir ../customer-service/eval/results \
+  2>&1 | grep "Run folder:" | awk '{print $3}')
 
-Note the output folder path - you'll use it in the next steps.
+echo "Results saved to: $CS_RUN_DIR"
+```
 
 ---
 
@@ -323,16 +371,21 @@ make dev  # Starts on port 8502
 The `interact` command sends queries from your golden dataset to the running agent and collects traces.
 
 ```bash
-cd evaluation
+# From a new terminal, navigate to the repo's evaluation folder
+cd accelerate/evaluation
 
-uv run agent-eval interact \
+# Run interactions and capture the output folder path automatically
+export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
   --questions-file ../retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
-  --results-dir ../retail-ai-location-strategy/eval/results
+  --results-dir ../retail-ai-location-strategy/eval/results \
+  2>&1 | grep "Run folder:" | awk '{print $3}')
+
+echo "Results saved to: $RETAIL_RUN_DIR"
 ```
 
-This runs for 3-5 minutes. Note the output folder path - you'll use it later.
+This runs for 3-5 minutes.
 
 > **What's happening:** The CLI creates sessions, sends user inputs from the golden dataset, and collects all traces and session data programmatically.
 
@@ -351,15 +404,11 @@ Now that we have traces, we score them. The `evaluate` command:
 ### Step 3A: Evaluate Customer Service
 
 ```bash
-cd evaluation
-
-# Use the folder path from Step 2A.3
-RUN_DIR=../customer-service/eval/results/<your-folder-name>
-
+# Uses $CS_RUN_DIR from Step 2A.3
 uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_sim.jsonl \
+  --interaction-file $CS_RUN_DIR/raw/processed_interaction_sim.jsonl \
   --metrics-files ../customer-service/eval/metrics/metric_definitions.json \
-  --results-dir $RUN_DIR \
+  --results-dir $CS_RUN_DIR \
   --input-label baseline
 ```
 
@@ -368,13 +417,11 @@ uv run agent-eval evaluate \
 ### Step 3B: Evaluate Retail AI
 
 ```bash
-# Use the folder path from Step 2B.2
-RUN_DIR=../retail-ai-location-strategy/eval/results/<your-folder-name>
-
+# Uses $RETAIL_RUN_DIR from Step 2B.2
 uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_app.jsonl \
+  --interaction-file $RETAIL_RUN_DIR/raw/processed_interaction_app.jsonl \
   --metrics-files ../retail-ai-location-strategy/eval/metrics/metric_definitions.json \
-  --results-dir $RUN_DIR \
+  --results-dir $RETAIL_RUN_DIR \
   --input-label baseline
 ```
 
@@ -426,10 +473,9 @@ Each metric has:
 ### Step 4A: Analyze Customer Service
 
 ```bash
-RUN_DIR=../customer-service/eval/results/<your-folder-name>
-
+# Uses $CS_RUN_DIR from Step 2A.3
 uv run agent-eval analyze \
-  --results-dir $RUN_DIR \
+  --results-dir $CS_RUN_DIR \
   --agent-dir ../customer-service \
   --location global
 ```
@@ -438,14 +484,14 @@ uv run agent-eval analyze \
 
 **Option 1: AI-Generated Analysis (Recommended)**
 ```bash
-cat $RUN_DIR/gemini_analysis.md
+cat $CS_RUN_DIR/gemini_analysis.md
 ```
 
 This markdown file contains Gemini's interpretation of your results, including root cause analysis and improvement suggestions.
 
 **Option 2: Raw Metrics**
 ```bash
-cat $RUN_DIR/eval_summary.json
+cat $CS_RUN_DIR/eval_summary.json
 ```
 
 > **Coming Soon:** A Gradio dashboard for visual comparison of evaluation runs.
@@ -465,10 +511,9 @@ cat $RUN_DIR/eval_summary.json
 ### Step 4B: Analyze Retail AI
 
 ```bash
-RUN_DIR=../retail-ai-location-strategy/eval/results/<your-folder-name>
-
+# Uses $RETAIL_RUN_DIR from Step 2B.2
 uv run agent-eval analyze \
-  --results-dir $RUN_DIR \
+  --results-dir $RETAIL_RUN_DIR \
   --agent-dir ../retail-ai-location-strategy \
   --location global
 ```
@@ -476,7 +521,7 @@ uv run agent-eval analyze \
 #### Review Results
 
 ```bash
-cat $RUN_DIR/gemini_analysis.md
+cat $RETAIL_RUN_DIR/gemini_analysis.md
 ```
 
 **What to Look For (Retail AI):**
@@ -637,6 +682,7 @@ git checkout optimizations/05-prefix-caching      # Retail AI
 ### Full Pipeline: Customer Service (ADK User Sim)
 
 ```bash
+# Run from repo root (accelerate/)
 cd customer-service
 rm -rf customer_service/.adk/eval_history/*
 rm -f customer_service/*.evalset.json
@@ -649,20 +695,19 @@ uv run adk eval customer_service eval_set_with_scenarios
 
 cd ../evaluation
 
-uv run agent-eval convert \
+# Convert and capture output folder
+export CS_RUN_DIR=$(uv run agent-eval convert \
   --agent-dir ../customer-service/customer_service \
-  --output-dir ../customer-service/eval/results
-
-# Use the output folder path
-RUN_DIR=../customer-service/eval/results/<folder>
+  --output-dir ../customer-service/eval/results \
+  2>&1 | grep "Run folder:" | awk '{print $3}')
 
 uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_sim.jsonl \
+  --interaction-file $CS_RUN_DIR/raw/processed_interaction_sim.jsonl \
   --metrics-files ../customer-service/eval/metrics/metric_definitions.json \
-  --results-dir $RUN_DIR
+  --results-dir $CS_RUN_DIR
 
 uv run agent-eval analyze \
-  --results-dir $RUN_DIR \
+  --results-dir $CS_RUN_DIR \
   --agent-dir ../customer-service \
   --location global
 ```
@@ -670,28 +715,27 @@ uv run agent-eval analyze \
 ### Full Pipeline: Retail AI (DIY Interactions)
 
 ```bash
-# Terminal 1: Start agent
+# Terminal 1 (from repo root): Start agent
 cd retail-ai-location-strategy && make dev
 
-# Terminal 2: Run evaluation
+# Terminal 2 (from repo root): Run evaluation
 cd evaluation
 
-uv run agent-eval interact \
+# Run interactions and capture output folder
+export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
   --questions-file ../retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
-  --results-dir ../retail-ai-location-strategy/eval/results
-
-# Use the output folder path
-RUN_DIR=../retail-ai-location-strategy/eval/results/<folder>
+  --results-dir ../retail-ai-location-strategy/eval/results \
+  2>&1 | grep "Run folder:" | awk '{print $3}')
 
 uv run agent-eval evaluate \
-  --interaction-file $RUN_DIR/raw/processed_interaction_app.jsonl \
+  --interaction-file $RETAIL_RUN_DIR/raw/processed_interaction_app.jsonl \
   --metrics-files ../retail-ai-location-strategy/eval/metrics/metric_definitions.json \
-  --results-dir $RUN_DIR
+  --results-dir $RETAIL_RUN_DIR
 
 uv run agent-eval analyze \
-  --results-dir $RUN_DIR \
+  --results-dir $RETAIL_RUN_DIR \
   --agent-dir ../retail-ai-location-strategy \
   --location global
 ```
