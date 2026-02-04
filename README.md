@@ -494,7 +494,15 @@ This markdown file contains Gemini's interpretation of your results, including r
 cat $CS_RUN_DIR/eval_summary.json
 ```
 
-> **Coming Soon:** A Gradio dashboard for visual comparison of evaluation runs.
+**Option 3: Visual Dashboard**
+
+For interactive comparison of evaluation runs, use the Gradio dashboard:
+```bash
+cd dashboard
+uv run dashboard.py
+# Open http://127.0.0.1:7860 in your browser
+```
+See [`dashboard/README.md`](dashboard/README.md) for detailed usage instructions.
 
 **What to Look For (Customer Service):**
 
