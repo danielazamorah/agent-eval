@@ -570,6 +570,12 @@ We'll work through the branches in order. Each branch builds on concepts from th
 
 ---
 
+> **Optional: Branch 00 (Model Swap)**
+> Before diving into architectural optimizations, you can explore `optimizations/00-model-swap` to see what happens when you *only* change the model (e.g., Flash → Pro). This demonstrates that model swaps alone have trade-offs and aren't a substitute for proper context engineering.
+> ```bash
+> git checkout optimizations/00-model-swap
+> ```
+
 ### Start with Branch 01: Tool Schema Hardening
 
 ```bash
