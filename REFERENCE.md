@@ -912,6 +912,60 @@ IMPORTANT: Tools may return MOCK data in test environments.
 Do NOT penalize the agent for correctly relaying mock data.
 ```
 
+### ADK UserSim: "Error rendering metric prompt template" during `adk eval`
+
+**Cause:** ADK UserSim runs a built-in evaluation by default after the simulation completes. If no eval config file is provided, the default metrics may fail with errors like `Error rendering metric prompt template: Variable conversation_history is required but not provided..`. This does not affect the simulation runs themselves - the agent interactions and traces are captured successfully. We do not use this built-in ADK evaluation; we run our own separate evaluation step later using the Vertex AI SDK.
+**Fix:** Provide an eval config file with your `adk eval` command to suppress the error:
+
+```bash
+uv run adk eval customer_service --config_file_path customer_service/eval_config.json eval_set_with_scenarios
+```
+
+If you don't have an eval config file, create one (e.g., `eval/eval_config.json`) with criteria:
+
+```json
+{
+  "criteria": {
+    "hallucinations_v1": {
+      "threshold": 0.5,
+      "evaluate_intermediate_nl_responses": true
+    },
+    "safety_v1": {
+      "threshold": 0.8
+    }
+  }
+}
+```
+
+For more details on ADK UserSim and eval configuration, see the [ADK User Simulation docs](https://google.github.io/adk-docs/evaluate/user-sim/).
+
+### Evaluation commands failing with "file not found" or directory errors
+
+**Cause:** The `agent-eval` CLI commands must be run from the `evaluation/` directory. If you navigated to a different folder during a previous step (e.g., `retail-ai-location-strategy/` or `customer-service/`), the commands will fail.
+**Fix:** Verify your current directory and navigate to the evaluation folder:
+
+```bash
+cd ../evaluation
+```
+
+### Permission denied on autorater model during evaluation
+
+**Cause:** The Vertex AI service account lacks permissions to access the autorater model used for LLM-as-judge metrics. You may see an error like:
+
+```text
+google.genai.errors.ClientError: 403 PERMISSION_DENIED. {'error': {'code': 403, 'message': 'Failed to make GenerateContent request to autorater model projects/accelerate-workshop-aitor/locations/us-central1/publishers/google/models/gemini-2.5-flash. Permission denied on autorater model (or it may not exist). Please check the model permissions and try again.', 'status': 'PERMISSION_DENIED'
+```
+
+**Fix:** Grant the Vertex AI service agent role to your project's AI Platform service account:
+
+```bash
+export GOOGLE_CLOUD_PROJECT_NUMBER=$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format="value(projectNumber)")
+
+gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
+    --member="serviceAccount:service-$GOOGLE_CLOUD_PROJECT_NUMBER@gcp-sa-aiplatform.iam.gserviceaccount.com" \
+    --role="roles/aiplatform.serviceAgent"
+```
+
 ---
 
 ## Context Engineering Principles

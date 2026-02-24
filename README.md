@@ -117,6 +117,13 @@ gcloud services enable aiplatform.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
 
 # Places API (required for Retail AI competitor mapping)
 gcloud services enable places.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
+
+# Grant Vertex AI autorater model permissions
+export GOOGLE_CLOUD_PROJECT_NUMBER=$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format="value(projectNumber)")
+
+gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
+    --member="serviceAccount:service-$GOOGLE_CLOUD_PROJECT_NUMBER@gcp-sa-aiplatform.iam.gserviceaccount.com" \
+    --role="roles/aiplatform.serviceAgent"
 ```
 
 ### 1.4 Clone and Verify
@@ -242,8 +249,10 @@ uv run adk eval_set add_eval_case customer_service eval_set_with_scenarios \
 
 #### 2A.2 Run the Simulation
 
+> **Note:** The `--config_file_path` flag provides an eval config to ADK's built-in evaluation, which runs automatically after the simulation. This is not the evaluation we use in this workshop - we run our own evaluation step later using the Vertex AI SDK. The config file simply prevents an error from the default built-in metrics. See [Troubleshooting](REFERENCE.md#adk-usersim-error-rendering-metric-prompt-template-during-adk-eval) for details.
+
 ```bash
-uv run adk eval customer_service eval_set_with_scenarios
+uv run adk eval customer_service --config_file_path customer_service/eval_config.json eval_set_with_scenarios
 ```
 
 This runs for 2-3 minutes. You'll see simulated conversations in real-time.
@@ -324,6 +333,8 @@ Now that we have traces, we score them. The `evaluate` command:
 ### Step 3A: Evaluate Customer Service
 
 ```bash
+cd ../evaluation
+
 # Uses $CS_RUN_DIR from Step 2A.3
 uv run agent-eval evaluate \
   --interaction-file $CS_RUN_DIR/raw/processed_interaction_sim.jsonl \
@@ -634,7 +645,7 @@ uv run adk eval_set create customer_service eval_set_with_scenarios
 uv run adk eval_set add_eval_case customer_service eval_set_with_scenarios \
   --scenarios_file eval/scenarios/conversation_scenarios.json \
   --session_input_file eval/scenarios/session_input.json
-uv run adk eval customer_service eval_set_with_scenarios
+uv run adk eval customer_service --config_file_path customer_service/eval_config.json eval_set_with_scenarios
 
 cd ../evaluation
 
