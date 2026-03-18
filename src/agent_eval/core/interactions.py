@@ -5,7 +5,7 @@ import pandas as pd
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from evaluation.core.agent_client import AgentClient
+from agent_eval.core.agent_client import AgentClient
 
 def get_golden_questions(filepath: str) -> List[Dict[str, Any]]:
     """Loads questions from a JSON file."""

@@ -6,11 +6,11 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-from evaluation.core.interactions import InteractionRunner
-from evaluation.core.processor import InteractionProcessor
-from evaluation.core.evaluator import Evaluator
-from evaluation.core.analyzer import Analyzer
-from evaluation.core.converters import AdkHistoryConverter, TestToGoldenConverter, write_jsonl, read_jsonl
+from agent_eval.core.interactions import InteractionRunner
+from agent_eval.core.processor import InteractionProcessor
+from agent_eval.core.evaluator import Evaluator
+from agent_eval.core.analyzer import Analyzer
+from agent_eval.core.converters import AdkHistoryConverter, TestToGoldenConverter, write_jsonl, read_jsonl
 
 def interact_command(args):
     """

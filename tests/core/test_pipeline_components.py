@@ -12,8 +12,8 @@ import pandas as pd
 sys.modules["google.genai"] = MagicMock()
 sys.modules["google.genai.types"] = MagicMock()
 
-from evaluation.core.converters import AdkHistoryConverter, synthesize_trace_from_events
-from evaluation.core.analyzer import Analyzer, LogEntry
+from agent_eval.core.converters import AdkHistoryConverter, synthesize_trace_from_events
+from agent_eval.core.analyzer import Analyzer, LogEntry
 
 
 class TestConverters(unittest.TestCase):

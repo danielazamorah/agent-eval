@@ -11,7 +11,7 @@ import pandas as pd
 from google import genai
 from google.genai.types import HttpOptions
 
-from evaluation.core.gemini_prompt_builder import GeminiAnalysisPrompter
+from agent_eval.core.gemini_prompt_builder import GeminiAnalysisPrompter
 
 
 class LogEntry(TypedDict):

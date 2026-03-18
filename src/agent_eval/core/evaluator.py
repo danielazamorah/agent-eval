@@ -16,9 +16,9 @@ from google.cloud import aiplatform
 from vertexai import Client, types
 from vertexai.preview.evaluation import PointwiseMetric
 
-from evaluation.core.config import CONFIG
-from evaluation.core.deterministic_metrics import DETERMINISTIC_METRICS, evaluate_deterministic_metrics
-from evaluation.core.data_mapper import map_dataset_columns, robust_json_loads
+from agent_eval.core.config import CONFIG
+from agent_eval.core.deterministic_metrics import DETERMINISTIC_METRICS, evaluate_deterministic_metrics
+from agent_eval.core.data_mapper import map_dataset_columns, robust_json_loads
 
 # Setup Logger
 logging.basicConfig(
@@ -337,7 +337,7 @@ class Evaluator:
         if file_ext == '.jsonl':
             # JSONL format: use standard json module to avoid ujson "Value is too big" errors
             # with large response payloads (e.g., retail AI full analysis)
-            from evaluation.core.converters import read_jsonl
+            from agent_eval.core.converters import read_jsonl
             records = read_jsonl(str(interaction_file))
             interaction_results = pd.DataFrame(records)
             # Ensure question_id is string

@@ -13,7 +13,7 @@ import sys
 sys.modules["google.genai"] = MagicMock()
 sys.modules["google.genai.types"] = MagicMock()
 
-from evaluation.core.converters import AdkHistoryConverter
+from agent_eval.core.converters import AdkHistoryConverter
 
 class TestAdkHistoryConverterPerInvocation(unittest.TestCase):
     def setUp(self):

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 # Import the class under test
-from evaluation.core.evaluator import Evaluator
+from agent_eval.core.evaluator import Evaluator
 
 
 @patch("evaluation.core.evaluator.CONFIG")

@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 # Import AgentClient for consistent trace analysis logic
-from evaluation.core.agent_client import AgentClient
+from agent_eval.core.agent_client import AgentClient
 
 def robust_json_load(file_path: str) -> Optional[Dict[str, Any]]:
     try:

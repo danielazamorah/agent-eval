@@ -1,4 +1,4 @@
-from evaluation.cli.main import main
+from agent_eval.cli.main import main
 
 if __name__ == "__main__":
     main()

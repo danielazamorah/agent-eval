@@ -3,7 +3,7 @@ import asyncio
 import pandas as pd
 from typing import Dict, Any, Optional
 
-from evaluation.core.agent_client import AgentClient
+from agent_eval.core.agent_client import AgentClient
 
 async def enrich_single_interaction(
     row: pd.Series,
