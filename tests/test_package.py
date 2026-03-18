@@ -1,6 +1,11 @@
 """Smoke tests: verify the package installs, imports, and wires up correctly."""
 
 import importlib
+import json
+import tempfile
+from pathlib import Path
+
+from click.testing import CliRunner
 
 
 def test_package_importable():
@@ -43,3 +48,50 @@ def test_config_defaults():
     assert CONFIG.MAX_RETRIES == 3
     assert CONFIG.MAX_WORKERS == 4
     assert CONFIG.COL_PROMPT == "prompt"
+
+
+def test_cli_version():
+    """--version flag should print version string."""
+    from agent_eval.cli.main import cli
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--version"])
+    assert result.exit_code == 0
+    assert "agent-eval v" in result.output
+
+
+def test_cli_help_lists_all_commands():
+    """All commands must appear in --help output."""
+    from agent_eval.cli.main import cli
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["--help"])
+    assert result.exit_code == 0
+    for cmd in ["init", "interact", "evaluate", "analyze", "convert", "create-dataset"]:
+        assert cmd in result.output, f"Command '{cmd}' missing from --help"
+
+
+def test_init_creates_eval_structure():
+    """agent-eval init --auto-approve should scaffold the eval/ folder."""
+    from agent_eval.cli.main import cli
+
+    runner = CliRunner()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = runner.invoke(cli, [
+            "init", "--target-dir", tmpdir, "--agent-name", "test_agent",
+            "--mode", "both", "-y",
+        ])
+        assert result.exit_code == 0
+
+        eval_dir = Path(tmpdir) / "eval"
+        assert (eval_dir / "metrics" / "metric_definitions.json").exists()
+        assert (eval_dir / "scenarios" / "session_input.json").exists()
+        assert (eval_dir / "scenarios" / "conversation_scenarios.json").exists()
+        assert (eval_dir / "eval_data" / "golden_dataset.json").exists()
+
+        # Verify agent name is injected
+        session = json.loads((eval_dir / "scenarios" / "session_input.json").read_text())
+        assert session["app_name"] == "test_agent"
+
+        metrics = json.loads((eval_dir / "metrics" / "metric_definitions.json").read_text())
+        assert "general_quality" in metrics["metrics"]
