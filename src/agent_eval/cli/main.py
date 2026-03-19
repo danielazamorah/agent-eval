@@ -56,6 +56,7 @@ from agent_eval.cli.commands.analyze import analyze  # noqa: E402
 from agent_eval.cli.commands.convert import convert  # noqa: E402
 from agent_eval.cli.commands.create_dataset import create_dataset  # noqa: E402
 from agent_eval.cli.commands.init import init  # noqa: E402
+from agent_eval.cli.commands.simulate import simulate  # noqa: E402
 
 cli.add_command(interact)
 cli.add_command(evaluate)
@@ -63,6 +64,7 @@ cli.add_command(analyze)
 cli.add_command(convert)
 cli.add_command(create_dataset, name="create-dataset")
 cli.add_command(init)
+cli.add_command(simulate)
 
 
 def main():

@@ -1,14 +1,92 @@
 """agent-eval evaluate — run metrics on processed interaction data."""
 
+import json
+import os
 import sys
 from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from agent_eval.core.evaluator import Evaluator
 
 console = Console()
+
+
+def _display_metrics_summary(results_dir: str) -> None:
+    """Read eval_summary.json and display a metrics overview table."""
+    summary_path = Path(results_dir) / "eval_summary.json"
+    if not summary_path.exists():
+        return
+
+    try:
+        data = json.loads(summary_path.read_text())
+        overall = data.get("overall_summary", {})
+    except (json.JSONDecodeError, KeyError):
+        return
+
+    # ── LLM-as-Judge metrics table ─────────────────────────────────────
+    llm_metrics = overall.get("llm_based_metrics", {})
+    if llm_metrics:
+        table = Table(title="LLM-as-Judge Metrics", border_style="blue", padding=(0, 2))
+        table.add_column("Metric", style="bold")
+        table.add_column("Score", justify="right")
+        table.add_column("Range", justify="center", style="dim")
+        table.add_column("", justify="center")
+
+        for name, info in llm_metrics.items():
+            avg = info.get("average", 0)
+            sr = info.get("score_range", {})
+            max_val = sr.get("max", 5)
+            min_val = sr.get("min", 0)
+            range_str = f"{min_val}–{max_val}"
+
+            # Color based on how good the score is relative to range
+            ratio = (avg - min_val) / (max_val - min_val) if max_val > min_val else 0
+            if ratio >= 0.7:
+                color = "green"
+                indicator = "OK"
+            elif ratio >= 0.4:
+                color = "yellow"
+                indicator = "Review"
+            else:
+                color = "red"
+                indicator = "Check mapping"
+
+            table.add_row(name, f"[{color}]{avg:.1f}[/]", range_str, f"[{color}]{indicator}[/]")
+
+        console.print()
+        console.print(table)
+
+    # ── Key deterministic metrics ──────────────────────────────────────
+    det = overall.get("deterministic_metrics", {})
+    if det:
+        table = Table(title="Key Deterministic Metrics", border_style="blue", padding=(0, 2))
+        table.add_column("Metric", style="bold")
+        table.add_column("Value", justify="right")
+
+        # Pick the most useful metrics to show
+        highlights = [
+            ("Total tokens", "token_usage.total_tokens", "{:.0f}"),
+            ("Prompt tokens", "token_usage.prompt_tokens", "{:.0f}"),
+            ("Completion tokens", "token_usage.completion_tokens", "{:.0f}"),
+            ("Estimated cost", "token_usage.estimated_cost_usd", "${:.4f}"),
+            ("Total latency", "latency_metrics.total_latency_seconds", "{:.2f}s"),
+            ("LLM latency", "latency_metrics.llm_latency_seconds", "{:.2f}s"),
+            ("Cache hit rate", "cache_efficiency.cache_hit_rate", "{:.0%}"),
+            ("Tool calls", "tool_utilization.total_tool_calls", "{:.0f}"),
+            ("Tool success rate", "tool_success_rate.tool_success_rate", "{:.0%}"),
+        ]
+
+        for label, key, fmt in highlights:
+            val = det.get(key)
+            if val is not None:
+                table.add_row(label, fmt.format(val))
+
+        console.print()
+        console.print(table)
 
 
 @click.command()
@@ -43,9 +121,38 @@ def evaluate(interaction_file, metrics_files, results_dir, input_label, test_des
             metrics_files=list(metrics_files),
             results_dir=Path(results_dir),
         )
-        console.print(f"\n[bold green]Evaluation complete.[/]")
-        console.print(f"\nTo analyze results, run:")
-        console.print(f"  agent-eval analyze --results-dir {results_dir}")
+
+        cwd = Path.cwd()
+        rel_results = os.path.relpath(results_dir, cwd)
+        rel_metrics = os.path.relpath(metrics_files[0], cwd) if metrics_files else "<metrics.json>"
+
+        # ── Display metrics overview ───────────────────────────────────
+        _display_metrics_summary(results_dir)
+
+        console.print()
+        console.print(Panel(
+            f"[bold green]Evaluation complete![/]\n\n"
+            f"[bold]Results:[/]  {rel_results}/\n\n"
+            "[bold]Deep dive into the files:[/]\n"
+            f"  eval_summary.json        — Full aggregated scores\n"
+            f"  question_answer_log.md   — Per-question breakdown with scores\n\n"
+            "[bold]Scores look wrong?[/] Low scores often mean a [bold]metric mapping[/]\n"
+            "issue, not an agent problem. Each metric's `dataset_mapping`\n"
+            f"controls which trace fields the LLM judge sees. Edit:\n"
+            f"  {rel_metrics}\n\n"
+            "[dim]See docs/reference.md > Custom Metrics for mapping options.[/]",
+            title="[bold]Done[/]",
+            border_style="green",
+            padding=(1, 2),
+        ))
+
+        console.print()
+        console.print("[bold]Next step — copy and paste:[/]")
+        console.print()
+        console.print(f"uv run agent-eval analyze \\")
+        console.print(f"  --results-dir {rel_results}")
+        console.print()
+
     except Exception as e:
         import traceback
         traceback.print_exc()

@@ -32,9 +32,13 @@ A single-turn multi-agent AI pipeline for retail site selection. Given a busines
 Each agent is a standalone Python project with its own `pyproject.toml` and dependencies.
 
 ```bash
-cd customer-service  # or retail-ai-location-strategy
-cp .env.example .env  # configure your GCP project and API keys
-uv sync
+# From the agent-eval repository root:
+cp docs/tutorial/example_agents/customer-service/.env.example \
+   docs/tutorial/example_agents/customer-service/.env
+# Edit the .env file with your GCP project and API keys
+
+# Install dependencies
+uv sync --directory docs/tutorial/example_agents/customer-service
 ```
 
 See the [tutorial](../tutorial.md) for a complete walkthrough of evaluating and optimizing both agents step by step.

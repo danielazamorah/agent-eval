@@ -54,10 +54,11 @@ my-agent/
 | Command | Purpose |
 |---------|---------|
 | `uv run agent-eval init` | Scaffold eval folder structure |
-| `uv run agent-eval interact` | Run queries against a live agent endpoint |
-| `uv run agent-eval convert` | Convert ADK User Sim traces to evaluation format |
+| `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
+| `uv run agent-eval interact` | Run queries against a live agent endpoint (single-turn) |
 | `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
 | `uv run agent-eval analyze` | Generate AI-powered analysis reports |
+| `uv run agent-eval convert` | Convert ADK traces to evaluation format (used by simulate) |
 | `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
 
 ---
@@ -145,6 +146,6 @@ Instructions:
 ## Critical Reminders
 
 1. **Always use Vertex AI**, not API keys (evaluation won't work otherwise)
-2. **Clear eval_history** before each ADK User Sim run: `rm -rf <agent_module>/.adk/eval_history/*`
+2. **Clear eval_history** before each ADK User Sim run — `simulate` does this automatically; if running manually: `rm -rf <agent_module>/.adk/eval_history/*`
 3. **Use `--location global`** for Gemini 2.5+ models in the analyze command
 4. **`app_name` must match the folder name** containing `agent.py`, not the agent's display name

@@ -7,17 +7,18 @@ Complete documentation for the `agent-eval` CLI, metrics, data formats, and cust
 ## Table of Contents
 
 1. [Environment Setup](#environment-setup)
-2. [CLI Reference](#cli-reference)
-3. [Interaction Modes](#interaction-modes)
-4. [Metrics Deep Dive](#metrics-deep-dive)
-5. [Creating Custom Metrics](#creating-custom-metrics)
-6. [Structured Response Evaluation](#structured-response-evaluation)
-7. [Output Files](#output-files)
-8. [Data Formats](#data-formats)
-9. [Adapting for Your Own Agent](#adapting-for-your-own-agent)
-10. [Creating Custom Simulations](#creating-custom-simulations)
-11. [Troubleshooting](#troubleshooting)
-12. [AI Assistant Setup](#ai-assistant-setup)
+2. [Metrics Overview](#metrics-overview)
+3. [CLI Reference](#cli-reference)
+4. [Interaction Modes](#interaction-modes)
+5. [Metrics Deep Dive](#metrics-deep-dive)
+6. [Creating Custom Metrics](#creating-custom-metrics)
+7. [Structured Response Evaluation](#structured-response-evaluation)
+8. [Output Files](#output-files)
+9. [Data Formats](#data-formats)
+10. [Adapting for Your Own Agent](#adapting-for-your-own-agent)
+11. [Creating Custom Simulations](#creating-custom-simulations)
+12. [Troubleshooting](#troubleshooting)
+13. [AI Assistant Setup](#ai-assistant-setup)
 
 ---
 
@@ -78,6 +79,39 @@ agent-eval/
 
 ---
 
+## Metrics Overview
+
+`agent-eval` produces two categories of metrics. Understanding them upfront makes the rest of this guide easier to follow.
+
+### Deterministic Metrics (automatic)
+
+Extracted directly from OpenTelemetry traces — no configuration needed. These are the same for every agent:
+
+| Metric Group | What you learn | Key fields |
+|-------------|---------------|------------|
+| **Token Usage** | How many tokens the agent consumes and estimated cost | `total_tokens`, `prompt_tokens`, `estimated_cost_usd` |
+| **Latency** | Where time is spent (LLM, tools, overhead) | `total_latency_seconds`, `llm_latency_seconds`, `tool_latency_seconds` |
+| **Cache Efficiency** | Is your prompt structured for KV-cache hits? | `cache_hit_rate`, `cached_tokens`, `fresh_prompt_tokens` |
+| **Tool Reliability** | How often tool calls succeed vs fail | `tool_success_rate`, `failed_tool_calls` |
+| **Thinking** | How much the model reasons before responding | `reasoning_ratio`, `thinking_tokens` |
+
+### LLM-as-Judge Metrics (configurable)
+
+Scored by Vertex AI Evaluation using rubrics you define in `eval/metrics/metric_definitions.json`. The `init` command creates starter metrics; you customize them for your agent.
+
+| Default Metric | What it scores | Score Range |
+|---------------|---------------|-------------|
+| `general_quality` | Overall response quality (managed by Vertex AI) | 0–1 |
+| `trajectory_accuracy` | Did the agent take the right execution path? | 0–5 |
+| `tool_use_quality` | Were tool arguments correct and calls efficient? | 0–5 |
+| `safety` | Safety compliance (managed by Vertex AI) | 0–1 |
+
+You can define **custom metrics** with your own scoring rubrics — see [Creating Custom Metrics](#creating-custom-metrics) below.
+
+> **Important:** Each metric has a `dataset_mapping` that controls which trace fields the LLM judge receives. If a metric scores unexpectedly low (e.g., 0.0), it often means the mapping points to the wrong field — not that your agent is broken. Always validate your metrics alongside your agent.
+
+---
+
 ## CLI Reference
 
 ### All Commands
@@ -85,15 +119,16 @@ agent-eval/
 | Command | Purpose | Mode |
 |---------|---------|------|
 | \`uv run agent-eval init` | Scaffold eval folder structure | Setup |
-| \`uv run agent-eval convert` | Convert ADK traces to JSONL | ADK User Sim |
+| \`uv run agent-eval simulate` | Run ADK User Sim + convert traces | ADK User Sim |
 | \`uv run agent-eval interact` | Run interactions against live agent | DIY Interactions |
 | \`uv run agent-eval evaluate` | Run metrics on interactions | Both |
 | \`uv run agent-eval analyze` | Generate reports and AI analysis | Both |
+| \`uv run agent-eval convert` | Convert ADK traces to JSONL (used by simulate) | ADK User Sim |
 | \`uv run agent-eval create-dataset` | Convert test files to Golden Dataset | DIY Interactions |
 
 ### \`uv run agent-eval init`
 
-Scaffolds the `eval/` folder structure for a new agent project with starter metrics and data files.
+Scaffolds the `eval/` folder structure for an ADK agent. Automatically discovers `agent.py` files in the current directory tree and lets you select which agent to add evaluation to. The `eval/` folder is created inside the agent module directory, as a sibling to `agent.py`.
 
 ```bash
 uv run agent-eval init
@@ -101,14 +136,39 @@ uv run agent-eval init
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--target-dir` | `.` | Root directory of your agent project |
-| `--agent-name` | (prompted) | Agent application name |
+| `--target-dir` | (auto-detected) | Directory containing agent.py (eval/ created here) |
+| `--agent-name` | (auto-detected) | Agent module name |
 | `--mode` | (prompted) | Interaction mode: `user-sim`, `diy`, or `both` |
 | `--auto-approve`, `-y` | `false` | Skip interactive prompts, use defaults |
 
+### \`uv run agent-eval simulate`
+
+Runs the full ADK User Sim workflow in a single command: creates symlinks so ADK can find scenario files, clears previous traces, sets up a fresh eval set, runs the simulation, and converts traces to agent-eval format.
+
+```bash
+uv run agent-eval simulate --agent-dir <path-to-agent-module>
+```
+
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `--agent-dir` | Yes | — | Path to agent module directory (containing agent.py) |
+| `--eval-dir` | No | (auto-detected) | Path to eval/ directory |
+
+**What it does (5 steps):**
+
+1. **Symlink scenario files** — Creates symlinks for `session_input.json`, `conversation_scenarios.json`, and `eval_config.json` from `eval/scenarios/` into the agent module directory (ADK requires these next to `agent.py`)
+2. **Clear eval history** — Removes `.adk/eval_history/` to avoid mixing stale traces with new results
+3. **Create eval set** — Recreates the eval set from scratch and loads your scenarios (ADK's `add_eval_case` appends, so recreating avoids duplicates)
+4. **Run ADK User Sim** — Runs `adk eval` which has an LLM simulate users following your scenario scripts
+5. **Convert traces** — Converts the resulting OpenTelemetry traces to agent-eval's JSONL format
+
+**Output:** `eval/results/<timestamp>/raw/processed_interaction_sim.jsonl`
+
+> **Note:** ADK's built-in eval runs a limited set of metrics (hallucination, safety). The `evaluate` command adds deterministic metrics (latency, tokens, cost, cache efficiency) and custom LLM-as-judge metrics via Vertex AI Evaluation. This also means agent-eval is not locked to ADK — you can run `evaluate` and `analyze` on traces from any agent framework.
+
 ### \`uv run agent-eval convert`
 
-Converts ADK simulator history (`.adk/eval_history/`) to evaluation JSONL.
+Converts ADK simulator history (`.adk/eval_history/`) to evaluation JSONL. This is called automatically by `simulate` — you only need this if you ran ADK manually.
 
 ```bash
 uv run agent-eval convert \
@@ -126,26 +186,36 @@ uv run agent-eval convert \
 
 ### \`uv run agent-eval interact`
 
-Runs interactions against a live agent endpoint.
+Runs interactions against a live agent endpoint. Prompts interactively for any missing configuration.
 
 ```bash
+# Interactive — prompts for questions file, base URL, run ID:
+uv run agent-eval interact --agent-dir path/to/agent_module
+
+# Non-interactive — all options provided:
 uv run agent-eval interact \
-  --app-name <agent_name> \
-  --questions-file <path-to-golden.json> \
-  --base-url <agent-url> \
-  --results-dir <path-to-results>
+  --agent-dir path/to/agent_module \
+  --questions-file path/to/golden_dataset.json \
+  --base-url http://localhost:8501 \
+  --run-id baseline
 ```
+
+Before running, start your agent in a separate terminal:
+- **ADK Starter Pack:** `cd path/to/agent && make playground` (port 8501)
+- **Custom agents:** start your server on any port
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
-| `--app-name` | Yes | — | Agent application name |
-| `--questions-file` | Yes | — | Golden Dataset JSON |
-| `--base-url` | No | `http://localhost:8080` | Agent API URL |
-| `--results-dir` | No | `results/` | Output directory |
-| `--user-id` | No | `test_user` | User ID for session |
+| `--agent-dir` | No | — | Agent module directory (prompted if omitted) |
+| `--app-name` | No | dir name | Agent application name |
+| `--questions-file` | No | auto-detected | Golden Dataset JSON (prompted if not found) |
+| `--base-url` | No | prompted | Agent API URL (prompted if omitted) |
+| `--results-dir` | No | auto-detected | Output directory |
+| `--run-id` | No | prompted | Name for results folder (prompted if omitted) |
+| `--user-id` | No | `eval_user` | User ID for session |
 | `--runs` | No | `1` | Number of runs per question |
 
-**Output:** `<results-dir>/<timestamp>/raw/processed_interaction_<app_name>.jsonl`
+**Output:** `<results-dir>/<run-id>/raw/processed_interaction_<app_name>.jsonl`
 
 ### \`uv run agent-eval evaluate`
 
@@ -221,7 +291,14 @@ Use the ADK simulator to generate multi-turn conversations from scenario definit
 1. Define conversation scenarios (intent + plan)
 2. ADK uses an LLM to simulate a realistic user following your plan
 3. The agent responds naturally to the simulated user
-4. Traces are captured in `.adk/eval_history/`
+4. Traces are captured and converted to evaluation format
+
+**Run it:**
+```bash
+uv run agent-eval simulate --agent-dir path/to/agent_module
+```
+
+The `simulate` command handles the full workflow: symlinks scenario files for ADK, clears stale traces, creates a fresh eval set, runs the simulation, and converts traces automatically.
 
 **When to use:**
 - Development and rapid iteration
@@ -232,9 +309,10 @@ Use the ADK simulator to generate multi-turn conversations from scenario definit
 
 **Files needed:**
 ```
-eval/scenarios/
+agent_module/eval/scenarios/
 ├── conversation_scenarios.json   # Scenario definitions
-└── session_input.json            # Session config (app_name, user_id)
+├── session_input.json            # Session config (app_name, user_id)
+└── eval_config.json              # ADK eval criteria (auto-created if missing)
 ```
 
 ### DIY Interactions
@@ -243,9 +321,9 @@ Run interactions against a live agent endpoint. Use when you have specific queri
 
 **How it works:**
 1. Create a Golden Dataset with queries and expected responses
-2. Start your agent
-3. Run `uv run agent-eval interact` against the running agent
-4. Traces are captured as JSONL
+2. Start your agent (`make playground` for ADK Starter Pack, port 8501)
+3. Run `uv run agent-eval interact --agent-dir path/to/agent_module` — it prompts for any missing config
+4. Responses and traces are captured as JSONL
 
 **When to use:**
 - Single-turn pipeline agents (ADK User Sim is overkill)
@@ -742,20 +820,14 @@ Create a Golden Dataset:
 }
 ```
 
-### 4. Run Evaluation
+### 4. Generate Interactions
 
 ```bash
-# For ADK agents — convert traces
-uv run agent-eval convert \
-  --agent-dir ~/my-agent/my_agent_module \
-  --output-dir ~/my-agent/eval/results
+# For ADK agents (multi-turn) — simulate runs the full workflow
+uv run agent-eval simulate --agent-dir ~/my-agent/my_agent_module
 
-# For live agents — run interactions
-uv run agent-eval interact \
-  --app-name my_agent \
-  --questions-file ~/my-agent/eval/golden_dataset.json \
-  --base-url http://localhost:8080 \
-  --results-dir ~/my-agent/eval/results
+# For live agents (single-turn) — prompts interactively for missing config
+uv run agent-eval interact --agent-dir ~/my-agent/my_agent_module
 ```
 
 ---
@@ -797,18 +869,18 @@ Create `eval/scenarios/session_input.json`:
 ### Step 3: Run the Simulation
 
 ```bash
-cd your-agent
-rm -rf agent_module/.adk/eval_history/*
-
-# Create eval set
-uv run adk eval_set create agent_module eval_set_name
-uv run adk eval_set add_eval_case agent_module eval_set_name \
-  --scenarios_file eval/scenarios/conversation_scenarios.json \
-  --session_input_file eval/scenarios/session_input.json
-
-# Run simulation
-uv run adk eval agent_module eval_set_name
+# From the agent-eval repository root:
+uv run agent-eval simulate --agent-dir path/to/your_agent_module
 ```
+
+The `simulate` command handles the full workflow automatically:
+1. Creates symlinks so ADK can find your scenario files
+2. Clears previous eval_history to avoid stale traces
+3. Creates a fresh eval_set (avoids duplicate scenarios)
+4. Runs ADK User Sim with your scenarios
+5. Converts the resulting traces to agent-eval JSONL format
+
+It prints the exact `evaluate` and `analyze` commands to run next.
 
 ---
 
@@ -832,7 +904,7 @@ uv run adk eval agent_module eval_set_name
 ### ADK evaluation shows stale results
 
 **Cause:** Didn't clear `eval_history` before running.
-**Fix:** `rm -rf agent_module/.adk/eval_history/*`
+**Fix:** Use `uv run agent-eval simulate` which clears eval_history automatically. If running ADK manually: `rm -rf agent_module/.adk/eval_history/*`
 
 ### Vertex AI authentication errors
 
@@ -881,13 +953,13 @@ Do NOT penalize the agent for correctly relaying mock data.
 ### ADK UserSim: "Error rendering metric prompt template" during `adk eval`
 
 **Cause:** ADK UserSim runs a built-in evaluation by default after the simulation completes. If no eval config file is provided, the default metrics may fail. This does not affect the simulation runs themselves — the agent interactions and traces are captured successfully. `agent-eval` runs its own separate evaluation step using the Vertex AI SDK.
-**Fix:** Provide an eval config file with your `adk eval` command:
+**Fix:** The `simulate` command auto-creates a default `eval_config.json` if one doesn't exist. If running ADK manually, provide an eval config file:
 
 ```bash
 uv run adk eval my_agent --config_file_path my_agent/eval_config.json eval_set_name
 ```
 
-If you don't have an eval config file, create one (e.g., `eval/eval_config.json`):
+If you need to create one manually (e.g., `eval/scenarios/eval_config.json`):
 
 ```json
 {

@@ -2,6 +2,8 @@
 
 A step-by-step walkthrough using the two example agents included in this repository. By the end, you'll understand the full evaluation pipeline and how to apply it to your own agents.
 
+> **Note:** This tutorial is under active validation. The example agents and evaluation workflows have been tested, but some steps or paths may need adjustment as the tool evolves. If you encounter issues, please check the [troubleshooting section](reference.md#troubleshooting) in the reference guide or open an issue.
+
 ---
 
 ## What You'll Do
@@ -22,7 +24,7 @@ For every step, we follow a rigorous loop inspired by the scientific method:
 ## Prerequisites
 
 1. Complete the [installation steps](../README.md#installation) in the README
-2. Ensure `agent-eval --help` works
+2. Ensure `uv run agent-eval --help` works
 3. Have a GCP project with Vertex AI enabled
 4. (Recommended) Install [Gemini CLI](https://github.com/google-gemini/gemini-cli) or [Claude Code](https://docs.anthropic.com/en/docs/build-with-claude/claude-code) for AI-assisted analysis
 
@@ -76,11 +78,11 @@ gcloud services enable aiplatform.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
 **Customer Service Agent:**
 
 ```bash
-cd docs/tutorial/example_agents/customer-service
-cp .env.example .env
+cp docs/tutorial/example_agents/customer-service/.env.example \
+   docs/tutorial/example_agents/customer-service/.env
 ```
 
-Edit `.env` and set:
+Edit `docs/tutorial/example_agents/customer-service/.env` and set:
 ```
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
@@ -90,11 +92,11 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE
 **Retail AI Agent:**
 
 ```bash
-cd ../retail-ai-location-strategy
-cp .env.example .env
+cp docs/tutorial/example_agents/retail-ai-location-strategy/.env.example \
+   docs/tutorial/example_agents/retail-ai-location-strategy/.env
 ```
 
-Edit `.env` and set:
+Edit `docs/tutorial/example_agents/retail-ai-location-strategy/.env` and set:
 ```
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
@@ -107,13 +109,12 @@ MAPS_API_KEY=your-maps-api-key
 ### 1.3 Install Dependencies
 
 ```bash
-# From repo root
+# From repo root — install agent-eval
 uv sync
 
 # Install example agent dependencies
-cd docs/tutorial/example_agents/customer-service && uv sync
-cd ../retail-ai-location-strategy && uv sync
-cd ../..
+uv sync --directory docs/tutorial/example_agents/customer-service
+uv sync --directory docs/tutorial/example_agents/retail-ai-location-strategy
 ```
 
 ---
@@ -125,46 +126,29 @@ ADK User Sim generates multi-turn conversations from scenario definitions. Inste
 ### 2.1 Run the Simulation
 
 ```bash
-cd docs/tutorial/example_agents/customer-service
-
-# Create eval set
-uv run adk eval_set create customer_service eval_set_with_scenarios
-
-# Add test scenarios
-uv run adk eval_set add_eval_case customer_service eval_set_with_scenarios \
-  --scenarios_file eval/scenarios/conversation_scenarios.json \
-  --session_input_file eval/scenarios/session_input.json
-
-# Run simulation (2-3 minutes)
-uv run adk eval customer_service \
-  --config_file_path customer_service/eval_config.json \
-  eval_set_with_scenarios
+# From the agent-eval repository root:
+uv run agent-eval simulate \
+  --agent-dir docs/tutorial/example_agents/customer-service/customer_service
 ```
 
-### 2.2 Convert Traces & Evaluate
+The `simulate` command handles the full workflow: symlinks scenario files, clears previous traces, creates a fresh eval set, runs ADK User Sim, and converts traces to evaluation format.
+
+### 2.2 Evaluate & Analyze
+
+The `simulate` command prints the exact commands to run next — copy and paste them. They will look like:
 
 ```bash
-cd ../..
-
-# Convert ADK traces to evaluation format
-export CS_RUN_DIR=$(agent-eval convert \
-  --agent-dir docs/tutorial/example_agents/customer-service/customer_service \
-  --output-dir docs/tutorial/example_agents/customer-service/eval/results \
-  2>&1 | grep "Run folder:" | awk '{print $3}')
-
-echo "Results saved to: $CS_RUN_DIR"
-
 # Run evaluation
 uv run agent-eval evaluate \
-  --interaction-file $CS_RUN_DIR/raw/processed_interaction_sim.jsonl \
-  --metrics-files docs/tutorial/example_agents/customer-service/eval/metrics/metric_definitions.json \
-  --results-dir $CS_RUN_DIR \
+  --interaction-file docs/tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp>/raw/processed_interaction_sim.jsonl \
+  --metrics-files docs/tutorial/example_agents/customer-service/customer_service/eval/metrics/metric_definitions.json \
+  --results-dir docs/tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp> \
   --input-label baseline
 
 # Analyze
 uv run agent-eval analyze \
-  --results-dir $CS_RUN_DIR \
-  --agent-dir docs/tutorial/example_agents/customer-service \
+  --results-dir docs/tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp> \
+  --agent-dir docs/tutorial/example_agents/customer-service/customer_service \
   --location global
 ```
 
@@ -197,7 +181,6 @@ cat $CS_RUN_DIR/eval_summary.json     # Raw metrics
 
 ```bash
 cd docs/tutorial/example_agents/retail-ai-location-strategy
-uv sync
 make dev  # Starts on port 8502
 ```
 
@@ -207,7 +190,7 @@ Keep this terminal running.
 
 ```bash
 # From repo root
-export RETAIL_RUN_DIR=$(agent-eval interact \
+export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
   --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
@@ -290,43 +273,18 @@ Each exercise below tells you exactly what to change, why, and what to expect. A
 
 ### How to Re-Run Evaluation After a Change
 
-After modifying agent code, always run the full cycle:
+After modifying agent code, always run the full cycle from the **agent-eval repository root**:
 
 ```bash
-cd docs/tutorial/example_agents/customer-service
+# Step 1: Re-run simulation (handles clearing traces, creating eval set, etc.)
+uv run agent-eval simulate \
+  --agent-dir docs/tutorial/example_agents/customer-service/customer_service
 
-# Clear previous simulation data
-rm -rf customer_service/.adk/eval_history/*
-rm -f customer_service/*.evalset.json
-
-# Re-run simulation
-uv run adk eval_set create customer_service eval_set_with_scenarios
-uv run adk eval_set add_eval_case customer_service eval_set_with_scenarios \
-  --scenarios_file eval/scenarios/conversation_scenarios.json \
-  --session_input_file eval/scenarios/session_input.json
-uv run adk eval customer_service \
-  --config_file_path customer_service/eval_config.json \
-  eval_set_with_scenarios
-
-cd ../..
-
-# Convert, evaluate, analyze
-export CS_RUN_DIR=$(agent-eval convert \
-  --agent-dir docs/tutorial/example_agents/customer-service/customer_service \
-  --output-dir docs/tutorial/example_agents/customer-service/eval/results \
-  2>&1 | grep "Run folder:" | awk '{print $3}')
-
-uv run agent-eval evaluate \
-  --interaction-file $CS_RUN_DIR/raw/processed_interaction_sim.jsonl \
-  --metrics-files docs/tutorial/example_agents/customer-service/eval/metrics/metric_definitions.json \
-  --results-dir $CS_RUN_DIR \
-  --input-label <optimization-name>
-
-uv run agent-eval analyze \
-  --results-dir $CS_RUN_DIR \
-  --agent-dir docs/tutorial/example_agents/customer-service \
-  --location global
+# Step 2: Copy the evaluate and analyze commands printed by simulate
+# They include the correct paths for this run's timestamp
 ```
+
+> **Tip:** The `simulate` command prints the exact `evaluate` and `analyze` commands with the correct paths — just copy and paste them. Change `--input-label` to match your optimization (e.g., `--input-label tool-hardening`).
 
 Then use your AI assistant to compare the new results against the baseline:
 
@@ -778,7 +736,7 @@ cd docs/tutorial/example_agents/retail-ai-location-strategy
 make dev
 
 # Terminal 2: Run evaluation
-export RETAIL_RUN_DIR=$(agent-eval interact \
+export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
   --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \

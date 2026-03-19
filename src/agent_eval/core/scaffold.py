@@ -90,7 +90,10 @@ def scaffold_eval_structure(
 
     # Resolve which metrics to include
     if metrics is None:
-        metrics = ["general_quality", "trajectory_accuracy"]
+        if mode == "diy":
+            metrics = ["general_quality", "tool_use_quality", "safety"]
+        else:
+            metrics = ["general_quality", "trajectory_accuracy", "tool_use_quality", "safety"]
 
     # Build metric definitions
     metric_defs = {"metrics": {}}

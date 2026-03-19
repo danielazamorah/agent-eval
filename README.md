@@ -18,6 +18,56 @@ It consolidates the full evaluation workflow into a single CLI: generate interac
 
 ---
 
+## How it works
+
+```
+  Interact           Evaluate              Analyze
+ ──────────       ────────────          ────────────
+│ simulate │ ──▶ │ Deterministic │ ──▶ │ Gemini AI  │
+│ interact │     │ + LLM Judge   │     │ Diagnosis  │
+ ──────────       ────────────          ────────────
+
+ Generate           Score traces          Root cause
+ agent traces       with metrics          analysis
+```
+
+**1. Interact** — Generate agent traces via ADK User Sim (multi-turn) or DIY queries (single-turn)
+
+**2. Evaluate** — Score traces with two types of metrics:
+
+| Type | What it measures | How it works |
+|------|-----------------|--------------|
+| **Deterministic** | Latency, tokens, cost, cache efficiency, tool reliability | Auto-extracted from OpenTelemetry traces — no configuration needed |
+| **LLM-as-Judge** | Response quality, trajectory accuracy, tool use, safety | Scored by Vertex AI using customizable rubrics you define |
+
+**3. Analyze** — Gemini reads all metrics and generates a diagnosis report with root cause analysis and optimization recommendations.
+
+### Metrics at a glance
+
+**Deterministic** (automatic, same for all agents):
+
+| Metric | What you learn |
+|--------|---------------|
+| `token_usage.*` | Total tokens, prompt vs completion, estimated cost in USD |
+| `latency_metrics.*` | Total time, LLM time, tool time, time to first response |
+| `cache_efficiency.*` | KV-cache hit rate — are your prompts structured for caching? |
+| `tool_success_rate.*` | How often tool calls succeed vs fail |
+| `thinking_metrics.*` | How much the model "thinks" before responding |
+
+**LLM-as-Judge** (configurable per agent in `metric_definitions.json`):
+
+| Metric | What it scores |
+|--------|---------------|
+| `general_quality` | Overall response quality (Vertex AI managed) |
+| `trajectory_accuracy` | Did the agent take the right path through tools? |
+| `tool_use_quality` | Were tool arguments correct and efficient? |
+| `safety` | Safety compliance (Vertex AI managed) |
+| Custom metrics | Anything you define with a scoring rubric |
+
+> Metrics are defined in `eval/metrics/metric_definitions.json`. The `init` command creates starter metrics; you customize them for your agent. See [docs/reference.md](docs/reference.md) for the full metrics glossary and custom metric creation guide.
+
+---
+
 ## Requirements
 
 | Requirement | Version | Notes |
@@ -84,7 +134,7 @@ gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
 
 ## Quickstart
 
-`agent-eval` works inside your ADK agent project — the directory that contains your agent module (with `agent.py`, tools, prompts, etc.).
+All `uv run agent-eval` commands run from the **agent-eval repository root**. You point the CLI to your agent using `--agent-dir` with the path to the folder containing your `agent.py`.
 
 > **Don't have an agent yet?** Create one with [Agent Starter Pack](https://github.com/GoogleCloudPlatform/agent-starter-pack):
 >
@@ -93,8 +143,6 @@ gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
 > ```
 >
 > Or to follow along with the [tutorial](docs/tutorial.md), use one of the [example agents](docs/tutorial/example_agents/).
->
-> **Note:** Run all `uv run agent-eval` commands from the agent-eval repository root. The CLI takes paths to your agent project via flags like `--agent-dir` and `--target-dir`.
 
 ### 1. Initialize your project
 
@@ -102,9 +150,7 @@ gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
 uv run agent-eval init
 ```
 
-This interactive command scaffolds an `eval/` folder in your agent project with starter metrics, scenario files, and a golden dataset.
-
-The **agent name** is the name of the folder containing your `agent.py`, tools, and sub-agents. For agents scaffolded with [Agent Starter Pack](https://github.com/GoogleCloudPlatform/agent-starter-pack), this is typically `app`. The default is `app`, but enter whatever matches your agent module folder name.
+The CLI scans for `agent.py` files and lets you select which agent to scaffold evaluation for. It creates an `eval/` folder inside the agent module directory with starter metrics, scenario files, and a golden dataset.
 
 Use `uv run agent-eval init -y` for non-interactive mode with defaults.
 
@@ -114,60 +160,49 @@ Choose the method that fits your agent:
 
 | Method | Best for | Command |
 |--------|----------|---------|
-| **ADK User Sim** | Multi-turn conversational agents | `adk eval` → `uv run agent-eval convert` |
+| **ADK User Sim** | Multi-turn conversational agents | `uv run agent-eval simulate` |
 | **DIY Interactions** | Single-turn agents, deployed endpoints | `uv run agent-eval interact` |
 
 **ADK User Sim** (multi-turn):
 
 ```bash
-# In your agent project directory
-uv run adk eval_set create <agent_module> eval_set
-uv run adk eval_set add_eval_case <agent_module> eval_set \
-  --scenarios_file eval/scenarios/conversation_scenarios.json \
-  --session_input_file eval/scenarios/session_input.json
-uv run adk eval <agent_module> eval_set
-
-# Convert traces to evaluation format
-uv run agent-eval convert \
-  --agent-dir <agent_module> \
-  --output-dir eval/results
+# Pass the full path to your agent module (the folder with agent.py)
+uv run agent-eval simulate --agent-dir path/to/your/agent_module
 ```
+
+This single command handles the full workflow: creates symlinks for ADK, clears previous traces, sets up a fresh eval set, runs the simulation, and converts traces to evaluation format.
 
 **DIY Interactions** (single-turn or live agents):
 
 ```bash
-# Start your agent, then:
-uv run agent-eval interact \
-  --app-name <agent_name> \
-  --questions-file eval/eval_data/golden_dataset.json \
-  --base-url http://localhost:8080 \
-  --results-dir eval/results
+# First, start your agent (in a separate terminal):
+# ADK Starter Pack agents: cd path/to/your/agent && make playground
+# Custom agents: start your server on any port
+
+# Then run the interactive command:
+uv run agent-eval interact --agent-dir path/to/your/agent_module
 ```
 
-### 3. Evaluate
+The command prompts for any missing configuration (questions file, base URL, run ID). Pass `--base-url`, `--questions-file`, etc. to skip prompts in CI.
+
+### 3. Evaluate & Analyze
+
+> **Don't type these commands manually!** Both `simulate` and `interact` print the exact `evaluate` and `analyze` commands with the correct paths pre-filled at the end of their output. Just copy and paste them.
+
+The commands look like this:
 
 ```bash
 uv run agent-eval evaluate \
-  --interaction-file eval/results/<run>/raw/processed_interaction_*.jsonl \
-  --metrics-files eval/metrics/metric_definitions.json \
-  --results-dir eval/results/<run>
-```
+  --interaction-file <path-to-interactions.jsonl> \
+  --metrics-files <path-to-metric_definitions.json> \
+  --results-dir <path-to-run-dir>
 
-### 4. Analyze
-
-```bash
 uv run agent-eval analyze \
-  --results-dir eval/results/<run> \
-  --agent-dir <path-to-agent> \
-  --location global
+  --results-dir <path-to-run-dir> \
+  --agent-dir <path-to-agent-module>
 ```
 
-Review the results:
-
-```bash
-cat eval/results/<run>/gemini_analysis.md    # AI-generated analysis
-cat eval/results/<run>/eval_summary.json     # Raw metrics
-```
+The `evaluate` command displays a metrics summary table directly in the terminal. The `analyze` command renders the full AI diagnosis report in the terminal. Results are also saved to files for deeper review.
 
 ---
 
@@ -176,33 +211,14 @@ cat eval/results/<run>/eval_summary.json     # Raw metrics
 | Command | Purpose |
 |---------|---------|
 | `uv run agent-eval init` | Scaffold eval folder structure for a new project |
-| `uv run agent-eval interact` | Run interactions against a live agent endpoint |
-| `uv run agent-eval convert` | Convert ADK traces to evaluation format |
+| `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
+| `uv run agent-eval interact` | Run interactions against a live agent endpoint (single-turn) |
 | `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
 | `uv run agent-eval analyze` | Generate reports and AI-powered analysis |
+| `uv run agent-eval convert` | Convert ADK traces to evaluation format (used by simulate) |
 | `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
 
 Run `uv run agent-eval --help` or `uv run agent-eval <command> --help` for detailed usage.
-
----
-
-## Metrics
-
-The evaluation produces two types of metrics:
-
-**Deterministic** (extracted automatically from traces):
-- `latency_metrics.*` — timing data
-- `token_usage.*` — input/output tokens, estimated cost
-- `cache_efficiency.*` — KV-cache hit rates
-- `tool_success_rate.*` — tool call reliability
-
-**LLM-as-Judge** (scored by Vertex AI):
-- `general_quality` — overall response quality
-- `trajectory_accuracy` — execution path correctness
-- `tool_use_quality` — tool argument correctness
-- Custom metrics you define
-
-See [docs/reference.md](docs/reference.md) for the full metrics glossary, custom metric creation, and data format specifications.
 
 ---
 
