@@ -1,6 +1,6 @@
 # Agent Evaluation Reference Guide
 
-Deep-dive documentation for the `agent-eval` CLI, metrics, and customization. For the step-by-step workshop, see [README.md](README.md).
+Complete documentation for the `agent-eval` CLI, metrics, data formats, and customization.
 
 ---
 
@@ -17,9 +17,7 @@ Deep-dive documentation for the `agent-eval` CLI, metrics, and customization. Fo
 9. [Adapting for Your Own Agent](#adapting-for-your-own-agent)
 10. [Creating Custom Simulations](#creating-custom-simulations)
 11. [Troubleshooting](#troubleshooting)
-12. [Understanding Trade-offs](#understanding-trade-offs)
-13. [Context Engineering Principles](#context-engineering-principles)
-14. [AI Assistant Setup (Optional)](#ai-assistant-setup-optional)
+12. [AI Assistant Setup](#ai-assistant-setup)
 
 ---
 
@@ -29,23 +27,15 @@ Deep-dive documentation for the `agent-eval` CLI, metrics, and customization. Fo
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Python | 3.10-3.12 | Python 3.13+ not yet supported |
+| Python | 3.10–3.12 | Python 3.13+ not yet supported |
 | uv | Latest | Package manager |
 | gcloud CLI | Latest | Google Cloud authentication |
 | Vertex AI API | Enabled | Required for evaluation metrics |
 
 ### Required IAM Permissions
 
-- `roles/aiplatform.user` - For running evaluations
-- `roles/resourcemanager.projectIamAdmin` - For quota project setup
-
-### Recommended Environments
-
-| Environment | Notes |
-|-------------|-------|
-| **CloudTop** | Recommended for Googlers |
-| **Cloud Shell** | Works well, pre-authenticated |
-| **Mac (local)** | Works, ensure gcloud is configured |
+- `roles/aiplatform.user` — For running evaluations
+- `roles/resourcemanager.projectIamAdmin` — For quota project setup
 
 ### Critical: Vertex AI Configuration
 
@@ -66,35 +56,25 @@ Deep-dive documentation for the `agent-eval` CLI, metrics, and customization. Fo
 
 ### Dependency Management
 
-This repository has **three separate Python projects**, each with its own `pyproject.toml` and `uv.lock`:
+The repository contains the `agent-eval` CLI package and example agents, each with their own dependencies:
 
 ```
-accelerate/
-├── evaluation/           # agent-eval CLI tool
-│   ├── pyproject.toml    # google-adk>=1.22.0, google-cloud-aiplatform[evaluation]
-│   └── uv.lock
-├── customer-service/     # Customer Service ADK agent
-│   ├── pyproject.toml    # google-adk[eval]>=1.0.0
-│   └── uv.lock
-└── retail-ai-location-strategy/  # Retail AI ADK agent
-    ├── pyproject.toml    # google-adk[eval]>=1.22.0
-    └── uv.lock
+agent-eval/
+├── pyproject.toml                       # agent-eval CLI tool
+├── uv.lock
+├── examples/
+│   ├── customer-service/                # Example: multi-turn agent
+│   │   ├── pyproject.toml
+│   │   └── uv.lock
+│   └── retail-ai-location-strategy/     # Example: single-turn pipeline
+│       ├── pyproject.toml
+│       └── uv.lock
 ```
 
 **Why separate?**
-- The `evaluation/` folder is a **standalone CLI tool** that can evaluate any ADK agent
-- Agent folders contain the agents themselves with their own dependencies
+- `agent-eval` is a **standalone CLI tool** that can evaluate any ADK agent
+- Example agent folders contain the agents themselves with their own dependencies
 - This separation allows you to use `agent-eval` with agents from other repositories
-
-**When to run `uv sync`:**
-
-| Folder | When to sync | Command |
-|--------|--------------|---------|
-| `evaluation/` | Before running `agent-eval` commands | `cd evaluation && uv sync` |
-| `customer-service/` | Before running `adk` commands or the agent | `cd customer-service && uv sync` |
-| `retail-ai-location-strategy/` | Before running `make dev` or the agent | `cd retail-ai-location-strategy && uv sync` |
-
-**Best Practice:** Keep your ADK version aligned across projects. If you update `google-adk` in one project, consider updating the others to avoid compatibility issues.
 
 ---
 
@@ -104,27 +84,43 @@ accelerate/
 
 | Command | Purpose | Mode |
 |---------|---------|------|
+| `agent-eval init` | Scaffold eval folder structure | Setup |
 | `agent-eval convert` | Convert ADK traces to JSONL | ADK User Sim |
 | `agent-eval interact` | Run interactions against live agent | DIY Interactions |
 | `agent-eval evaluate` | Run metrics on interactions | Both |
 | `agent-eval analyze` | Generate reports and AI analysis | Both |
 | `agent-eval create-dataset` | Convert test files to Golden Dataset | DIY Interactions |
 
+### `agent-eval init`
+
+Scaffolds the `eval/` folder structure for a new agent project with starter metrics and data files.
+
+```bash
+agent-eval init
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--target-dir` | `.` | Root directory of your agent project |
+| `--agent-name` | (prompted) | Agent application name |
+| `--mode` | (prompted) | Interaction mode: `user-sim`, `diy`, or `both` |
+| `--auto-approve`, `-y` | `false` | Skip interactive prompts, use defaults |
+
 ### `agent-eval convert`
 
 Converts ADK simulator history (`.adk/eval_history/`) to evaluation JSONL.
 
 ```bash
-uv run agent-eval convert \
+agent-eval convert \
   --agent-dir <path-to-agent-module> \
   --output-dir <path-to-results>
 ```
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--agent-dir` | Yes | - | Agent module containing `.adk/eval_history/` |
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `--agent-dir` | Yes | — | Agent module containing `.adk/eval_history/` |
 | `--output-dir` | No | `results/` | Output directory |
-| `--questions-file` | No | - | Golden dataset for merging reference data |
+| `--questions-file` | No | — | Golden dataset for merging reference data |
 
 **Output:** `<output-dir>/<timestamp>/raw/processed_interaction_sim.jsonl`
 
@@ -133,23 +129,83 @@ uv run agent-eval convert \
 Runs interactions against a live agent endpoint.
 
 ```bash
-uv run agent-eval interact \
+agent-eval interact \
   --app-name <agent_name> \
   --questions-file <path-to-golden.json> \
   --base-url <agent-url> \
   --results-dir <path-to-results>
 ```
 
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--app-name` | Yes | - | Agent application name |
-| `--questions-file` | Yes | - | Golden Dataset JSON |
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `--app-name` | Yes | — | Agent application name |
+| `--questions-file` | Yes | — | Golden Dataset JSON |
 | `--base-url` | No | `http://localhost:8080` | Agent API URL |
 | `--results-dir` | No | `results/` | Output directory |
 | `--user-id` | No | `test_user` | User ID for session |
 | `--runs` | No | `1` | Number of runs per question |
 
 **Output:** `<results-dir>/<timestamp>/raw/processed_interaction_<app_name>.jsonl`
+
+### `agent-eval evaluate`
+
+Runs metrics on processed interaction data.
+
+```bash
+agent-eval evaluate \
+  --interaction-file <path-to-jsonl> \
+  --metrics-files <path-to-metrics.json> \
+  --results-dir <path-to-results>
+```
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--interaction-file` | Yes | Path to processed JSONL |
+| `--metrics-files` | Yes | Metric definition JSON (can specify multiple) |
+| `--results-dir` | Yes | Output directory (use same timestamp folder) |
+| `--input-label` | No | Run label (e.g., "baseline") |
+| `--test-description` | No | Description for this run |
+
+**Output:** `eval_summary.json`, `evaluation_results_*.csv`
+
+### `agent-eval analyze`
+
+Generates reports and AI-powered root cause analysis.
+
+```bash
+agent-eval analyze \
+  --results-dir <path-to-results> \
+  --agent-dir <path-to-agent>
+```
+
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `--results-dir` | Yes | — | Directory with eval results |
+| `--agent-dir` | No | — | Agent source (adds context to AI analysis) |
+| `--strategy-file` | No | — | Optimization strategy markdown |
+| `--model` | No | `gemini-2.5-pro` | Gemini model for analysis |
+| `--location` | No | — | Vertex AI region (use `global` for Gemini 2.5) |
+| `--skip-gemini` | No | `false` | Skip AI analysis |
+
+**Output:** `question_answer_log.md`, `gemini_analysis.md`
+
+### `agent-eval create-dataset`
+
+Converts ADK test files to Golden Dataset format.
+
+```bash
+agent-eval create-dataset \
+  --input <path-to-test.json> \
+  --output <path-to-golden.json> \
+  --agent-name <agent_name>
+```
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--input` | Yes | Path to ADK test JSON |
+| `--output` | Yes | Path for output Golden Dataset |
+| `--agent-name` | Yes | Agent name for metadata |
+| `--metadata` | No | Add tags (format: `key:value`) |
 
 ---
 
@@ -159,7 +215,7 @@ The evaluation framework supports two ways to generate agent interactions:
 
 ### ADK User Sim
 
-Use the ADK simulator to generate multi-turn conversations from scenario definitions. This solves the **cold start problem** - you don't need hand-crafted golden datasets to start evaluating.
+Use the ADK simulator to generate multi-turn conversations from scenario definitions. This solves the **cold start problem** — you don't need hand-crafted golden datasets to start evaluating.
 
 **How it works:**
 1. Define conversation scenarios (intent + plan)
@@ -187,7 +243,7 @@ Run interactions against a live agent endpoint. Use when you have specific queri
 
 **How it works:**
 1. Create a Golden Dataset with queries and expected responses
-2. Start your agent (e.g., `make dev`)
+2. Start your agent
 3. Run `agent-eval interact` against the running agent
 4. Traces are captured as JSONL
 
@@ -206,68 +262,6 @@ Run interactions against a live agent endpoint. Use when you have specific queri
 | Single-turn pipeline | DIY Interactions | Faster, no conversation to simulate |
 | Deployed agent | DIY Interactions | Works with any URL |
 | Rapid prototyping | ADK User Sim | No golden dataset needed |
-
----
-
-### `agent-eval evaluate`
-
-Runs metrics on processed interaction data.
-
-```bash
-uv run agent-eval evaluate \
-  --interaction-file <path-to-jsonl> \
-  --metrics-files <path-to-metrics.json> \
-  --results-dir <path-to-results>
-```
-
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `--interaction-file` | Yes | Path to processed JSONL |
-| `--metrics-files` | Yes | Metric definition JSON |
-| `--results-dir` | Yes | Output directory (use same timestamp folder) |
-| `--input-label` | No | Run label (e.g., "baseline") |
-| `--test-description` | No | Description for this run |
-
-**Output:** `eval_summary.json`, `evaluation_results_*.csv`
-
-### `agent-eval analyze`
-
-Generates reports and AI-powered root cause analysis.
-
-```bash
-uv run agent-eval analyze \
-  --results-dir <path-to-results> \
-  --agent-dir <path-to-agent>
-```
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--results-dir` | Yes | - | Directory with eval results |
-| `--agent-dir` | No | - | Agent source (adds context to AI analysis) |
-| `--strategy-file` | No | - | Optimization strategy markdown |
-| `--model` | No | `gemini-2.5-pro` | Gemini model for analysis |
-| `--location` | No | - | Vertex AI region (use `global` for Gemini 2.5) |
-| `--skip-gemini` | No | `false` | Skip AI analysis |
-
-**Output:** `question_answer_log.md`, `gemini_analysis.md`
-
-### `agent-eval create-dataset`
-
-Converts ADK test files to Golden Dataset format.
-
-```bash
-uv run agent-eval create-dataset \
-  --input <path-to-test.json> \
-  --output <path-to-golden.json> \
-  --agent-name <agent_name>
-```
-
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `--input` | Yes | Path to ADK test JSON |
-| `--output` | Yes | Path for output Golden Dataset |
-| `--agent-name` | Yes | Agent name for metadata |
-| `--metadata` | No | Add tags (format: `key:value`) |
 
 ---
 
@@ -347,7 +341,7 @@ Choose based on your agent's conversation pattern:
   "metrics": {
     "my_metric": {
       "metric_type": "llm",
-      "agents": ["customer_service"],
+      "agents": ["my_agent"],
       "score_range": {"min": 0, "max": 5, "description": "0=Fail, 5=Perfect"},
       "dataset_mapping": {
         "prompt": {"source_column": "user_inputs"},
@@ -389,7 +383,7 @@ Use `:` to access nested fields within JSON responses:
 {
   "trajectory_accuracy": {
     "metric_type": "llm",
-    "agents": ["customer_service"],
+    "agents": ["my_agent"],
     "score_range": {"min": 0, "max": 5, "description": "0=Wrong, 5=Perfect"},
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},
@@ -407,7 +401,7 @@ Use `:` to access nested fields within JSON responses:
 {
   "tool_use_quality": {
     "metric_type": "llm",
-    "agents": ["customer_service"],
+    "agents": ["my_agent"],
     "score_range": {"min": 0, "max": 5, "description": "0=Poor, 5=Excellent"},
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},
@@ -422,20 +416,20 @@ Use `:` to access nested fields within JSON responses:
 
 ### Tips for Custom Metrics
 
-1. **Be specific** - Define exactly what each score level means
-2. **Request structured output** - Ask for `Score: [X]` format for parsing
-3. **Use score_range** - Documents expected output range
-4. **Filter by agent** - Use `agents` array for agent-specific metrics
-5. **Include available_tools** - Prevents penalizing for non-existent tools
-6. **Use compound mapping** - For large state objects, select specific fields
+1. **Be specific** — Define exactly what each score level means
+2. **Request structured output** — Ask for `Score: [X]` format for parsing
+3. **Use score_range** — Documents expected output range
+4. **Filter by agent** — Use `agents` array for agent-specific metrics
+5. **Include available_tools** — Prevents penalizing for non-existent tools
+6. **Use compound mapping** — For large state objects, select specific fields
 
 ### Binary Decomposition (Recommended Approach)
 
 Instead of asking an LLM for a vague "Quality" score (1-5), break requirements into specific True/False assertions:
 
 **Step 1: Decompose into Binary Assertions**
-- ❌ Vague: "Is the response helpful?"
-- ✅ Binary:
+- Bad: "Is the response helpful?"
+- Good:
   - Did the agent provide a direct answer? (Yes/No)
   - Did the agent mention the user's specific product? (Yes/No)
   - Did the agent provide a 'next step'? (Yes/No)
@@ -497,9 +491,6 @@ You can create a metric that evaluates just the `top_recommendation`:
     "metric_type": "llm",
     "agents": ["app"],
     "score_range": {"min": 0, "max": 5, "description": "0=Poor, 5=Excellent recommendation"},
-
-    "_implementation_note": "Evaluates the top_recommendation object from structured JSON response",
-
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},
       "top_recommendation": {"source_column": "final_response:top_recommendation"},
@@ -546,7 +537,7 @@ Primary output with aggregated metrics:
 {
   "experiment_id": "eval-20260127_143022",
   "run_type": "baseline",
-  "test_description": "Customer Service Baseline",
+  "test_description": "Baseline evaluation",
   "overall_summary": {
     "deterministic_metrics": {
       "token_usage.total_tokens": 15420,
@@ -561,7 +552,7 @@ Primary output with aggregated metrics:
   "per_question_summary": [
     {
       "question_id": "scenario_001",
-      "deterministic_metrics": {...},
+      "deterministic_metrics": {},
       "llm_metrics": {
         "trajectory_accuracy": {
           "score": 4.0,
@@ -582,7 +573,7 @@ AI-generated root cause analysis:
 ## Critical Issues
 
 1. **Tool Selection Error** (affects 3 test cases)
-   - File: `customer_service/tools/billing.py:45`
+   - File: `agent/tools/billing.py:45`
    - Issue: The `lookup_invoice` tool returns incomplete data
    - Recommendation: Apply Tool Hardening pattern
 ```
@@ -599,7 +590,7 @@ For DIY interactions, create a JSON file with this structure:
 {
   "golden_questions": [
     {
-      "id": "retail_001",
+      "id": "test_001",
       "user_inputs": ["I want to open a coffee shop in Seattle"],
       "agents_evaluated": ["app"],
       "reference_data": {
@@ -611,7 +602,7 @@ For DIY interactions, create a JSON file with this structure:
       }
     },
     {
-      "id": "retail_002",
+      "id": "test_002",
       "user_inputs": ["Analyze the downtown area"],
       "agents_evaluated": ["app"],
       "reference_data": {
@@ -665,17 +656,12 @@ For ADK User Sim, define scenarios in JSON:
 
 ```json
 {
-  "app_name": "customer_service",
+  "app_name": "my_agent",
   "user_id": "eval_user"
 }
 ```
 
 **CRITICAL:** `app_name` must match the **folder name** containing your agent's `agent.py`, not the agent's internal name.
-
-| Agent | Folder | Correct app_name |
-|-------|--------|------------------|
-| Customer Service | `customer_service/` | `"customer_service"` |
-| Retail AI | `app/` | `"app"` |
 
 ### Processed JSONL Fields
 
@@ -700,28 +686,22 @@ The evaluation pipeline produces JSONL with these fields:
 
 To evaluate an agent from a different repository:
 
-### 1. Create Eval Structure
+### 1. Scaffold Eval Structure
+
+The easiest way is to use the `init` command:
 
 ```bash
-# In your agent project
-mkdir -p eval/metrics eval/scenarios eval/results
-
-# Add metric definitions
-cat > eval/metrics/metric_definitions.json << 'EOF'
-{
-  "metrics": {
-    "general_quality": {
-      "metric_type": "llm",
-      "is_managed": true,
-      "managed_metric_name": "GENERAL_QUALITY",
-      "use_gemini_format": true
-    }
-  }
-}
-EOF
+cd /path/to/your-agent
+agent-eval init
 ```
 
-### 2. For ADK Agents
+Or create the structure manually:
+
+```bash
+mkdir -p eval/metrics eval/scenarios eval/results
+```
+
+### 2. For ADK Agents (User Sim)
 
 Create scenario files:
 
@@ -765,17 +745,13 @@ Create a Golden Dataset:
 ### 4. Run Evaluation
 
 ```bash
-# From accelerate/evaluation folder
-cd /path/to/accelerate/evaluation
-uv sync
-
-# Point to your external agent
-uv run agent-eval convert \
+# For ADK agents — convert traces
+agent-eval convert \
   --agent-dir ~/my-agent/my_agent_module \
   --output-dir ~/my-agent/eval/results
 
-# Or for live agents
-uv run agent-eval interact \
+# For live agents — run interactions
+agent-eval interact \
   --app-name my_agent \
   --questions-file ~/my-agent/eval/golden_dataset.json \
   --base-url http://localhost:8080 \
@@ -811,17 +787,12 @@ Create `eval/scenarios/session_input.json`:
 
 ```json
 {
-  "app_name": "customer_service",
+  "app_name": "your_agent_module",
   "user_id": "eval_user"
 }
 ```
 
 > **CRITICAL:** `app_name` must match the **folder name** containing `agent.py`, not the agent's internal name.
-
-| Agent | Folder | Correct app_name |
-|-------|--------|------------------|
-| Customer Service | `customer_service/` | `"customer_service"` |
-| Retail AI | `app/` | `"app"` |
 
 ### Step 3: Run the Simulation
 
@@ -843,15 +814,10 @@ uv run adk eval agent_module eval_set_name
 
 ## Troubleshooting
 
-### Cloudtop: Copy/paste not working
-
-**Cause:** Cloudtop terminal uses different keyboard shortcuts.
-**Fix:** Use `Ctrl+Shift+V` to paste (not `Ctrl+V`). For vim, enter insert mode first, then `Ctrl+Shift+V`.
-
-### "ModuleNotFoundError: No module named 'customer_service'"
+### "ModuleNotFoundError: No module named '...'"
 
 **Cause:** Running from wrong directory.
-**Fix:** `cd customer-service` before running commands.
+**Fix:** `cd` to the directory containing the agent module before running commands.
 
 ### Token usage shows all zeros
 
@@ -914,14 +880,14 @@ Do NOT penalize the agent for correctly relaying mock data.
 
 ### ADK UserSim: "Error rendering metric prompt template" during `adk eval`
 
-**Cause:** ADK UserSim runs a built-in evaluation by default after the simulation completes. If no eval config file is provided, the default metrics may fail with errors like `Error rendering metric prompt template: Variable conversation_history is required but not provided..`. This does not affect the simulation runs themselves - the agent interactions and traces are captured successfully. We do not use this built-in ADK evaluation; we run our own separate evaluation step later using the Vertex AI SDK.
-**Fix:** Provide an eval config file with your `adk eval` command to suppress the error:
+**Cause:** ADK UserSim runs a built-in evaluation by default after the simulation completes. If no eval config file is provided, the default metrics may fail. This does not affect the simulation runs themselves — the agent interactions and traces are captured successfully. `agent-eval` runs its own separate evaluation step using the Vertex AI SDK.
+**Fix:** Provide an eval config file with your `adk eval` command:
 
 ```bash
-uv run adk eval customer_service --config_file_path customer_service/eval_config.json eval_set_with_scenarios
+uv run adk eval my_agent --config_file_path my_agent/eval_config.json eval_set_name
 ```
 
-If you don't have an eval config file, create one (e.g., `eval/eval_config.json`) with criteria:
+If you don't have an eval config file, create one (e.g., `eval/eval_config.json`):
 
 ```json
 {
@@ -937,26 +903,12 @@ If you don't have an eval config file, create one (e.g., `eval/eval_config.json`
 }
 ```
 
-For more details on ADK UserSim and eval configuration, see the [ADK User Simulation docs](https://google.github.io/adk-docs/evaluate/user-sim/).
-
-### Evaluation commands failing with "file not found" or directory errors
-
-**Cause:** The `agent-eval` CLI commands must be run from the `evaluation/` directory. If you navigated to a different folder during a previous step (e.g., `retail-ai-location-strategy/` or `customer-service/`), the commands will fail.
-**Fix:** Verify your current directory and navigate to the evaluation folder:
-
-```bash
-cd ../evaluation
-```
+For more details, see the [ADK User Simulation docs](https://google.github.io/adk-docs/evaluate/user-sim/).
 
 ### Permission denied on autorater model during evaluation
 
-**Cause:** The Vertex AI service account lacks permissions to access the autorater model used for LLM-as-judge metrics. You may see an error like:
-
-```text
-google.genai.errors.ClientError: 403 PERMISSION_DENIED. {'error': {'code': 403, 'message': 'Failed to make GenerateContent request to autorater model projects/accelerate-workshop-aitor/locations/us-central1/publishers/google/models/gemini-2.5-flash. Permission denied on autorater model (or it may not exist). Please check the model permissions and try again.', 'status': 'PERMISSION_DENIED'
-```
-
-**Fix:** Grant the Vertex AI service agent role to your project's AI Platform service account:
+**Cause:** The Vertex AI service account lacks permissions to access the autorater model.
+**Fix:** Grant the Vertex AI service agent role:
 
 ```bash
 export GOOGLE_CLOUD_PROJECT_NUMBER=$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format="value(projectNumber)")
@@ -968,177 +920,68 @@ gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
 
 ---
 
-## Context Engineering Principles
+## AI Assistant Setup
 
-### The Core Idea
+Use AI coding assistants to accelerate the evaluation workflow. Both Gemini CLI and Claude Code can help you interpret evaluation results, debug metric definitions, and suggest optimizations.
 
-> "Context Engineering is the systematic management of the model's context window to maximize Signal-to-Noise Ratio, protecting the model from Context Rot."
->
-> **More Context != More Intelligence**
+This repository includes context files for both assistants:
 
-### Optimization Patterns
+- **`GEMINI.md`** — Loaded automatically by Gemini CLI when running from the project root
+- **`CLAUDE.md`** — Loaded automatically by Claude Code when running from the project root
 
-| Principle | The Signal (Symptom) | The Fix |
-|-----------|---------------------|---------|
-| **Offload** | Reasoning errors in deterministic tasks | Move logic to tools or code execution |
-| **Reduce** | High latency, "Lost in the Middle" syndrome | Summarize history, trim context |
-| **Retrieve** | Hallucinations about facts | Replace static data with RAG |
-| **Isolate** | Agent chooses wrong tools, gets confused | Split into specialized sub-agents |
-| **Cache** | Low cache hit rate, high TTFT | Restructure prompt for prefix caching |
-
-### Signal Identification Cheatsheet
-
-| Signal (Symptom) | Metric to Check | Fix (Branch) |
-|------------------|-----------------|--------------|
-| Agent invents tool parameters | `tool_use_quality` < 3.0 | 01 - Tool Hardening |
-| Agent forgets earlier context | Quality drops over turns | 02 - Context Compaction |
-| Agent chooses wrong tools | `trajectory_accuracy` < 3.0 | 03 - Functional Isolation |
-| Token usage exploding | `input_tokens` > 10,000 | 04 - Offloading |
-| High latency, low cache hits | `cache_hit_rate` < 50% | 05 - Prefix Caching |
-
-### Diagnostic Patterns
-
-**Tool Hardening (Poka-Yoke):** Look for "High Technical Success, Low Semantic Honesty" - the agent calls valid tools (100% success rate) but lies about what it did (`capability_honesty` < 2.0). Fix with Pydantic schemas and `Literal` types.
-
-**Functional Isolation (Triage/Worker):** Look for "High Technical Success, Low Logical Coherence" - the agent takes noisy paths with irrelevant tool calls (`trajectory_accuracy` < 2.0, `reasoning_ratio` > 0.6). Fix by splitting into specialized sub-agents.
-
----
-
-## Understanding Trade-offs
-
-Not every optimization is a pure win. Watch for these trade-offs:
-
-| Optimization | Benefit | Potential Trade-off |
-|--------------|---------|---------------------|
-| **Tool Hardening** | Fewer tool errors, stricter validation | May reject valid edge-case inputs |
-| **Context Compaction** | Lower latency, reduced context rot | May lose important details in summaries |
-| **Functional Isolation** | Better routing, clearer responsibilities | Adds latency from agent handoffs |
-| **Offloading to Code** | Accurate deterministic operations | Adds complexity, sandbox limitations |
-| **Prefix Caching** | Lower TTFT, reduced costs | Requires careful prompt restructuring |
-
-### Measuring Trade-offs
-
-Use the evaluation framework to quantify trade-offs:
-
-1. **Before optimization:** Record baseline metrics
-2. **After optimization:** Compare all metrics, not just the target
-3. **Watch for regressions:** Did improving one metric hurt another?
-
-Example trade-off analysis:
-```
-Optimization: Context Compaction
-Target: Reduce input_tokens
-
-Before: input_tokens=12,000, quality=4.2
-After:  input_tokens=4,000,  quality=3.8  ← Quality regressed!
-
-Action: Tune compaction strategy to preserve key context
-```
-
----
-
-## AI Assistant Setup (Optional)
-
-Use AI coding assistants for faster iteration during the workshop. Both options below work with Vertex AI, which is ideal for enterprise/Argolis environments.
-
----
+These files provide the assistant with project context: what `agent-eval` is, how the CLI commands work, the evaluation pipeline, and the example agents. This lets the assistant give relevant advice when you share `eval_summary.json` or `gemini_analysis.md` results.
 
 ### Gemini CLI
 
-**Prerequisites:**
-- Node.js 20+ ([download](https://nodejs.org/))
-- Google Cloud SDK with `gcloud auth application-default login` completed
-
-**Installation:**
-
 ```bash
-# Option 1: Quick start (no install needed)
-npx @google/gemini-cli
-
-# Option 2: Global install
+# Install
 npm install -g @google/gemini-cli
 
-# Option 3: Homebrew (macOS/Linux)
-brew install gemini-cli
-```
-
-**Configure for Vertex AI (Recommended for workshop):**
-
-```bash
-# Set environment variables for Vertex AI
+# Configure for Vertex AI
 export GOOGLE_CLOUD_PROJECT=your-project-id
 export GOOGLE_CLOUD_LOCATION=us-central1
 export GOOGLE_GENAI_USE_VERTEXAI=true
 
-# Run from project root - GEMINI.md is loaded automatically
-cd accelerate_context_engineering_workshop
+# Run from project root (GEMINI.md is loaded automatically)
 gemini
 ```
 
-**Useful Commands:**
-- `/memory show` — See loaded context from GEMINI.md
-- `/memory refresh` — Reload after editing GEMINI.md
-- `/help` — See all available commands
-
-> **Note:** This repo includes a `.gemini/settings.json` that configures context loading. The `GEMINI.md` file is automatically loaded when you run `gemini` from the project root.
-
----
-
 ### Claude Code
 
-**Prerequisites:**
-- Node.js 18+ ([download](https://nodejs.org/))
-- Anthropic API key or Vertex AI with Claude enabled
-
-**Installation:**
-
 ```bash
+# Install
 npm install -g @anthropic-ai/claude-code
-```
 
-**Option A: With Vertex AI (Recommended for workshop)**
-
-```bash
-# Enable Claude in Vertex AI Model Garden first
-# Then configure Claude Code to use Vertex AI
+# Option A: With Vertex AI
 export ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
 export CLOUD_ML_REGION=us-central1
 
-# Run from project root
-cd accelerate_context_engineering_workshop
-claude
-```
-
-See: [Step-by-step Vertex AI guide](https://docs.anthropic.com/en/docs/build-with-claude/claude-code/bedrock-vertex)
-
-**Option B: With API Key**
-
-```bash
+# Option B: With API Key
 export ANTHROPIC_API_KEY=your-api-key
+
+# Run from project root (CLAUDE.md is loaded automatically)
 claude
 ```
 
-**Passing Context:**
+See [Vertex AI guide for Claude Code](https://docs.anthropic.com/en/docs/build-with-claude/claude-code/bedrock-vertex) for detailed setup.
 
-Claude Code automatically reads `CLAUDE.md` files, but this repo uses `GEMINI.md`. To load context:
+### Tips for Using AI Assistants with Evaluation Results
+
+1. **Share data:** Paste `eval_summary.json` and `gemini_analysis.md` for data-driven help
+2. **Be specific:** "Improve trajectory_accuracy by fixing tool selection" beats "make it better"
+3. **Iterate:** Run eval → share results → get suggestions → implement → repeat
+
+### Dashboard (Alternative)
+
+For visual, interactive comparison of evaluation runs across multiple experiments, a Gradio dashboard is also available:
 
 ```bash
-# Option 1: Reference in conversation
-# "Read GEMINI.md for project context, then help me with..."
-
-# Option 2: Use gitingest for full repo context
-# Visit: https://gitingest.com/jcarah/accelerate_context_engineering_workshop
-# Paste output into Claude
+cd dashboard
+uv run dashboard.py
+# Open http://127.0.0.1:7860
 ```
 
----
-
-### Tips for Using AI Assistants
-
-1. **Be specific:** "Improve trajectory_accuracy by fixing tool selection" beats "make it better"
-2. **Share data:** Paste `eval_summary.json` and `gemini_analysis.md` for data-driven help
-3. **Iterate:** Run eval → share results → get suggestions → implement → repeat
-4. **Smart context loading:** Instead of pasting the full gitingest output, download it as a text file and add it to your project. Then ask the assistant to "search the gitingest file for X" - this lets the AI look up what's needed rather than loading everything into context (better for token efficiency!)
+See [`dashboard/README.md`](../dashboard/README.md) for details.
 
 ---
 

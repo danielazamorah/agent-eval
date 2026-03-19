@@ -1,6 +1,6 @@
 # agent-eval — AI Assistant Context
 
-> This file provides context for Gemini CLI. It is loaded automatically when you run `gemini` from a project that uses `agent-eval`.
+> This file provides context for Claude Code. It is loaded automatically when you run `claude` from a project that uses `agent-eval`.
 
 ---
 
