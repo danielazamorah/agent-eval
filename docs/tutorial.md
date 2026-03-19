@@ -192,16 +192,16 @@ Keep this terminal running.
 # From repo root
 export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
-  --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
+  --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
-  --results-dir docs/tutorial/example_agents/retail-ai-location-strategy/eval/results \
+  --results-dir docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/results \
   2>&1 | grep "Run folder:" | awk '{print $3}')
 
 echo "Results saved to: $RETAIL_RUN_DIR"
 
 uv run agent-eval evaluate \
   --interaction-file $RETAIL_RUN_DIR/raw/processed_interaction_app.jsonl \
-  --metrics-files docs/tutorial/example_agents/retail-ai-location-strategy/eval/metrics/metric_definitions.json \
+  --metrics-files docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/metrics/metric_definitions.json \
   --results-dir $RETAIL_RUN_DIR \
   --input-label baseline
 
@@ -261,7 +261,7 @@ Then generate an OPTIMIZATION_LOG.md that documents:
 4. Which Context Engineering principle applies (Offload, Reduce, Retrieve, Isolate, Cache)
 ```
 
-The assistant will produce a structured optimization log — save it to `docs/tutorial/example_agents/customer-service/eval/results/OPTIMIZATION_LOG.md`.
+The assistant will produce a structured optimization log — save it to `docs/tutorial/example_agents/customer-service/customer_service/eval/results/OPTIMIZATION_LOG.md`.
 
 This is the format you'll update after every optimization cycle.
 
@@ -738,14 +738,14 @@ make dev
 # Terminal 2: Run evaluation
 export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
-  --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/eval/eval_data/golden_dataset.json \
+  --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
-  --results-dir docs/tutorial/example_agents/retail-ai-location-strategy/eval/results \
+  --results-dir docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/results \
   2>&1 | grep "Run folder:" | awk '{print $3}')
 
 uv run agent-eval evaluate \
   --interaction-file $RETAIL_RUN_DIR/raw/processed_interaction_app.jsonl \
-  --metrics-files docs/tutorial/example_agents/retail-ai-location-strategy/eval/metrics/metric_definitions.json \
+  --metrics-files docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/metrics/metric_definitions.json \
   --results-dir $RETAIL_RUN_DIR \
   --input-label <optimization-name>
 
@@ -929,11 +929,11 @@ After running multiple optimizations, use your AI assistant to generate a compre
 
 ```
 I have the following evaluation runs for the Customer Service agent:
-- Baseline: docs/tutorial/example_agents/customer-service/eval/results/<baseline_dir>/eval_summary.json
-- Model Swap: docs/tutorial/example_agents/customer-service/eval/results/<m0_dir>/eval_summary.json
-- Tool Hardening: docs/tutorial/example_agents/customer-service/eval/results/<m1_dir>/eval_summary.json
-- Context Compaction: docs/tutorial/example_agents/customer-service/eval/results/<m2_dir>/eval_summary.json
-- Functional Isolation: docs/tutorial/example_agents/customer-service/eval/results/<m3_dir>/eval_summary.json
+- Baseline: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<baseline_dir>/eval_summary.json
+- Model Swap: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m0_dir>/eval_summary.json
+- Tool Hardening: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m1_dir>/eval_summary.json
+- Context Compaction: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m2_dir>/eval_summary.json
+- Functional Isolation: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m3_dir>/eval_summary.json
 
 Read all of them and:
 1. Create a full progression table showing every metric across all iterations
