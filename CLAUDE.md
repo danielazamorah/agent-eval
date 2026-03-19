@@ -53,12 +53,12 @@ my-agent/
 
 | Command | Purpose |
 |---------|---------|
-| `agent-eval init` | Scaffold eval folder structure |
-| `agent-eval interact` | Run queries against a live agent endpoint |
-| `agent-eval convert` | Convert ADK User Sim traces to evaluation format |
-| `agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
-| `agent-eval analyze` | Generate AI-powered analysis reports |
-| `agent-eval create-dataset` | Convert ADK test files to golden dataset format |
+| `uv run agent-eval init` | Scaffold eval folder structure |
+| `uv run agent-eval interact` | Run queries against a live agent endpoint |
+| `uv run agent-eval convert` | Convert ADK User Sim traces to evaluation format |
+| `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
+| `uv run agent-eval analyze` | Generate AI-powered analysis reports |
+| `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
 
 ---
 

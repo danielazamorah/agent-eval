@@ -62,7 +62,7 @@ The repository contains the `agent-eval` CLI package and example agents, each wi
 agent-eval/
 ├── pyproject.toml                       # agent-eval CLI tool
 ├── uv.lock
-├── examples/
+├── docs/tutorial/example_agents/
 │   ├── customer-service/                # Example: multi-turn agent
 │   │   ├── pyproject.toml
 │   │   └── uv.lock
@@ -84,19 +84,19 @@ agent-eval/
 
 | Command | Purpose | Mode |
 |---------|---------|------|
-| `agent-eval init` | Scaffold eval folder structure | Setup |
-| `agent-eval convert` | Convert ADK traces to JSONL | ADK User Sim |
-| `agent-eval interact` | Run interactions against live agent | DIY Interactions |
-| `agent-eval evaluate` | Run metrics on interactions | Both |
-| `agent-eval analyze` | Generate reports and AI analysis | Both |
-| `agent-eval create-dataset` | Convert test files to Golden Dataset | DIY Interactions |
+| \`uv run agent-eval init` | Scaffold eval folder structure | Setup |
+| \`uv run agent-eval convert` | Convert ADK traces to JSONL | ADK User Sim |
+| \`uv run agent-eval interact` | Run interactions against live agent | DIY Interactions |
+| \`uv run agent-eval evaluate` | Run metrics on interactions | Both |
+| \`uv run agent-eval analyze` | Generate reports and AI analysis | Both |
+| \`uv run agent-eval create-dataset` | Convert test files to Golden Dataset | DIY Interactions |
 
-### `agent-eval init`
+### \`uv run agent-eval init`
 
 Scaffolds the `eval/` folder structure for a new agent project with starter metrics and data files.
 
 ```bash
-agent-eval init
+uv run agent-eval init
 ```
 
 | Option | Default | Description |
@@ -106,12 +106,12 @@ agent-eval init
 | `--mode` | (prompted) | Interaction mode: `user-sim`, `diy`, or `both` |
 | `--auto-approve`, `-y` | `false` | Skip interactive prompts, use defaults |
 
-### `agent-eval convert`
+### \`uv run agent-eval convert`
 
 Converts ADK simulator history (`.adk/eval_history/`) to evaluation JSONL.
 
 ```bash
-agent-eval convert \
+uv run agent-eval convert \
   --agent-dir <path-to-agent-module> \
   --output-dir <path-to-results>
 ```
@@ -124,12 +124,12 @@ agent-eval convert \
 
 **Output:** `<output-dir>/<timestamp>/raw/processed_interaction_sim.jsonl`
 
-### `agent-eval interact`
+### \`uv run agent-eval interact`
 
 Runs interactions against a live agent endpoint.
 
 ```bash
-agent-eval interact \
+uv run agent-eval interact \
   --app-name <agent_name> \
   --questions-file <path-to-golden.json> \
   --base-url <agent-url> \
@@ -147,12 +147,12 @@ agent-eval interact \
 
 **Output:** `<results-dir>/<timestamp>/raw/processed_interaction_<app_name>.jsonl`
 
-### `agent-eval evaluate`
+### \`uv run agent-eval evaluate`
 
 Runs metrics on processed interaction data.
 
 ```bash
-agent-eval evaluate \
+uv run agent-eval evaluate \
   --interaction-file <path-to-jsonl> \
   --metrics-files <path-to-metrics.json> \
   --results-dir <path-to-results>
@@ -168,12 +168,12 @@ agent-eval evaluate \
 
 **Output:** `eval_summary.json`, `evaluation_results_*.csv`
 
-### `agent-eval analyze`
+### \`uv run agent-eval analyze`
 
 Generates reports and AI-powered root cause analysis.
 
 ```bash
-agent-eval analyze \
+uv run agent-eval analyze \
   --results-dir <path-to-results> \
   --agent-dir <path-to-agent>
 ```
@@ -189,12 +189,12 @@ agent-eval analyze \
 
 **Output:** `question_answer_log.md`, `gemini_analysis.md`
 
-### `agent-eval create-dataset`
+### \`uv run agent-eval create-dataset`
 
 Converts ADK test files to Golden Dataset format.
 
 ```bash
-agent-eval create-dataset \
+uv run agent-eval create-dataset \
   --input <path-to-test.json> \
   --output <path-to-golden.json> \
   --agent-name <agent_name>
@@ -244,7 +244,7 @@ Run interactions against a live agent endpoint. Use when you have specific queri
 **How it works:**
 1. Create a Golden Dataset with queries and expected responses
 2. Start your agent
-3. Run `agent-eval interact` against the running agent
+3. Run `uv run agent-eval interact` against the running agent
 4. Traces are captured as JSONL
 
 **When to use:**
@@ -620,7 +620,7 @@ For DIY interactions, create a JSON file with this structure:
 | `agents_evaluated` | Yes | Which agents this test applies to |
 | `reference_data` | No | Ground truth for comparison |
 
-> **Tip:** Use `agent-eval create-dataset` to convert ADK test files to this format.
+> **Tip:** Use `uv run agent-eval create-dataset` to convert ADK test files to this format.
 
 ### Conversation Scenario Format
 
@@ -692,7 +692,7 @@ The easiest way is to use the `init` command:
 
 ```bash
 cd /path/to/your-agent
-agent-eval init
+uv run agent-eval init
 ```
 
 Or create the structure manually:
@@ -746,12 +746,12 @@ Create a Golden Dataset:
 
 ```bash
 # For ADK agents — convert traces
-agent-eval convert \
+uv run agent-eval convert \
   --agent-dir ~/my-agent/my_agent_module \
   --output-dir ~/my-agent/eval/results
 
 # For live agents — run interactions
-agent-eval interact \
+uv run agent-eval interact \
   --app-name my_agent \
   --questions-file ~/my-agent/eval/golden_dataset.json \
   --base-url http://localhost:8080 \

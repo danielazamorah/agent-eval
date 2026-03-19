@@ -44,11 +44,14 @@ It consolidates the full evaluation workflow into a single CLI: generate interac
 
 ```bash
 # Clone the repository
-git clone REPO_URL_PLACEHOLDER
+git clone REPO_URL_PLACEHOLDER agent-eval
 cd agent-eval
 
 # Install dependencies
 uv sync
+
+# Verify installation
+uv run agent-eval --version
 ```
 
 ### Authentication
@@ -81,15 +84,29 @@ gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
 
 ## Quickstart
 
+`agent-eval` works inside your ADK agent project — the directory that contains your agent module (with `agent.py`, tools, prompts, etc.).
+
+> **Don't have an agent yet?** Create one with [Agent Starter Pack](https://github.com/GoogleCloudPlatform/agent-starter-pack):
+>
+> ```bash
+> uvx agent-starter-pack create my-agent
+> ```
+>
+> Or to follow along with the [tutorial](docs/tutorial.md), use one of the [example agents](docs/tutorial/example_agents/).
+>
+> **Note:** Run all `uv run agent-eval` commands from the agent-eval repository root. The CLI takes paths to your agent project via flags like `--agent-dir` and `--target-dir`.
+
 ### 1. Initialize your project
 
 ```bash
-agent-eval init
+uv run agent-eval init
 ```
 
 This interactive command scaffolds an `eval/` folder in your agent project with starter metrics, scenario files, and a golden dataset.
 
-Use `agent-eval init -y` for non-interactive mode with defaults.
+The **agent name** is the name of the folder containing your `agent.py`, tools, and sub-agents. For agents scaffolded with [Agent Starter Pack](https://github.com/GoogleCloudPlatform/agent-starter-pack), this is typically `app`. The default is `app`, but enter whatever matches your agent module folder name.
+
+Use `uv run agent-eval init -y` for non-interactive mode with defaults.
 
 ### 2. Generate interactions
 
@@ -97,8 +114,8 @@ Choose the method that fits your agent:
 
 | Method | Best for | Command |
 |--------|----------|---------|
-| **ADK User Sim** | Multi-turn conversational agents | `adk eval` → `agent-eval convert` |
-| **DIY Interactions** | Single-turn agents, deployed endpoints | `agent-eval interact` |
+| **ADK User Sim** | Multi-turn conversational agents | `adk eval` → `uv run agent-eval convert` |
+| **DIY Interactions** | Single-turn agents, deployed endpoints | `uv run agent-eval interact` |
 
 **ADK User Sim** (multi-turn):
 
@@ -111,7 +128,7 @@ uv run adk eval_set add_eval_case <agent_module> eval_set \
 uv run adk eval <agent_module> eval_set
 
 # Convert traces to evaluation format
-agent-eval convert \
+uv run agent-eval convert \
   --agent-dir <agent_module> \
   --output-dir eval/results
 ```
@@ -120,7 +137,7 @@ agent-eval convert \
 
 ```bash
 # Start your agent, then:
-agent-eval interact \
+uv run agent-eval interact \
   --app-name <agent_name> \
   --questions-file eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8080 \
@@ -130,7 +147,7 @@ agent-eval interact \
 ### 3. Evaluate
 
 ```bash
-agent-eval evaluate \
+uv run agent-eval evaluate \
   --interaction-file eval/results/<run>/raw/processed_interaction_*.jsonl \
   --metrics-files eval/metrics/metric_definitions.json \
   --results-dir eval/results/<run>
@@ -139,7 +156,7 @@ agent-eval evaluate \
 ### 4. Analyze
 
 ```bash
-agent-eval analyze \
+uv run agent-eval analyze \
   --results-dir eval/results/<run> \
   --agent-dir <path-to-agent> \
   --location global
@@ -158,14 +175,14 @@ cat eval/results/<run>/eval_summary.json     # Raw metrics
 
 | Command | Purpose |
 |---------|---------|
-| `agent-eval init` | Scaffold eval folder structure for a new project |
-| `agent-eval interact` | Run interactions against a live agent endpoint |
-| `agent-eval convert` | Convert ADK traces to evaluation format |
-| `agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
-| `agent-eval analyze` | Generate reports and AI-powered analysis |
-| `agent-eval create-dataset` | Convert ADK test files to golden dataset format |
+| `uv run agent-eval init` | Scaffold eval folder structure for a new project |
+| `uv run agent-eval interact` | Run interactions against a live agent endpoint |
+| `uv run agent-eval convert` | Convert ADK traces to evaluation format |
+| `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
+| `uv run agent-eval analyze` | Generate reports and AI-powered analysis |
+| `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
 
-Run `agent-eval --help` or `agent-eval <command> --help` for detailed usage.
+Run `uv run agent-eval --help` or `uv run agent-eval <command> --help` for detailed usage.
 
 ---
 
@@ -191,12 +208,12 @@ See [docs/reference.md](docs/reference.md) for the full metrics glossary, custom
 
 ## Examples
 
-The [`examples/`](examples/) folder contains two complete agent projects with pre-configured evaluation setups:
+The [`docs/tutorial/example_agents/`](docs/tutorial/example_agents/) folder contains two complete agent projects with pre-configured evaluation setups:
 
 | Example | Type | Description |
 |---------|------|-------------|
-| [customer-service](examples/customer-service/) | Multi-turn | ADK conversational agent evaluated with User Sim |
-| [retail-ai-location-strategy](examples/retail-ai-location-strategy/) | Single-turn | ADK pipeline agent evaluated with DIY Interactions |
+| [customer-service](docs/tutorial/example_agents/customer-service/) | Multi-turn | ADK conversational agent evaluated with User Sim |
+| [retail-ai-location-strategy](docs/tutorial/example_agents/retail-ai-location-strategy/) | Single-turn | ADK pipeline agent evaluated with DIY Interactions |
 
 See the [tutorial](docs/tutorial.md) for a guided walkthrough using these examples.
 
@@ -208,7 +225,7 @@ See the [tutorial](docs/tutorial.md) for a guided walkthrough using these exampl
 |----------|----------|
 | [Reference Guide](docs/reference.md) | CLI reference, metrics deep dive, data formats, custom metrics, troubleshooting |
 | [Tutorial](docs/tutorial.md) | Step-by-step walkthrough using the example agents |
-| [Examples](examples/README.md) | Overview of the example agent projects |
+| [Examples](docs/tutorial/example_agents/README.md) | Overview of the example agent projects |
 
 ---
 

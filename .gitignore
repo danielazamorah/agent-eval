@@ -187,6 +187,7 @@ celerybeat.pid
 my_env.tfvars
 .saved_chats
 .requirements.txt
+my-agent/
 
 # Evaluation Results
 evaluation/results/

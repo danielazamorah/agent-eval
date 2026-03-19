@@ -71,15 +71,15 @@ METRIC_TEMPLATES = {
 
 def scaffold_eval_structure(
     target_dir: Path,
-    agent_name: str = "my_agent",
+    agent_name: str = "app",
     mode: str = "both",
     metrics: list[str] | None = None,
 ) -> None:
     """Creates the eval/ folder structure with starter templates.
 
     Args:
-        target_dir: Root directory of the agent project.
-        agent_name: Agent application name.
+        target_dir: Root directory of the agent project (eval/ is created here).
+        agent_name: Agent module name (folder containing agent.py).
         mode: 'user-sim', 'diy', or 'both'.
         metrics: List of metric keys to include.
     """
@@ -97,7 +97,6 @@ def scaffold_eval_structure(
     for key in metrics:
         if key in METRIC_TEMPLATES:
             defn = dict(METRIC_TEMPLATES[key])
-            # Add agents field with actual agent name
             if "agents" not in defn:
                 defn["agents"] = [agent_name]
             metric_defs["metrics"][key] = defn
@@ -106,15 +105,18 @@ def scaffold_eval_structure(
     for d in [eval_dir, eval_dir / "metrics", eval_dir / "scenarios", eval_dir / "results"]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # Compute display prefix for file paths
+    display_prefix = str(eval_dir)
+
     _write_if_missing(eval_dir / "__init__.py", "")
     _write_if_missing(eval_dir / "results" / ".gitkeep", "")
 
     _write_json_if_missing(eval_dir / "metrics" / "metric_definitions.json", metric_defs)
-    console.print(f"  [green]ok[/] eval/metrics/metric_definitions.json")
+    console.print(f"  [green]created[/] {display_prefix}/metrics/metric_definitions.json")
 
     session_input = {"app_name": agent_name, "user_id": "eval_user"}
     _write_json_if_missing(eval_dir / "scenarios" / "session_input.json", session_input)
-    console.print(f"  [green]ok[/] eval/scenarios/session_input.json")
+    console.print(f"  [green]created[/] {display_prefix}/scenarios/session_input.json")
 
     if mode in ("user-sim", "both"):
         scenarios = {
@@ -126,7 +128,7 @@ def scaffold_eval_structure(
             ]
         }
         _write_json_if_missing(eval_dir / "scenarios" / "conversation_scenarios.json", scenarios)
-        console.print(f"  [green]ok[/] eval/scenarios/conversation_scenarios.json")
+        console.print(f"  [green]created[/] {display_prefix}/scenarios/conversation_scenarios.json")
 
     if mode in ("diy", "both"):
         golden = {
@@ -144,9 +146,9 @@ def scaffold_eval_structure(
         }
         (eval_dir / "eval_data").mkdir(parents=True, exist_ok=True)
         _write_json_if_missing(eval_dir / "eval_data" / "golden_dataset.json", golden)
-        console.print(f"  [green]ok[/] eval/eval_data/golden_dataset.json")
+        console.print(f"  [green]created[/] {display_prefix}/eval_data/golden_dataset.json")
 
-    console.print(f"  [green]ok[/] eval/results/.gitkeep")
+    console.print(f"  [green]created[/] {display_prefix}/results/.gitkeep")
 
 
 def _write_if_missing(path: Path, content: str) -> None:

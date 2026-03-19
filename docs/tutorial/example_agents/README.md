@@ -37,4 +37,4 @@ cp .env.example .env  # configure your GCP project and API keys
 uv sync
 ```
 
-See the [tutorial](../docs/tutorial.md) for a complete walkthrough of evaluating and optimizing both agents step by step.
+See the [tutorial](../tutorial.md) for a complete walkthrough of evaluating and optimizing both agents step by step.
