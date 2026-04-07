@@ -210,8 +210,17 @@ class AdkHistoryConverter:
             session_details = case.get("session_details")
 
             if not session_details:
-                # session_details is None - this indicates a configuration problem
-                # The most common cause is app_name in evalset.json not matching the folder name
+                # Format 2: eval_metric_result_per_invocation (no session_details)
+                per_invocation = case.get("eval_metric_result_per_invocation")
+                if per_invocation:
+                    row = self._process_per_invocation_format(
+                        eval_id, session_id, per_invocation, case
+                    )
+                    if row:
+                        extracted_rows.append(row)
+                    continue
+
+                # No session_details and no per_invocation — configuration problem
                 print("\n" + "=" * 70)
                 print("ERROR: session_details is empty for eval case: " + str(eval_id))
                 print("=" * 70)
@@ -445,6 +454,162 @@ class AdkHistoryConverter:
             extracted_rows.append(row)
 
         return extracted_rows
+
+    def _process_per_invocation_format(
+        self, eval_id: str, session_id: Optional[str],
+        per_invocation: list, case: dict
+    ) -> Optional[Dict[str, Any]]:
+        """Process Format 2: eval_metric_result_per_invocation (no session_details).
+
+        This format appears when ADK eval runs without capturing full session details.
+        Each invocation contains user_content, final_response, and intermediate_data.
+        """
+        if not per_invocation:
+            return None
+
+        user_inputs = []
+        text_responses = []
+        tool_calls = []
+        app_name = None
+        final_response = ""
+
+        for inv_wrapper in per_invocation:
+            inv = inv_wrapper.get("actual_invocation", {})
+
+            # Extract user input
+            user_content = inv.get("user_content", {})
+            user_parts = user_content.get("parts", [])
+            user_text = "".join(p.get("text", "") for p in user_parts)
+            if user_text:
+                user_inputs.append(user_text)
+
+            # Extract final response
+            resp_content = inv.get("final_response", {})
+            resp_parts = resp_content.get("parts", [])
+            resp_text = "".join(p.get("text", "") for p in resp_parts)
+            if resp_text:
+                text_responses.append(resp_text)
+                final_response = resp_text  # Last one wins
+
+            # Extract tool calls and agent name from intermediate events
+            intermediate = inv.get("intermediate_data", {})
+            events = intermediate.get("invocation_events", [])
+            for event in events:
+                author = event.get("author", "")
+                if not app_name and author:
+                    app_name = author  # Discover agent name from first author
+
+                content = event.get("content", {})
+                parts = content.get("parts", [])
+                for part in parts:
+                    fc = part.get("functionCall")
+                    if fc:
+                        tool_calls.append({
+                            "tool_name": fc.get("name", ""),
+                            "input_arguments": fc.get("args", {}),
+                            "output_result": {}
+                        })
+
+        app_name = app_name or "unknown"
+
+        # Synthesize a minimal trace with spans for each component
+        synthetic_trace = []
+        trace_id = str(uuid.uuid4())[:16]
+
+        # Root invocation span
+        synthetic_trace.append({
+            "name": "invocation",
+            "context": {"trace_id": trace_id, "span_id": "0001"},
+            "parent_id": None,
+            "start_time": datetime.now().isoformat(),
+            "end_time": datetime.now().isoformat(),
+            "attributes": {},
+        })
+
+        # Agent span
+        synthetic_trace.append({
+            "name": f"invoke_agent {app_name}",
+            "context": {"trace_id": trace_id, "span_id": "0002"},
+            "parent_id": "0001",
+            "start_time": datetime.now().isoformat(),
+            "end_time": datetime.now().isoformat(),
+            "attributes": {},
+        })
+
+        # Tool spans
+        for i, tc in enumerate(tool_calls):
+            synthetic_trace.append({
+                "name": f"execute_tool {tc['tool_name']}",
+                "context": {"trace_id": trace_id, "span_id": f"{i+3:04d}"},
+                "parent_id": "0002",
+                "start_time": datetime.now().isoformat(),
+                "end_time": datetime.now().isoformat(),
+                "attributes": {"tool_name": tc["tool_name"]},
+            })
+
+        # Build tool declarations from discovered tool names
+        tool_names = sorted(set(tc["tool_name"] for tc in tool_calls))
+        tool_declarations = [
+            {"function_declarations": [{"name": tn, "description": f"Tool: {tn}"}]}
+            for tn in tool_names
+        ]
+
+        # Build Gemini batch format
+        contents = []
+        for i, user_input in enumerate(user_inputs):
+            contents.append({"role": "user", "parts": [{"text": user_input}]})
+            if i < len(text_responses):
+                contents.append({"role": "model", "parts": [{"text": text_responses[i]}]})
+
+        extracted_data = {
+            "state_variables": {},
+            "tool_interactions": tool_calls,
+            "sub_agent_trace": [],
+            "tool_declarations": tool_declarations,
+            "system_instruction": f"You are the {app_name} agent.",
+            "conversation_history": contents[:-1] if len(contents) > 1 else [],
+            "thinking_trace": [],
+            "grounding_chunks": [],
+            "per_turn_tokens": [],
+            "stop_reasons": [],
+        }
+
+        golden_q = self.golden_map.get(eval_id, {})
+
+        row = {
+            "request": {"contents": contents},
+            "response": {"candidates": [{"content": {"role": "model", "parts": [{"text": final_response}]}}]},
+            "question_id": eval_id,
+            "session_id": session_id or str(uuid.uuid4()),
+            "base_url": "simulation",
+            "source_type": "simulation",
+            "app_name": app_name,
+            "ADK_USER_ID": "eval_user",
+            "status": {"boolean": "success"},
+            "run_id": str(uuid.uuid4()),
+            "agents_evaluated": [app_name],
+            "user_inputs": user_inputs,
+            "question_metadata": golden_q.get("metadata", {}),
+            "interaction_datetime": datetime.now().isoformat(),
+            "USER": os.environ.get("USER", "simulator"),
+            "reference_data": golden_q.get("reference_data", {}),
+            "missing_information": {"boolean": False},
+            "final_session_state": {},
+            "session_trace": synthetic_trace,
+            "latency_data": {},
+            "trace_summary": [f"Tool: {tc['tool_name']}" for tc in tool_calls],
+            "extracted_data": extracted_data,
+            "final_response": final_response,
+        }
+
+        # ADK eval scores
+        adk_evals = case.get("eval_metric_results") or case.get("overall_eval_metric_results") or []
+        for eval_res in adk_evals:
+            m_name = eval_res.get("metric_name")
+            if m_name:
+                row[f"adk_score.{m_name}"] = eval_res.get("score")
+
+        return row
 
     def run(self) -> List[Dict[str, Any]]:
         """Processes ADK eval history files and returns a list of interaction records.

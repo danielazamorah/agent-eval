@@ -126,6 +126,7 @@ class TestAnalyzer(unittest.TestCase):
             user_inputs=["input 1"],
             final_response="response 1",
             trace_summary=["step1", "step2"],
+            sub_agent_trace=[],
             tool_interactions=[{"tool_name": "search", "input_arguments": {"q": "foo"}, "output_result": "bar"}],
             eval_results={"quality": {"score": 5, "explanation": "ok"}},
             latency_summary={"total_seconds": 1.5},

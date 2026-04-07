@@ -14,6 +14,7 @@ from google import genai
 from google.genai.types import HttpOptions
 
 from agent_eval.core.gemini_prompt_builder import GeminiAnalysisPrompter
+from agent_eval.core.utils import discover_agent_context
 
 
 class LogEntry(TypedDict):
@@ -498,71 +499,7 @@ class Analyzer:
 
     def _discover_agent_context(self, agent_dir: Optional[Path]) -> Dict[str, str]:
         """Discovers and loads agent source code and ADK context from agent directory."""
-        context = {}
-        if not agent_dir or not agent_dir.exists():
-            return context
-
-        # Patterns to exclude (virtual environments, caches, etc.)
-        exclude_patterns = [".venv", "venv", "__pycache__", ".git", "node_modules", "site-packages"]
-
-        def should_exclude(path: Path) -> bool:
-            """Check if path should be excluded based on patterns."""
-            path_str = str(path)
-            return any(excl in path_str for excl in exclude_patterns)
-
-        # 1. Find agent.py files (only in project source, not dependencies)
-        for pattern in ["agent.py", "**/agent.py"]:
-            for agent_file in agent_dir.glob(pattern):
-                if agent_file.is_file() and not should_exclude(agent_file):
-                    try:
-                        context[str(agent_file)] = agent_file.read_text()
-                        print(f"  Found agent source: {agent_file}")
-                    except Exception:
-                        pass
-
-        # 2. Find tools.py if exists (only in project source)
-        for pattern in ["tools.py", "**/tools.py"]:
-            for tools_file in agent_dir.glob(pattern):
-                if tools_file.is_file() and not should_exclude(tools_file):
-                    try:
-                        context[str(tools_file)] = tools_file.read_text()
-                        print(f"  Found tools source: {tools_file}")
-                    except Exception:
-                        pass
-
-        # 3. Load GEMINI.md (ADK context) - extract key sections to keep it concise
-        gemini_md = agent_dir / "GEMINI.md"
-        if gemini_md.exists():
-            try:
-                full_content = gemini_md.read_text()
-                # Extract relevant sections for evaluation context (first ~4000 chars + key sections)
-                # This keeps the context focused on ADK fundamentals
-                lines = full_content.split('\n')
-                key_sections = []
-                in_relevant_section = False
-                section_count = 0
-
-                for line in lines:
-                    # Include header and first few sections (Core Concepts, Agent Definitions, Tools, State)
-                    if line.startswith('## 1.') or line.startswith('## 2.') or line.startswith('## 7.') or line.startswith('## 8.'):
-                        in_relevant_section = True
-                        section_count += 1
-                    elif line.startswith('## ') and section_count > 0:
-                        in_relevant_section = False
-
-                    if in_relevant_section or len(key_sections) < 50:  # First 50 lines + key sections
-                        key_sections.append(line)
-
-                    if len('\n'.join(key_sections)) > 15000:  # Cap at ~15k chars
-                        break
-
-                adk_context = '\n'.join(key_sections)
-                context["GEMINI.md (ADK Reference - Key Sections)"] = adk_context
-                print(f"  Found ADK context: {gemini_md} ({len(adk_context)} chars)")
-            except Exception:
-                pass
-
-        return context
+        return discover_agent_context(agent_dir)
 
     def _auto_find_previous_run(self, results_dir: Path, current_run_folder: Path) -> Optional[Path]:
         """Find the most recent previous run folder in results_dir.

@@ -64,7 +64,7 @@ It consolidates the full evaluation workflow into a single CLI: generate interac
 | `safety` | Safety compliance (Vertex AI managed) |
 | Custom metrics | Anything you define with a scoring rubric |
 
-> Metrics are defined in `eval/metrics/metric_definitions.json`. The `init` command creates starter metrics; you customize them for your agent. See [docs/reference.md](docs/reference.md) for the full metrics glossary and custom metric creation guide.
+> Metrics are defined in `eval/metrics/metric_definitions.json`. The `init` command can create starter metrics manually or generate tailored metrics with AI (`--ai-metrics`). See [docs/reference.md](docs/reference.md) for the full metrics glossary and custom metric creation guide.
 
 ---
 
@@ -152,7 +152,12 @@ uv run agent-eval init
 
 The CLI scans for `agent.py` files and lets you select which agent to scaffold evaluation for. It creates an `eval/` folder inside the agent module directory with starter metrics, scenario files, and a golden dataset.
 
-Use `uv run agent-eval init -y` for non-interactive mode with defaults.
+**AI-powered metric generation:** In Step 3, choose "Generate with AI" (the default) and Gemini will analyze your agent's source code to create tailored LLM-as-judge metrics, plus recommendations for scenarios and test queries. You can provide evaluation priorities to guide generation.
+
+```bash
+# Non-interactive with AI-generated metrics
+uv run agent-eval init -y --ai-metrics
+```
 
 ### 2. Run the full pipeline
 
@@ -162,7 +167,9 @@ The fastest way to evaluate is the `run` command — it executes all four phases
 uv run agent-eval run --agent-dir path/to/your/agent_module
 ```
 
-This runs: **simulate** → **interact** → **evaluate** → **analyze**, prompting you for configuration at each phase. If your agent isn't reachable for live interactions, it skips gracefully.
+This runs: **simulate** → **interact** → **evaluate** → **analyze**, prompting you for configuration at each phase.
+
+> **Note:** The interact phase sends queries to a running agent. Make sure your agent is serving (e.g., `adk web` or `make playground`) before running. If the agent isn't reachable, interact is skipped gracefully.
 
 ### 3. Or run individual steps
 
@@ -194,7 +201,7 @@ uv run agent-eval analyze \
 
 | Command | Purpose |
 |---------|---------|
-| `uv run agent-eval init` | Scaffold eval folder structure for a new project |
+| `uv run agent-eval init` | Scaffold eval folder with optional AI metric generation |
 | `uv run agent-eval run` | Full pipeline: simulate + interact + evaluate + analyze |
 | `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
 | `uv run agent-eval interact` | Run interactions against a live agent endpoint (single-turn) |

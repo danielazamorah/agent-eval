@@ -1002,7 +1002,7 @@ The OPTIMIZATION_LOG becomes your project's "lab notebook" — a data-driven rec
 
 ## Next Steps
 
-1. **Apply to your own agents** — Run `uv run agent-eval init` in your agent project to get started
+1. **Apply to your own agents** — Run `uv run agent-eval init` in your agent project. Choose "Generate with AI" in Step 3 to get tailored metrics based on your agent's code
 2. **Create custom metrics** — See [reference.md — Creating Custom Metrics](reference.md#creating-custom-metrics)
 3. **Integrate with CI/CD** — Run evaluations on every code change
 4. **Build dashboards** — Push results to BigQuery and visualize in Looker

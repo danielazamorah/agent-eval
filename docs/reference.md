@@ -97,7 +97,7 @@ Extracted directly from OpenTelemetry traces — no configuration needed. These 
 
 ### LLM-as-Judge Metrics (configurable)
 
-Scored by Vertex AI Evaluation using rubrics you define in `eval/metrics/metric_definitions.json`. The `init` command creates starter metrics; you customize them for your agent.
+Scored by Vertex AI Evaluation using rubrics you define in `eval/metrics/metric_definitions.json`. The `init` command can create starter metrics manually or generate tailored metrics with AI (Gemini analyzes your agent code and creates metrics specific to your tools and domain).
 
 | Default Metric | What it scores | Score Range |
 |---------------|---------------|-------------|
@@ -139,8 +139,21 @@ uv run agent-eval init
 |--------|---------|-------------|
 | `--target-dir` | (auto-detected) | Directory containing agent.py (eval/ created here) |
 | `--agent-name` | (auto-detected) | Agent module name |
-| `--mode` | (prompted) | Interaction mode: `user-sim`, `diy`, or `both` |
+| `--mode` | `both` | Interaction mode: `user-sim`, `diy`, or `both` |
 | `--auto-approve`, `-y` | `false` | Skip interactive prompts, use defaults |
+| `--ai-metrics` | `false` | Generate tailored metrics with AI (Gemini analyzes your agent code) |
+
+**AI-generated metrics:** When you select "Generate with AI" in Step 3 (the default, or use `--ai-metrics` with `-y`), Gemini analyzes your agent's source code, tools, and any existing eval files (metrics, scenarios, golden data, previous analysis reports) to generate custom LLM-as-judge metrics tailored to your agent. It also provides recommendations for scenarios and test queries in structured tables. You can provide evaluation priorities (e.g., "accuracy of billing lookups, response tone") to guide generation. Requires `GOOGLE_CLOUD_PROJECT` to be set.
+
+**Non-destructive updates:** If eval files already exist, AI-generated content is saved as `.ai_generated.json` files (e.g., `metric_definitions.ai_generated.json`) instead of overwriting. Review and merge what you want into the main files, then delete the `.ai_generated` versions.
+
+```bash
+# Interactive — choose AI generation in Step 3
+uv run agent-eval init
+
+# Non-interactive with AI metrics
+uv run agent-eval init -y --ai-metrics
+```
 
 ### \`uv run agent-eval run`
 
@@ -504,7 +517,25 @@ Choose based on your agent's conversation pattern:
 }
 ```
 
-### Dataset Mapping Sources
+### Dataset Mapping — SDK Constraint
+
+```
++------------------------------------------------------------------+
+|  IMPORTANT: The Vertex AI Evaluation SDK only accepts three       |
+|  column names in dataset_mapping:                                 |
+|                                                                    |
+|    prompt    — the user's request                                 |
+|    response  — the agent's output                                 |
+|    reference — supporting context (tools, state, etc.)            |
+|                                                                    |
+|  Using any other name will crash the SDK.                         |
+|  Combine multiple data sources into these three columns.          |
++------------------------------------------------------------------+
+```
+
+### Available Source Columns
+
+These are the values you can use in `source_column` to point at trace data:
 
 | Source | Description |
 |--------|-------------|
@@ -523,12 +554,21 @@ Use `:` to access nested fields within JSON responses:
 
 ```json
 "dataset_mapping": {
-  "location": {"source_column": "extracted_data:target_location"},
-  "recommendation": {"source_column": "final_response:top_recommendation"}
+  "reference": {"source_column": "extracted_data:target_location"}
+}
+```
+
+Or access nested response fields:
+
+```json
+"dataset_mapping": {
+  "response": {"source_column": "final_response:top_recommendation"}
 }
 ```
 
 ### Example: Trajectory Accuracy
+
+Uses `reference` for the available tool list:
 
 ```json
 {
@@ -539,14 +579,16 @@ Use `:` to access nested fields within JSON responses:
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},
       "response": {"source_column": "trace_summary"},
-      "available_tools": {"source_column": "extracted_data:tool_declarations"}
+      "reference": {"source_column": "extracted_data:tool_declarations"}
     },
-    "template": "Evaluate the agent's execution trajectory.\n\n**User Request:**\n{prompt}\n\n**Agent Trajectory:**\n{response}\n\n**Available Tools:**\n{available_tools}\n\n**Scoring:**\n- 5: Perfect execution\n- 3: Mostly correct with minor issues\n- 0: Completely wrong\n\nCRITICAL: Only evaluate against tools that exist. Do NOT penalize for missing tools.\n\nScore: [0-5]\nExplanation: [Your reasoning]"
+    "template": "Evaluate the agent's execution trajectory.\n\n**User Request:**\n{prompt}\n\n**Agent Trajectory:**\n{response}\n\n**Available Tools:**\n{reference}\n\n**Scoring:**\n- 5: Perfect execution\n- 3: Mostly correct with minor issues\n- 0: Completely wrong\n\nCRITICAL: Only evaluate against tools that exist. Do NOT penalize for missing tools.\n\nScore: [0-5]\nExplanation: [Your reasoning]"
   }
 }
 ```
 
 ### Example: Tool Usage Quality
+
+Uses combined `reference` to include both tool declarations and tool interactions:
 
 ```json
 {
@@ -557,50 +599,38 @@ Use `:` to access nested fields within JSON responses:
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},
       "response": {"source_column": "final_response"},
-      "tool_interactions": {"source_column": "extracted_data:tool_interactions"},
-      "available_tools": {"source_column": "extracted_data:tool_declarations"}
+      "reference": {
+        "template": "Available Tools: {extracted_data_tool_declarations}\n\nTool Calls: {extracted_data_tool_interactions}",
+        "source_columns": ["extracted_data:tool_declarations", "extracted_data:tool_interactions"]
+      }
     },
-    "template": "Evaluate tool usage.\n\n**Request:** {prompt}\n**Available Tools:** {available_tools}\n**Tool Calls:** {tool_interactions}\n**Response:** {response}\n\n**Criteria:**\n1. Tool Selection: Were appropriate tools chosen?\n2. Arguments: Were parameters correct?\n3. Efficiency: Were calls non-redundant?\n\nScore: [0-5]\nExplanation:"
+    "template": "Evaluate tool usage.\n\n**Request:** {prompt}\n**Response:** {response}\n\n{reference}\n\n**Criteria:**\n1. Tool Selection: Were appropriate tools chosen?\n2. Arguments: Were parameters correct?\n3. Efficiency: Were calls non-redundant?\n\nScore: [0-5]\nExplanation:"
   }
 }
 ```
 
-### Custom Placeholder Names
+### Combining Multiple Sources into `reference`
 
-You are **not limited** to `prompt`, `response`, and `reference`. Any valid Python identifier works as a placeholder name. Each key in `dataset_mapping` becomes a column that's substituted into `{key}` in your template:
+When you need to evaluate against multiple data sources (e.g., tool declarations AND tool interactions), combine them into the `reference` column using the `template` + `source_columns` syntax:
 
 ```json
 "dataset_mapping": {
   "prompt": {"source_column": "user_inputs"},
   "response": {"source_column": "final_response"},
-  "tool_calls": {"source_column": "extracted_data:tool_interactions"},
-  "available_tools": {"source_column": "extracted_data:tool_declarations"}
-},
-"template": "Request: {prompt}\nTools available: {available_tools}\nCalls made: {tool_calls}\nResponse: {response}\n\nScore: [0-5]"
-```
-
-> **Note:** `prompt` and `response` are auto-populated from `user_inputs` and `final_response` if you don't include them in `dataset_mapping`. All other placeholders must be explicitly mapped.
-
-### Combining Multiple Columns (Meta-Columns)
-
-To merge several source columns into a single placeholder, use the `template` + `source_columns` syntax instead of `source_column`:
-
-```json
-"dataset_mapping": {
-  "prompt": {"source_column": "user_inputs"},
-  "combined_context": {
-    "template": "Agent reasoning: {agent_reasoning}\nSearch output: {extracted_data_search_results}",
-    "source_columns": ["agent_reasoning", "extracted_data:search_results"]
+  "reference": {
+    "template": "Available Tools: {extracted_data_tool_declarations}\n\nTool Calls: {extracted_data_tool_interactions}",
+    "source_columns": ["extracted_data:tool_declarations", "extracted_data:tool_interactions"]
   }
 },
-"template": "Evaluate the agent's analysis.\n\nUser: {prompt}\n\n{combined_context}\n\nScore: [0-5]"
+"template": "Evaluate the agent's analysis.\n\nUser: {prompt}\nResponse: {response}\n\n{reference}\n\nScore: [0-5]"
 ```
 
-**Rules for meta-columns:**
-- `source_columns` lists the columns to pull values from
+**Rules for combined columns:**
+- `source_columns` lists the data sources to pull values from
 - `template` is a Python format string with `{variable}` placeholders
 - Colons in source column names are replaced with underscores in the template variables (e.g., `extracted_data:search_results` → `{extracted_data_search_results}`)
-- Placeholder names must be valid Python identifiers (letters, digits, underscores only — no hyphens or dots)
+
+> **Note:** `prompt` and `response` are auto-populated from `user_inputs` and `final_response` if you don't include them in `dataset_mapping`. `reference` must be explicitly mapped if used.
 
 ### Tips for Custom Metrics
 
@@ -909,6 +939,8 @@ The easiest way is to use the `init` command:
 cd /path/to/your-agent
 uv run agent-eval init
 ```
+
+During setup, choose "Generate with AI" in Step 3 to have Gemini create tailored metrics based on your agent's source code, or pick from starter metrics manually.
 
 Or create the structure manually:
 

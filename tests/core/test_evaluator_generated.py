@@ -11,13 +11,14 @@ import pandas as pd
 from agent_eval.core.evaluator import Evaluator
 
 
-@patch("evaluation.core.evaluator.CONFIG")
-@patch("evaluation.core.evaluator.aiplatform")
-@patch("evaluation.core.evaluator.Client")
+@patch("agent_eval.core.evaluator.CONFIG")
+@patch("agent_eval.core.evaluator.aiplatform")
+@patch("agent_eval.core.evaluator.Client")
 class TestEvaluator(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.results_dir = Path(self.test_dir) / "results"
+        self.results_dir.mkdir()
         self.config = {
             "metric_filters": {},
             "input_label": "test_label",
@@ -36,9 +37,9 @@ class TestEvaluator(unittest.TestCase):
         # Verify the mocked library was initialized
         mock_aiplatform.init.assert_called_with(project="test-project", location="us-central1")
 
-    @patch("evaluation.core.evaluator.load_and_consolidate_metrics")
-    @patch("evaluation.core.evaluator.evaluate_deterministic_metrics")
-    @patch("evaluation.core.evaluator.save_metrics_summary")
+    @patch("agent_eval.core.evaluator.load_and_consolidate_metrics")
+    @patch("agent_eval.core.evaluator.evaluate_deterministic_metrics")
+    @patch("agent_eval.core.evaluator.save_metrics_summary")
     def test_evaluate_adk_score_integration_jsonl(
         self, 
         mock_save_summary, 
@@ -79,7 +80,11 @@ class TestEvaluator(unittest.TestCase):
 
         # Run
         evaluator = Evaluator(self.config)
-        evaluator.evaluate(input_file, ["metrics.json"], self.results_dir)
+        evaluator.evaluate(
+            metrics_files=["metrics.json"],
+            results_dir=self.results_dir,
+            interaction_files=[input_file],
+        )
 
         # Verify
         args, _ = mock_save_summary.call_args
@@ -93,9 +98,9 @@ class TestEvaluator(unittest.TestCase):
         self.assertEqual(first_row_results["hallucination"]["score"], 0.1)
         self.assertEqual(first_row_results["safety"]["score"], 1.0)
 
-    @patch("evaluation.core.evaluator.load_and_consolidate_metrics")
-    @patch("evaluation.core.evaluator.concurrent.futures.as_completed")
-    @patch("evaluation.core.evaluator.concurrent.futures.ThreadPoolExecutor")
+    @patch("agent_eval.core.evaluator.load_and_consolidate_metrics")
+    @patch("agent_eval.core.evaluator.concurrent.futures.as_completed")
+    @patch("agent_eval.core.evaluator.concurrent.futures.ThreadPoolExecutor")
     def test_evaluate_llm_metrics_execution_jsonl(
         self,
         mock_executor_cls,
@@ -145,7 +150,11 @@ class TestEvaluator(unittest.TestCase):
         mock_as_completed.return_value = [mock_future]
         
         evaluator = Evaluator(self.config)
-        evaluator.evaluate(input_file, [], self.results_dir)
+        evaluator.evaluate(
+            metrics_files=[],
+            results_dir=self.results_dir,
+            interaction_files=[input_file],
+        )
         
         # Verify executor was used
         mock_executor_instance.submit.assert_called()

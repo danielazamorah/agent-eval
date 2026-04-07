@@ -53,7 +53,7 @@ my-agent/
 
 | Command | Purpose |
 |---------|---------|
-| `uv run agent-eval init` | Scaffold eval folder structure |
+| `uv run agent-eval init` | Scaffold eval folder (with optional AI metric generation via `--ai-metrics`) |
 | `uv run agent-eval run` | Full pipeline: simulate + interact + evaluate + analyze |
 | `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
 | `uv run agent-eval interact` | Run queries against a live agent endpoint (single-turn) |
@@ -81,10 +81,15 @@ my-agent/
 
 ### Creating Custom Metrics
 
-Metrics live in `eval/metrics/metric_definitions.json`. Help users write LLM-as-judge metrics with:
-- Clear scoring criteria (what each score level means)
-- `dataset_mapping` pointing to the right trace fields
-- `Score: [X]` format in the template for reliable parsing
+Metrics live in `eval/metrics/metric_definitions.json`. Users can create them in two ways:
+
+1. **AI generation** (recommended): Run `uv run agent-eval init` and choose "Generate with AI" in Step 3. Gemini analyzes the agent's source code, existing eval files, and user-stated evaluation priorities to create tailored metrics with correct `dataset_mapping` constraints, plus recommendations for scenarios and test data. If eval files already exist, AI output goes to `.ai_generated.json` files for review.
+
+2. **Manual creation**: Help users write LLM-as-judge metrics with:
+   - **CRITICAL:** `dataset_mapping` keys can ONLY be `prompt`, `response`, `reference` — the Vertex AI SDK crashes with any other name. Combine multiple data sources into `reference` using the `template` + `source_columns` syntax.
+   - Clear scoring criteria (what each score level means)
+   - `dataset_mapping` pointing to the right trace fields
+   - `Score: [X]` format in the template for reliable parsing
 
 ### Diagnosing Agent Issues from Metrics
 

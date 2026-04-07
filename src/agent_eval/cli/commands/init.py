@@ -5,7 +5,7 @@ from pathlib import Path
 import click
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -18,14 +18,14 @@ _SKIP_DIRS = {".venv", "venv", "site-packages", "node_modules", "__pycache__",
               ".git", ".adk", "sub_agents", "app_env", "eval_history"}
 
 INTERACTION_MODES = [
+    ("both", "Both (recommended)",
+     "Generates files for both methods — use whichever fits when you're ready."),
     ("user-sim", "ADK User Sim (multi-turn)",
      "An LLM plays the role of a user, following scenario scripts you define.\n"
      "       Best for: conversational agents with back-and-forth dialogue."),
     ("diy", "DIY Interactions (single-turn)",
      "You send specific queries from a golden dataset to a running agent.\n"
      "       Best for: pipeline agents, deployed endpoints, or regression testing."),
-    ("both", "Both",
-     "Generates files for both methods — pick whichever fits when you're ready."),
 ]
 
 STARTER_METRICS = [
@@ -145,13 +145,14 @@ def _prompt_interaction_mode() -> str:
             console.print()
 
     console.print(
-        "\n  [dim]Not sure? Pick [bold]Both[/bold] (3) — you can always delete files you don't need.[/]"
+        "\n  [dim]Both is recommended — even if you only use one method now,[/]"
+        "\n  [dim]having both file types ready makes switching easy later.[/]"
     )
 
-    choice = IntPrompt.ask("\n  Select", default=3)
+    choice = IntPrompt.ask("\n  Select", default=1)
     while choice < 1 or choice > len(INTERACTION_MODES):
         console.print(f"  [red]Please enter a number between 1 and {len(INTERACTION_MODES)}[/]")
-        choice = IntPrompt.ask("  Select", default=3)
+        choice = IntPrompt.ask("  Select", default=1)
 
     return INTERACTION_MODES[choice - 1][0]
 
@@ -159,19 +160,44 @@ def _prompt_interaction_mode() -> str:
 # ── Step 3: Metrics ─────────────────────────────────────────────────────────
 
 
-def _prompt_metrics() -> list[str]:
-    selected = [key for key, _, _, default in STARTER_METRICS if default]
+def _prompt_metrics_choice(agent_dir: Path, agent_name: str) -> tuple[list[str], dict | None, dict | None]:
+    """Let user choose between starter metrics or AI-generated metrics.
 
+    Returns (starter_metric_keys, custom_metric_definitions_or_None, recommendations_or_None).
+    """
     console.print(Panel(
-        "[bold]Step 3 of 3[/] — Select starter metrics\n\n"
+        "[bold]Step 3 of 3[/] — Select metrics\n\n"
         "These define how your agent's responses will be scored.\n"
         "[bold]Deterministic metrics[/] (latency, tokens, cost) are always included.\n"
-        "Below are the [bold]LLM-as-judge metrics[/] — an LLM scores each response\n"
-        "against the rubric you define. You can customize them later in\n"
-        "[cyan]eval/metrics/metric_definitions.json[/].",
+        "Below are the [bold]LLM-as-judge metrics[/] — choose how to set them up.",
         border_style="blue",
         padding=(1, 2),
     ))
+
+    console.print()
+    console.print("    [bold]1.[/] [cyan]Generate with AI[/]  [dim](recommended)[/]")
+    console.print("       [dim]Gemini analyzes your agent code and creates tailored metrics,[/]")
+    console.print("       [dim]plus recommendations for scenarios and test data.[/]")
+    console.print()
+    console.print("    [bold]2.[/] [cyan]Pick from starter metrics[/]  [dim](manual selection)[/]")
+    console.print("       [dim]Choose from 4 general-purpose evaluation metrics.[/]")
+
+    console.print()
+    choice = IntPrompt.ask("  Select", default=1)
+    while choice not in (1, 2):
+        console.print("  [red]Please enter 1 or 2[/]")
+        choice = IntPrompt.ask("  Select", default=1)
+
+    if choice == 2:
+        return _prompt_starter_metrics(), None, None
+
+    # AI generation path
+    return _prompt_ai_metrics(agent_dir, agent_name)
+
+
+def _prompt_starter_metrics() -> list[str]:
+    """Original starter metrics toggle UI."""
+    selected = [key for key, _, _, default in STARTER_METRICS if default]
 
     console.print()
     _draw_metrics(selected)
@@ -199,6 +225,245 @@ def _prompt_metrics() -> list[str]:
     return selected
 
 
+def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dict | None, dict | None]:
+    """Generate metrics with AI, show results, and get user confirmation.
+
+    Returns (starter_keys_for_managed, custom_definitions_or_None, recommendations_or_None).
+    On failure or rejection, falls back to starter metrics.
+    """
+    # Ask what matters to them
+    console.print()
+    console.print(Panel(
+        "[bold]What matters most?[/]\n\n"
+        "Tell Gemini what aspects of your agent are important to evaluate.\n"
+        "For example: [dim]accuracy of billing lookups, whether it refuses\n"
+        "out-of-scope requests, tool call efficiency, response tone[/]\n\n"
+        "[dim]Press Enter to skip — Gemini will analyze the code on its own.[/]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+
+    console.print()
+    user_priorities = Prompt.ask("  Evaluation priorities", default="")
+
+    # Check for existing eval files to inform the user
+    eval_dir = agent_dir / "eval"
+    existing_files = []
+    if (eval_dir / "metrics" / "metric_definitions.json").exists():
+        existing_files.append("metrics")
+    if (eval_dir / "scenarios" / "conversation_scenarios.json").exists():
+        existing_files.append("scenarios")
+    if (eval_dir / "eval_data" / "golden_dataset.json").exists():
+        existing_files.append("golden data")
+    results_dirs = list((eval_dir / "results").glob("*/gemini_analysis.md")) if (eval_dir / "results").exists() else []
+    if results_dirs:
+        existing_files.append("previous analysis")
+
+    if existing_files:
+        console.print()
+        console.print(f"  [dim]Found existing {', '.join(existing_files)} — Gemini will review and build on them.[/]")
+
+    # Show spinner while generating
+    console.print()
+    with console.status("[bold blue]Analyzing agent source code with Gemini...[/]", spinner="dots"):
+        try:
+            from agent_eval.core.metric_generator import generate_metrics_with_gemini
+            metrics, rationale, recommendations = generate_metrics_with_gemini(
+                agent_dir=agent_dir,
+                agent_name=agent_name,
+                user_priorities=user_priorities,
+            )
+        except Exception as e:
+            console.print(f"\n  [yellow]AI generation failed:[/] {e}")
+            console.print("  [dim]Falling back to starter metrics.[/]\n")
+            return _prompt_starter_metrics(), None, None
+
+    # Display generated metrics
+    console.print()
+    _display_generated_metrics(metrics, rationale)
+
+    # Display recommendations
+    if recommendations:
+        _display_recommendations(recommendations)
+
+    # Ask what to do next — loop allows feedback + regeneration
+    while True:
+        console.print()
+        has_existing = (agent_dir / "eval").exists()
+        if has_existing:
+            console.print("  [dim]Your existing eval files will [bold]not[/bold] be overwritten.[/]")
+            console.print("  [dim]AI suggestions will be saved as .ai_generated.json files for you to review and merge.[/]")
+        else:
+            console.print("  [dim]These metrics, scenarios, and test queries will be written to your eval/ folder.[/]")
+
+        console.print()
+        console.print("    [bold]1.[/] [green]Accept[/] — create the eval files with these metrics and recommendations")
+        console.print("    [bold]2.[/] [cyan]Refine[/] — provide feedback and regenerate")
+        console.print("    [bold]3.[/] [yellow]Skip[/]   — use starter metrics instead")
+
+        console.print()
+        action = IntPrompt.ask("  Select", default=1)
+        while action not in (1, 2, 3):
+            console.print("  [red]Please enter 1, 2, or 3[/]")
+            action = IntPrompt.ask("  Select", default=1)
+
+        if action == 1:
+            # Always include general_quality and safety as managed metrics
+            starter_keys = ["general_quality", "safety"]
+            return starter_keys, metrics, recommendations
+
+        if action == 3:
+            console.print("  [dim]Switching to starter metrics.[/]\n")
+            return _prompt_starter_metrics(), None, None
+
+        # action == 2: Refine — get feedback and regenerate
+        console.print()
+        console.print(Panel(
+            "[bold]What should change?[/]\n\n"
+            "Tell Gemini what to adjust. For example:\n"
+            "[dim]  - \"focus more on tool error handling\"\n"
+            "  - \"the trajectory metric is too strict\"\n"
+            "  - \"add a metric for response latency awareness\"[/]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
+
+        console.print()
+        feedback = Prompt.ask("  Feedback")
+        if not feedback.strip():
+            continue
+
+        # Combine original priorities with feedback
+        combined_priorities = user_priorities
+        if combined_priorities:
+            combined_priorities += f"\n\nADDITIONAL FEEDBACK (the user reviewed the previous generation and wants these changes): {feedback}"
+        else:
+            combined_priorities = f"FEEDBACK on previous generation: {feedback}"
+
+        console.print()
+        with console.status("[bold blue]Regenerating metrics with your feedback...[/]", spinner="dots"):
+            try:
+                from agent_eval.core.metric_generator import generate_metrics_with_gemini
+                metrics, rationale, recommendations = generate_metrics_with_gemini(
+                    agent_dir=agent_dir,
+                    agent_name=agent_name,
+                    user_priorities=combined_priorities,
+                )
+            except Exception as e:
+                console.print(f"\n  [yellow]Regeneration failed:[/] {e}")
+                console.print("  [dim]Showing previous results.[/]")
+                continue
+
+        # Update priorities for next potential loop
+        user_priorities = combined_priorities
+
+        # Show new results
+        console.print()
+        _display_generated_metrics(metrics, rationale)
+        if recommendations:
+            _display_recommendations(recommendations)
+
+
+def _display_generated_metrics(metrics: dict, rationale: str) -> None:
+    """Display AI-generated metrics in a Rich table."""
+    table = Table(
+        title="AI-Generated Metrics",
+        border_style="cyan",
+        padding=(0, 2),
+    )
+    table.add_column("Metric", style="bold cyan")
+    table.add_column("Description")
+    table.add_column("Data Sources", style="dim")
+
+    for name, defn in metrics.items():
+        desc = defn.get("score_range", {}).get("description", "")
+        sources = ", ".join(
+            cfg.get("source_column", "?")
+            for cfg in defn.get("dataset_mapping", {}).values()
+        )
+        table.add_row(name, desc, sources)
+
+    console.print(table)
+
+    if rationale and not rationale.startswith("\n"):
+        console.print()
+        console.print(Panel(
+            rationale,
+            title="[bold]Rationale[/]",
+            border_style="dim",
+            padding=(1, 2),
+        ))
+
+    console.print()
+    console.print("  [dim]+ general_quality and safety are always included automatically.[/]")
+
+
+def _display_recommendations(recommendations: dict) -> None:
+    """Display Gemini's evaluation recommendations."""
+
+    # ── Strategy & file feedback ──────────────────────────────────────────
+    strategy_parts = []
+    strategy = recommendations.get("strategy", "")
+    if strategy:
+        strategy_parts.append(f"[bold]Strategy:[/] {strategy}")
+
+    feedback = recommendations.get("existing_file_feedback", "")
+    if feedback and feedback != "No existing files provided.":
+        strategy_parts.append(f"\n[bold]Existing files:[/] {feedback}")
+
+    if strategy_parts:
+        console.print()
+        console.print(Panel(
+            "\n".join(strategy_parts),
+            title="[bold]Recommendations[/]",
+            border_style="green",
+            padding=(1, 2),
+        ))
+
+    # ── Scenario table (multi-turn) ──────────────────────────────────────
+    scenarios = recommendations.get("scenarios", [])
+    if scenarios:
+        console.print()
+        console.print(
+            "  [bold]Suggested Scenarios[/] [dim]— multi-turn conversations for ADK User Sim.[/]"
+        )
+        console.print(
+            "  [dim]The simulator follows these plans without reference data —[/]"
+            "\n  [dim]it evaluates how the agent handles the full conversation.[/]"
+        )
+        scenario_table = Table(border_style="cyan", padding=(0, 2), expand=True)
+        scenario_table.add_column("#", style="dim", width=3)
+        scenario_table.add_column("Starting Prompt", style="cyan", ratio=2)
+        scenario_table.add_column("Description", ratio=3)
+        for i, s in enumerate(scenarios[:5], 1):
+            prompt = s.get("starting_prompt", "")
+            desc = s.get("description", s.get("conversation_plan", ""))
+            scenario_table.add_row(str(i), prompt, desc)
+        console.print(scenario_table)
+
+    # ── Golden queries table (single-turn) ────────────────────────────────
+    golden = recommendations.get("golden_data", [])
+    if golden:
+        console.print()
+        console.print(
+            "  [bold]Suggested Test Queries[/] [dim]— single-turn queries with reference data.[/]"
+        )
+        console.print(
+            "  [dim]Each query includes expected behavior so the evaluator can[/]"
+            "\n  [dim]check if the agent's response matches what it should do.[/]"
+        )
+        golden_table = Table(border_style="cyan", padding=(0, 2), expand=True)
+        golden_table.add_column("#", style="dim", width=3)
+        golden_table.add_column("Query", style="cyan", ratio=2)
+        golden_table.add_column("Expected Behavior", ratio=3)
+        for i, g in enumerate(golden[:5], 1):
+            inputs = g.get("user_inputs", [])
+            query = inputs[0] if inputs else g.get("description", "")
+            expected = g.get("expected_behavior", "")
+            golden_table.add_row(str(i), query, expected)
+        console.print(golden_table)
+
+
 def _draw_metrics(selected: list[str]) -> None:
     for i, (key, label, desc, _) in enumerate(STARTER_METRICS, 1):
         marker = "[green]x[/]" if key in selected else " "
@@ -208,70 +473,116 @@ def _draw_metrics(selected: list[str]) -> None:
 # ── Summary & Next Steps ───────────────────────────────────────────────────
 
 
-def _display_summary(agent_dir: Path, agent_name: str, mode: str, metrics: list[str]) -> None:
-    mode_label = next(label for key, label, _ in INTERACTION_MODES if key == mode)
-    metrics_str = ", ".join(metrics) if metrics else "(none)"
+def _display_summary(
+    agent_dir: Path, agent_name: str, mode: str,
+    metrics: list[str], custom_metrics: dict | None = None,
+) -> None:
+    """Show what files will be created/kept, with descriptions of each file's purpose."""
     eval_dir = agent_dir / "eval"
+    is_existing = eval_dir.exists()
 
-    # Build file list with descriptions
-    files = [("__init__.py", None)]
-    files.append(("metrics/metric_definitions.json", _FILE_DESCRIPTIONS["metrics/metric_definitions.json"]))
-    files.append(("scenarios/session_input.json", _FILE_DESCRIPTIONS["scenarios/session_input.json"]))
+    # Determine what will happen to each file
+    existing_metrics = (eval_dir / "metrics" / "metric_definitions.json").exists()
+    existing_scenarios = (eval_dir / "scenarios" / "conversation_scenarios.json").exists()
+    existing_golden = (eval_dir / "eval_data" / "golden_dataset.json").exists()
+    existing_session = (eval_dir / "scenarios" / "session_input.json").exists()
+    has_ai = custom_metrics is not None
+
+    console.print(f"  Creating eval files in [cyan]{eval_dir}/[/]")
+    if is_existing:
+        console.print("  [dim]Existing files will not be overwritten.[/]")
+        if has_ai:
+            console.print("  [dim]AI suggestions saved as .ai_generated.json for you to review and merge.[/]")
+    console.print()
+
+    # Build file table with descriptions
+    table = Table(show_header=True, border_style="blue", padding=(0, 2), expand=True)
+    table.add_column("Status", width=6)
+    table.add_column("File", style="cyan", ratio=2)
+    table.add_column("Purpose", ratio=3)
+
+    # Metrics
+    if has_ai and existing_metrics:
+        table.add_row("[green]new[/]", "metrics/metric_definitions.ai_generated.json", "AI-generated scoring rubrics — review and merge into the main file")
+        table.add_row("[yellow]kept[/]", "[dim]metrics/metric_definitions.json[/]", "[dim]Your current scoring rubrics (unchanged)[/]")
+    elif existing_metrics:
+        table.add_row("[yellow]kept[/]", "[dim]metrics/metric_definitions.json[/]", "[dim]Your current scoring rubrics (unchanged)[/]")
+    else:
+        table.add_row("[green]new[/]", "metrics/metric_definitions.json", "LLM-as-judge scoring rubrics for evaluating agent responses")
+
+    # Scenarios
     if mode in ("user-sim", "both"):
-        files.append(("scenarios/conversation_scenarios.json", _FILE_DESCRIPTIONS["scenarios/conversation_scenarios.json"]))
-    if mode in ("diy", "both"):
-        files.append(("eval_data/golden_dataset.json", _FILE_DESCRIPTIONS["eval_data/golden_dataset.json"]))
-    files.append(("results/.gitkeep", _FILE_DESCRIPTIONS["results/.gitkeep"]))
-
-    table = Table(show_header=False, show_edge=False, padding=(0, 2))
-    table.add_column(style="bold")
-    table.add_column()
-    table.add_row("Agent module:", f"[cyan]{agent_name}/[/]  [dim]({agent_dir})[/]")
-    table.add_row("Eval folder:", f"[cyan]{eval_dir}/[/]")
-    table.add_row("Mode:", mode_label)
-    table.add_row("Metrics:", metrics_str)
-    table.add_row("", "")
-    table.add_row("Files:", "")
-    for filename, desc in files:
-        if desc:
-            table.add_row("", f"  [cyan]{filename}[/]  [dim]{desc}[/]")
+        if existing_scenarios:
+            table.add_row("[yellow]kept[/]", "[dim]scenarios/conversation_scenarios.json[/]", "[dim]Your current multi-turn scenario scripts (unchanged)[/]")
+            if has_ai:
+                table.add_row("[green]new[/]", "scenarios/conversation_scenarios.ai_generated.json", "AI-suggested scenarios — review and merge into the main file")
         else:
-            table.add_row("", f"  [dim]{filename}[/]")
+            table.add_row("[green]new[/]", "scenarios/conversation_scenarios.json", "Multi-turn conversation scripts for ADK User Sim")
 
-    console.print(Panel(table, title="[bold]Review[/]", border_style="blue", padding=(1, 2)))
+    # Golden data
+    if mode in ("diy", "both"):
+        if existing_golden:
+            table.add_row("[yellow]kept[/]", "[dim]eval_data/golden_dataset.json[/]", "[dim]Your current test queries (unchanged)[/]")
+            if has_ai:
+                table.add_row("[green]new[/]", "eval_data/golden_dataset.ai_generated.json", "AI-suggested test queries — review and merge into the main file")
+        else:
+            table.add_row("[green]new[/]", "eval_data/golden_dataset.json", "Single-turn test queries with expected behaviors")
+
+    # Session input
+    if not existing_session:
+        table.add_row("[green]new[/]", "scenarios/session_input.json", "Agent name + user ID for trace collection")
+
+    console.print(table)
 
 
-def _display_next_steps(agent_name: str, agent_dir: Path, mode: str) -> None:
+def _display_next_steps(
+    agent_name: str, agent_dir: Path, mode: str,
+    custom_metrics: dict | None = None,
+) -> None:
     eval_path = agent_dir / "eval"
+    has_ai_files = custom_metrics and (eval_path / "metrics" / "metric_definitions.ai_generated.json").exists()
 
     lines = []
-    if mode in ("user-sim", "both"):
-        lines.append("[bold]1.[/] Edit your scenarios:")
-        lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.json[/]")
+
+    # Step 0: Review AI-generated files (if applicable)
+    if has_ai_files:
+        lines.append("[bold]1.[/] Review AI-generated files and merge what you want:")
+        lines.append(f"   [cyan]{eval_path}/metrics/metric_definitions.ai_generated.json[/]")
+        if (eval_path / "scenarios" / "conversation_scenarios.ai_generated.json").exists():
+            lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.ai_generated.json[/]")
+        if (eval_path / "eval_data" / "golden_dataset.ai_generated.json").exists():
+            lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.ai_generated.json[/]")
         lines.append("")
-        lines.append("[bold]2.[/] Run simulation + convert traces (one command):")
-        lines.append(f"   [dim]$[/] uv run agent-eval simulate --agent-dir {agent_dir}")
+        lines.append("   [dim]Copy the metrics/scenarios/queries you want into the main files,[/]")
+        lines.append("   [dim]then delete the .ai_generated files.[/]")
         lines.append("")
-        lines.append("   [dim]This creates symlinks, clears history, runs ADK User Sim,[/]")
-        lines.append("   [dim]and converts traces to evaluation format automatically.[/]")
-    elif mode == "diy":
-        lines.append("[bold]1.[/] Edit your golden dataset:")
-        lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.json[/]")
+        lines.append("[bold]2.[/] Run the full evaluation pipeline:")
+        lines.append(f"   [dim]$[/] uv run agent-eval run --agent-dir {agent_dir}")
+    else:
+        # Standard flow — review files, then run
+        step = 1
+        if mode in ("user-sim", "both"):
+            lines.append(f"[bold]{step}.[/] Review your scenarios:")
+            lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.json[/]")
+            step += 1
+        if mode in ("diy", "both"):
+            lines.append(f"[bold]{step}.[/] Review your golden dataset:")
+            lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.json[/]")
+            step += 1
+
         lines.append("")
-        lines.append("[bold]2.[/] Start your agent, then run:")
-        lines.append(f"   [dim]$[/] uv run agent-eval interact --app-name {agent_name} \\")
-        lines.append(f"       --questions-file {eval_path}/eval_data/golden_dataset.json")
+        lines.append(f"[bold]{step}.[/] Run the full evaluation pipeline:")
+        lines.append(f"   [dim]$[/] uv run agent-eval run --agent-dir {agent_dir}")
 
     lines.append("")
-    lines.append("[bold]Then evaluate + analyze:[/]")
-    lines.append(f"  [dim]$[/] uv run agent-eval evaluate \\")
-    lines.append(f"      --interaction-file {eval_path}/results/<run>/raw/processed_interaction_*.jsonl \\")
-    lines.append(f"      --metrics-files {eval_path}/metrics/metric_definitions.json \\")
-    lines.append(f"      --results-dir {eval_path}/results/<run>")
-    lines.append(f"  [dim]$[/] uv run agent-eval analyze \\")
-    lines.append(f"      --results-dir {eval_path}/results/<run> --agent-dir {agent_dir}")
+    lines.append("   [dim]This runs: simulate + interact + evaluate + analyze[/]")
+    lines.append("   [dim]in a single command with progress tracking.[/]")
     lines.append("")
-    lines.append("[dim]Full reference: uv run agent-eval --help[/]")
+    lines.append("[dim]Note: The interact phase sends queries to a running agent.[/]")
+    lines.append("[dim]Make sure your agent is serving (e.g. [bold]adk web[/bold]) before running.[/]")
+    lines.append("[dim]If the agent isn't reachable, interact is skipped gracefully.[/]")
+    lines.append("")
+    lines.append("[dim]Or run individual steps — see: uv run agent-eval --help[/]")
 
     console.print(Panel("\n".join(lines), title="[bold]Next Steps[/]", border_style="green", padding=(1, 2)))
 
@@ -285,7 +596,8 @@ def _display_next_steps(agent_name: str, agent_dir: Path, mode: str) -> None:
 @click.option("--mode", type=click.Choice(["user-sim", "diy", "both"]), default=None,
               help="Interaction mode.")
 @click.option("--auto-approve", "-y", is_flag=True, help="Skip interactive prompts, use defaults.")
-def init(target_dir, agent_name, mode, auto_approve):
+@click.option("--ai-metrics", is_flag=True, help="Generate tailored metrics with AI (Gemini analyzes your agent code).")
+def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
     """Scaffold the eval/ folder structure for an ADK agent.
 
     Searches for agent.py files in the current directory tree and lets you
@@ -294,6 +606,9 @@ def init(target_dir, agent_name, mode, auto_approve):
     """
     from agent_eval.cli.main import _display_banner
     _display_banner()
+
+    custom_metrics = None
+    recommendations = None
 
     if auto_approve:
         if target_dir:
@@ -310,7 +625,24 @@ def init(target_dir, agent_name, mode, auto_approve):
                 agent_dir = Path(agent_name)
 
         mode = mode or "both"
-        metrics = [key for key, _, _, default in STARTER_METRICS if default]
+
+        if ai_metrics:
+            console.print()
+            with console.status("[bold blue]Generating tailored metrics with Gemini...[/]", spinner="dots"):
+                try:
+                    from agent_eval.core.metric_generator import generate_metrics_with_gemini
+                    custom_metrics, rationale, recommendations = generate_metrics_with_gemini(
+                        agent_dir=agent_dir,
+                        agent_name=agent_name,
+                    )
+                    metrics = ["general_quality", "safety"]
+                    console.print(f"  [green]Generated {len(custom_metrics)} custom metrics[/]")
+                except Exception as e:
+                    console.print(f"  [yellow]AI generation failed:[/] {e}")
+                    console.print("  [dim]Using default starter metrics.[/]")
+                    metrics = [key for key, _, _, default in STARTER_METRICS if default]
+        else:
+            metrics = [key for key, _, _, default in STARTER_METRICS if default]
     else:
         search_dir = Path(target_dir) if target_dir else Path(".")
         agents = _find_agents(search_dir)
@@ -322,15 +654,10 @@ def init(target_dir, agent_name, mode, auto_approve):
             agent_name, agent_dir = _prompt_agent_name_manual()
 
         mode = mode or _prompt_interaction_mode()
-        metrics = _prompt_metrics()
+        metrics, custom_metrics, recommendations = _prompt_metrics_choice(agent_dir, agent_name)
 
     console.print()
-    _display_summary(agent_dir, agent_name, mode, metrics)
-
-    if not auto_approve:
-        if not Confirm.ask("\n  Create these files?", default=True):
-            console.print("\n  [yellow]Cancelled.[/]")
-            return
+    _display_summary(agent_dir, agent_name, mode, metrics, custom_metrics)
 
     console.print()
     scaffold_eval_structure(
@@ -338,7 +665,9 @@ def init(target_dir, agent_name, mode, auto_approve):
         agent_name=agent_name,
         mode=mode,
         metrics=metrics,
+        custom_metric_definitions=custom_metrics,
+        ai_recommendations=recommendations,
     )
 
     console.print()
-    _display_next_steps(agent_name, agent_dir, mode)
+    _display_next_steps(agent_name, agent_dir, mode, custom_metrics)
