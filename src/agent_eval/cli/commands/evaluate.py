@@ -65,7 +65,7 @@ def _display_metrics_summary(results_dir: str) -> None:
     if det:
         table = Table(title="Key Deterministic Metrics", border_style="blue", padding=(0, 2))
         table.add_column("Metric", style="bold")
-        table.add_column("Value", justify="right")
+        table.add_column("Avg Value", justify="right")
 
         # Pick the most useful metrics to show
         highlights = [

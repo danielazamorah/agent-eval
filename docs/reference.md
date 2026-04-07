@@ -1060,6 +1060,34 @@ Current pricing (April 2026):
 
 Source: [Vertex AI Generative AI Pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing)
 
+### ADK Optimization Patterns
+
+The `analyze` command includes ADK-specific design patterns in its Gemini prompt, enabling the AI analysis to provide actionable recommendations with code examples. These patterns are bundled in `src/agent_eval/core/adk_optimization_patterns.py` and cover:
+
+- Tool design (error handling, output truncation, docstring constraints)
+- Agent architecture (sub-agent isolation, sequential/parallel pipelines)
+- Prompt engineering (capability constraints, clarification rules)
+- State & context management (initialization, compaction)
+- Model configuration (temperature, determinism)
+
+The patterns map evaluation metric signals (e.g., high latency, low tool grounding) to concrete ADK fixes using the five **Context Engineering Principles**: Offload, Reduce, Retrieve, Isolate, Cache.
+
+**Maintainer note:** These patterns are derived from the [ADK documentation skills](https://github.com/google/adk-docs). To update them when ADK evolves:
+```bash
+# Install/update ADK skills locally to review the latest patterns
+npx skills add google/adk-docs/skills -y -g
+
+# Review the installed references
+ls ~/.agents/skills/adk-cheatsheet/references/
+ls ~/.agents/skills/adk-eval-guide/references/
+
+# Update src/agent_eval/core/adk_optimization_patterns.py accordingly
+```
+
+### Smart Comparison
+
+The `analyze` command automatically skips the comparison Gemini call (Call 2) when both runs share the same git commit and no code diff is detected. This avoids wasting API calls analyzing LLM non-determinism as if it were a code change. The comparison metrics table is still displayed so you can see the variance.
+
 ---
 
 ## Troubleshooting

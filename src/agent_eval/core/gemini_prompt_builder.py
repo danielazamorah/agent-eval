@@ -38,7 +38,7 @@ You are an expert AI evaluation analyst. Your task is to produce a deep technica
 {custom_strategy_section}
 
 **CRITICAL INSTRUCTIONS:**
-1.  **Focus on Diagnosis, Not Recommendations:** Your primary goal is to explain *why* the metrics are what they are. Do not provide a future-looking action plan unless the Strategic Framework above explicitly guides it.
+1.  **Diagnose AND Recommend:** Your primary goal is to explain *why* the metrics are what they are. Then, provide actionable recommendations using the ADK Design Patterns reference below. Each recommendation must cite a specific pattern and include a code example.
 2.  **Synthesize, Don't Summarize:** Do not simply repeat the scores. Your value is in synthesizing insights by connecting the metric scores, the metric definitions, the source code, and the raw explanations.
 3.  **Reference Your Sources:** When you make a claim or analyze a metric, you MUST reference the specific source file (e.g., `metric_definitions.json`, `deterministic_metrics.py`, `agent.py`).
 4.  **Analyze Calculation Methods:** For each metric you discuss, you MUST explain how its calculation method (deterministic vs. LLM-judged) influences its interpretation.
@@ -73,7 +73,17 @@ You are provided with the following context files to perform your diagnosis. Use
 *   **Questions Evaluated:** The full set of questions used in the evaluation. This can provide context if certain types of questions are causing specific failures.
 {questions_section}
 
+**5. ADK Design Patterns Reference:**
+*   **Optimization Patterns:** Use these ADK-specific patterns to provide actionable recommendations. Map each diagnosed issue to a concrete pattern with code examples.
+{adk_patterns_section}
+
 ---
+**FINAL SECTION REQUIREMENT:** End your report with a **## Recommended Next Steps** section. For each recommendation:
+1. Name the optimization pillar (Offload, Reduce, Retrieve, Isolate, or Cache)
+2. Reference the specific ADK pattern from the reference above
+3. Provide a concrete code change the developer can make
+4. Predict the expected metric impact (e.g., "should reduce `latency_metrics.total_latency_seconds` by ~30%")
+
 Format your entire response as a single Markdown document.
 """
 
@@ -218,6 +228,10 @@ Format your entire response as a single Markdown document.
                 f"---"
             )
 
+        # ADK optimization patterns
+        from agent_eval.core.adk_optimization_patterns import ADK_OPTIMIZATION_PATTERNS
+        adk_patterns_section = f"```markdown\n{ADK_OPTIMIZATION_PATTERNS}\n```"
+
         return self.BASE_TEMPLATE.format(
             audience=self.audience,
             tone=self.tone,
@@ -230,6 +244,7 @@ Format your entire response as a single Markdown document.
             deterministic_logic_section=deterministic_logic_section,
             source_code_section=source_code_section,
             questions_section=questions_section,
+            adk_patterns_section=adk_patterns_section,
         )
 
     def build_comparison_prompt(

@@ -158,6 +158,8 @@ Instructions:
 - 🔴 = Regression
 - ⚪ = Neutral
 
+> The `analyze` command includes ADK-specific design patterns in its Gemini prompt, enabling actionable recommendations mapped to the five Context Engineering Principles. These patterns are bundled in the package (`src/agent_eval/core/adk_optimization_patterns.py`) — no external installation required.
+
 ---
 
 ## Critical Reminders

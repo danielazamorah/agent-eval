@@ -97,6 +97,8 @@ Metrics live in `eval/metrics/metric_definitions.json`. Help users write LLM-as-
 | Agent fabricates data on failure | `pipeline_integrity` < 3.0 | Add circuit breaker checks |
 | Low cache hits | `cache_hit_rate` < 50% | Put static instructions in `global_instruction` |
 
+> The `analyze` command includes ADK-specific design patterns in its Gemini prompt, so the AI analysis provides actionable recommendations with code examples based on these patterns. The patterns are in `src/agent_eval/core/adk_optimization_patterns.py`.
+
 ---
 
 ## Creating Optimization Logs (Comparing Results)

@@ -961,6 +961,23 @@ class Analyzer:
             else:
                 print("\n--- No previous run found (this is the baseline) ---")
 
+        # Check if comparison is meaningful (code or questions actually changed)
+        skip_comparison_call = False
+        if comparison_data:
+            b_git = comparison_data.get("baseline_git", {})
+            c_git = comparison_data.get("current_git", {})
+            same_commit = (
+                b_git.get("commit") and c_git.get("commit")
+                and b_git["commit"] == c_git["commit"]
+            )
+            no_diff = not comparison_data.get("git_diff")
+            if same_commit and no_diff:
+                skip_comparison_call = True
+                print(
+                    f"\n--- Same code (commit {c_git['commit'][:8]}). "
+                    f"Skipping comparison analysis — metric changes are due to LLM non-determinism. ---"
+                )
+
         # 3. Generate Gemini Analysis (Call 1 + optional Call 2)
         gemini_comparison_text = ""
         if not skip_gemini:
@@ -971,7 +988,7 @@ class Analyzer:
                 analysis_path = run_folder / "gemini_analysis.md"
                 gemini_comparison_text = self.generate_gemini_analysis(
                     summary, analysis_content, raw_dir, analysis_path,
-                    comparison_data=comparison_data,
+                    comparison_data=comparison_data if not skip_comparison_call else None,
                 )
 
         # 4. Generate / append OPTIMIZATION_LOG.md
