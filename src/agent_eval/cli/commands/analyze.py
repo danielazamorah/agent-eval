@@ -215,8 +215,9 @@ def _display_metrics_table(
 @click.option("--location", default=None, help="Vertex AI location (e.g. us-central1, global).")
 @click.option("--skip-gemini", is_flag=True, help="Skip AI-powered analysis.")
 @click.option("--gcs-bucket", default=None, help="GCS bucket for upload.")
+@click.option("--debug", is_flag=True, help="Show detailed logs from Gemini API and other services.")
 def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_audience,
-            report_tone, report_length, model, location, skip_gemini, gcs_bucket):
+            report_tone, report_length, model, location, skip_gemini, gcs_bucket, debug):
     """Analyze evaluation results and generate reports.
 
     \b
@@ -243,6 +244,9 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
       # Compare to a specific previous run
       uv run agent-eval analyze --results-dir eval/results/v3 --compare-to eval/results/v1
     """
+    from agent_eval.core.evaluator import configure_logging
+    configure_logging(debug=debug)
+
     console.print("\n[bold blue]Analyzing Results[/]")
 
     config = {

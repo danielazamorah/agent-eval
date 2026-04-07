@@ -21,13 +21,47 @@ from agent_eval.core.config import CONFIG
 from agent_eval.core.deterministic_metrics import DETERMINISTIC_METRICS, evaluate_deterministic_metrics
 from agent_eval.core.data_mapper import map_dataset_columns, robust_json_loads
 
-# Setup Logger
+# Setup Logger — our own logs (agent_eval) are shown at INFO.
+# Third-party logs (Vertex AI SDK, ADK, Google Cloud) are suppressed by default
+# because they dump noisy tracebacks (e.g., 429 retries) that alarm users.
+# Use --debug to see everything.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("agent_eval")
+
+# Suppress noisy third-party logs by default
+_NOISY_LOGGERS = [
+    "vertexai",
+    "vertexai._genai._evals_metric_handlers",
+    "google.cloud",
+    "google.auth",
+    "google.api_core",
+    "urllib3",
+    "httpcore",
+    "httpx",
+    "grpc",
+]
+for _name in _NOISY_LOGGERS:
+    logging.getLogger(_name).setLevel(logging.CRITICAL)
+
+
+def configure_logging(debug: bool = False) -> None:
+    """Configure logging levels based on debug flag.
+
+    Normal mode (default): agent_eval at INFO, third-party at CRITICAL.
+    Debug mode (--debug): everything at DEBUG (shows SDK retries, ADK internals).
+    """
+    if debug:
+        logger.setLevel(logging.DEBUG)
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.CRITICAL)
 
 def serialize_rubric_verdicts(rubric_verdicts: Any) -> Optional[List[Dict]]:
     """Serialize rubric verdicts to JSON-compatible format."""
@@ -227,6 +261,7 @@ def save_metrics_summary(
     run_type: str,
     test_description: str,
     metric_definitions: Dict[str, Any] = None,
+    failed_metrics: list[str] | None = None,
 ) -> None:
     """Calculate and save a comprehensive summary of metrics including full input/output."""
     logger.info("--- Generating Metrics Summary ---")
@@ -351,6 +386,10 @@ def save_metrics_summary(
     # from agent-eval's LLM-as-judge metrics. Only include if present.
     if adk_summary:
         output["overall_summary"]["adk_eval_scores"] = adk_summary
+
+    # Track metrics that failed all retries so the CLI can surface them
+    if failed_metrics:
+        output["overall_summary"]["failed_metrics"] = failed_metrics
 
     # Per-source breakdown (only when multiple source types present)
     if "source_type" in df.columns:
@@ -513,19 +552,38 @@ class Evaluator:
                 if info.get("metric_type") == "deterministic":
                     continue
 
+                # Filter by applies_to (metric routing by source type)
+                applies_to = info.get("applies_to", "all")
+                if applies_to != "all" and "source_type" in agent_df.columns:
+                    source_map = {"scenarios": "simulation", "golden_dataset": "interaction"}
+                    required_source = source_map.get(applies_to)
+                    if required_source:
+                        source_mask = agent_df["source_type"] == required_source
+                        agent_df_filtered = agent_df[source_mask].copy()
+                        if agent_df_filtered.empty:
+                            logger.info(f"Skipping '{metric_name}' — no {applies_to} data available")
+                            continue
+                    else:
+                        agent_df_filtered = agent_df
+                else:
+                    agent_df_filtered = agent_df
+
                 # For API Predefined metrics, check if we should use raw GEMINI format
                 is_managed = info.get("is_managed", False)
                 use_gemini_format = info.get("use_gemini_format", False)
 
+                # Use filtered original_df to match the applies_to filter
+                original_df_filtered = original_df.loc[agent_df_filtered.index] if applies_to != "all" else original_df
+
                 if is_managed and use_gemini_format:
                     # Use raw data with request/response - SDK will auto-detect GEMINI schema
                     # This allows proper parsing of conversation_history from request.contents
-                    eval_dataset = original_df[["request", "response"]].copy()
+                    eval_dataset = original_df_filtered[["request", "response"]].copy()
                     logger.info(f"Using GEMINI format for API Predefined metric: {metric_name}")
                 else:
                     eval_dataset = map_dataset_columns(
-                        agent_df,
-                        original_df,
+                        agent_df_filtered,
+                        original_df_filtered,
                         info.get("dataset_mapping", {}),
                         metric_name,
                         CONFIG.METRIC_TOOL_USE_QUALITY,
@@ -559,6 +617,7 @@ class Evaluator:
                 ))
 
         # Run Parallel Execution
+        failed_metrics = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG.MAX_WORKERS) as executor:
             future_to_metric = {
                 executor.submit(run_single_metric_evaluation, t): t[3]
@@ -568,6 +627,8 @@ class Evaluator:
                 res, m_name, input_df = future.result()
                 if res is not None:
                     all_llm_results.append((res, m_name, input_df))
+                else:
+                    failed_metrics.append(m_name)
 
         # --- Consolidate Results ---
         final_df = original_df.copy()
@@ -700,6 +761,7 @@ class Evaluator:
             self.config.get("input_label", "manual"),
             self.config.get("test_description", "Automated run"),
             metric_definitions=metric_definitions,
+            failed_metrics=failed_metrics,
         )
 
         logger.info(f"Run folder: {results_dir}")

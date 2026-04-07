@@ -74,6 +74,7 @@ my-agent/
 
 ### Debugging Evaluation Issues
 
+- **Use `--debug`** on any command (`run`, `simulate`, `interact`, `evaluate`, `analyze`) to see detailed logs from ADK, Vertex AI SDK, and other services. By default, third-party logs are suppressed to keep the CLI output clean — `--debug` opens the floodgates.
 - Zero token usage → `app_name` in `session_input.json` doesn't match the agent module folder name
 - "conversation_history required" → Using `MULTI_TURN_*` metrics on a single-turn agent; use `GENERAL_QUALITY` instead
 - Empty metrics → Using `GOOGLE_API_KEY` instead of Vertex AI; set `GOOGLE_CLOUD_PROJECT` instead
@@ -83,10 +84,11 @@ my-agent/
 
 Metrics live in `eval/metrics/metric_definitions.json`. Users can create them in two ways:
 
-1. **AI generation** (recommended): Run `uv run agent-eval init` and choose "Generate with AI" in Step 3. Gemini analyzes the agent's source code, existing eval files, and user-stated evaluation priorities to create tailored metrics with correct `dataset_mapping` constraints, plus recommendations for scenarios and test data. If eval files already exist, AI output goes to `.ai_generated.json` files for review.
+1. **AI generation** (recommended): Run `uv run agent-eval init` and choose "Generate with AI" in Step 3. Gemini analyzes the agent's source code, existing eval files, and user-stated evaluation priorities to create tailored metrics with correct `dataset_mapping` constraints, plus recommendations for scenarios and test data. If eval files already exist, they are backed up to `eval/.backup/` before updating.
 
 2. **Manual creation**: Help users write LLM-as-judge metrics with:
    - **CRITICAL:** `dataset_mapping` keys can ONLY be `prompt`, `response`, `reference` — the Vertex AI SDK crashes with any other name. Combine multiple data sources into `reference` using the `template` + `source_columns` syntax.
+   - **`applies_to`** controls which data a metric runs on: `"all"` (default), `"scenarios"` (multi-turn from simulate — no reference data, evaluates conversation flow), or `"golden_dataset"` (single-turn from interact — has reference data, evaluates correctness). Use `"golden_dataset"` for metrics that need expected answers, `"scenarios"` for trajectory/conversation metrics, `"all"` for general quality/safety.
    - Clear scoring criteria (what each score level means)
    - `dataset_mapping` pointing to the right trace fields
    - `Score: [X]` format in the template for reliable parsing

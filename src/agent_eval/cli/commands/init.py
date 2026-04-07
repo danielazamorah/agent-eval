@@ -246,22 +246,63 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
     console.print()
     user_priorities = Prompt.ask("  Evaluation priorities", default="")
 
-    # Check for existing eval files to inform the user
+    # Check for existing eval files and let the user choose which to include
     eval_dir = agent_dir / "eval"
-    existing_files = []
-    if (eval_dir / "metrics" / "metric_definitions.json").exists():
-        existing_files.append("metrics")
-    if (eval_dir / "scenarios" / "conversation_scenarios.json").exists():
-        existing_files.append("scenarios")
-    if (eval_dir / "eval_data" / "golden_dataset.json").exists():
-        existing_files.append("golden data")
-    results_dirs = list((eval_dir / "results").glob("*/gemini_analysis.md")) if (eval_dir / "results").exists() else []
-    if results_dirs:
-        existing_files.append("previous analysis")
+    exclude_context: set[str] = set()
 
-    if existing_files:
+    found_files: list[tuple[str, str, str]] = []  # (key, label, detail)
+    if (eval_dir / "metrics" / "metric_definitions.json").exists():
+        found_files.append(("metrics", "Metric definitions", "eval/metrics/metric_definitions.json"))
+    if (eval_dir / "scenarios" / "conversation_scenarios.json").exists():
+        found_files.append(("scenarios", "Scenarios", "eval/scenarios/conversation_scenarios.json"))
+    if (eval_dir / "eval_data" / "golden_dataset.json").exists():
+        found_files.append(("golden_data", "Golden dataset", "eval/eval_data/golden_dataset.json"))
+
+    # Only use the latest results folder
+    results_dir = eval_dir / "results"
+    latest_analysis: Path | None = None
+    if results_dir.exists():
+        run_folders = sorted(
+            [d for d in results_dir.iterdir() if d.is_dir() and (d / "gemini_analysis.md").exists()],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        if run_folders:
+            latest_analysis = run_folders[0] / "gemini_analysis.md"
+            rel_path = latest_analysis.relative_to(agent_dir)
+            found_files.append(("analysis", "Previous analysis (latest run)", str(rel_path)))
+
+    if found_files:
         console.print()
-        console.print(f"  [dim]Found existing {', '.join(existing_files)} — Gemini will review and build on them.[/]")
+        console.print("  [bold]Existing eval files found.[/] Gemini can use these as context")
+        console.print("  [dim]to build on your current setup instead of starting from scratch.[/]")
+        console.print()
+
+        for i, (key, label, detail) in enumerate(found_files, 1):
+            console.print(f"    [bold]{i}.[/] [cyan]{label}[/]  [dim]→ {detail}[/]")
+
+        console.print()
+        console.print("  [dim]Enter numbers to exclude from context (comma-separated),[/]")
+        console.print("  [dim]or press Enter to include all.[/]")
+        console.print()
+        raw = Prompt.ask("  Exclude", default="")
+
+        if raw.strip():
+            for part in raw.split(","):
+                try:
+                    idx = int(part.strip()) - 1
+                    if 0 <= idx < len(found_files):
+                        key = found_files[idx][0]
+                        exclude_context.add(key)
+                        console.print(f"    [dim]Excluding: {found_files[idx][1]}[/]")
+                except ValueError:
+                    pass
+
+        included = [f[1] for f in found_files if f[0] not in exclude_context]
+        if included:
+            console.print(f"\n  [dim]Using as context: {', '.join(included)}[/]")
+        else:
+            console.print(f"\n  [dim]Generating from agent source code only.[/]")
 
     # Show spinner while generating
     console.print()
@@ -272,6 +313,7 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
                 agent_dir=agent_dir,
                 agent_name=agent_name,
                 user_priorities=user_priorities,
+                exclude_context=exclude_context if exclude_context else None,
             )
         except Exception as e:
             console.print(f"\n  [yellow]AI generation failed:[/] {e}")
@@ -291,8 +333,7 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
         console.print()
         has_existing = (agent_dir / "eval").exists()
         if has_existing:
-            console.print("  [dim]Your existing eval files will [bold]not[/bold] be overwritten.[/]")
-            console.print("  [dim]AI suggestions will be saved as .ai_generated.json files for you to review and merge.[/]")
+            console.print("  [dim]Existing eval files will be backed up before updating.[/]")
         else:
             console.print("  [dim]These metrics, scenarios, and test queries will be written to your eval/ folder.[/]")
 
@@ -348,6 +389,7 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
                     agent_dir=agent_dir,
                     agent_name=agent_name,
                     user_priorities=combined_priorities,
+                    exclude_context=exclude_context if exclude_context else None,
                 )
             except Exception as e:
                 console.print(f"\n  [yellow]Regeneration failed:[/] {e}")
@@ -373,15 +415,13 @@ def _display_generated_metrics(metrics: dict, rationale: str) -> None:
     )
     table.add_column("Metric", style="bold cyan")
     table.add_column("Description")
-    table.add_column("Data Sources", style="dim")
+    table.add_column("Runs On", style="dim", justify="center")
 
+    applies_labels = {"all": "all data", "scenarios": "scenarios", "golden_dataset": "golden data"}
     for name, defn in metrics.items():
         desc = defn.get("score_range", {}).get("description", "")
-        sources = ", ".join(
-            cfg.get("source_column", "?")
-            for cfg in defn.get("dataset_mapping", {}).values()
-        )
-        table.add_row(name, desc, sources)
+        applies = applies_labels.get(defn.get("applies_to", "all"), "all data")
+        table.add_row(name, desc, applies)
 
     console.print(table)
 
@@ -489,22 +529,24 @@ def _display_summary(
     has_ai = custom_metrics is not None
 
     console.print(f"  Creating eval files in [cyan]{eval_dir}/[/]")
-    if is_existing:
+    if is_existing and has_ai:
+        console.print("  [dim]Existing files will be backed up to eval/.backup/ before updating.[/]")
+    elif is_existing:
         console.print("  [dim]Existing files will not be overwritten.[/]")
-        if has_ai:
-            console.print("  [dim]AI suggestions saved as .ai_generated.json for you to review and merge.[/]")
     console.print()
 
     # Build file table with descriptions
     table = Table(show_header=True, border_style="blue", padding=(0, 2), expand=True)
-    table.add_column("Status", width=6)
+    table.add_column("Status", width=10)
     table.add_column("File", style="cyan", ratio=2)
     table.add_column("Purpose", ratio=3)
 
     # Metrics
-    if has_ai and existing_metrics:
-        table.add_row("[green]new[/]", "metrics/metric_definitions.ai_generated.json", "AI-generated scoring rubrics — review and merge into the main file")
-        table.add_row("[yellow]kept[/]", "[dim]metrics/metric_definitions.json[/]", "[dim]Your current scoring rubrics (unchanged)[/]")
+    if has_ai:
+        if existing_metrics:
+            table.add_row("[green]updated[/]", "metrics/metric_definitions.json", "AI-generated scoring rubrics (previous version backed up)")
+        else:
+            table.add_row("[green]new[/]", "metrics/metric_definitions.json", "AI-generated scoring rubrics for evaluating agent responses")
     elif existing_metrics:
         table.add_row("[yellow]kept[/]", "[dim]metrics/metric_definitions.json[/]", "[dim]Your current scoring rubrics (unchanged)[/]")
     else:
@@ -512,19 +554,25 @@ def _display_summary(
 
     # Scenarios
     if mode in ("user-sim", "both"):
-        if existing_scenarios:
+        if has_ai:
+            if existing_scenarios:
+                table.add_row("[green]updated[/]", "scenarios/conversation_scenarios.json", "AI scenarios merged with existing (previous version backed up)")
+            else:
+                table.add_row("[green]new[/]", "scenarios/conversation_scenarios.json", "AI-generated multi-turn conversation scripts for ADK User Sim")
+        elif existing_scenarios:
             table.add_row("[yellow]kept[/]", "[dim]scenarios/conversation_scenarios.json[/]", "[dim]Your current multi-turn scenario scripts (unchanged)[/]")
-            if has_ai:
-                table.add_row("[green]new[/]", "scenarios/conversation_scenarios.ai_generated.json", "AI-suggested scenarios — review and merge into the main file")
         else:
             table.add_row("[green]new[/]", "scenarios/conversation_scenarios.json", "Multi-turn conversation scripts for ADK User Sim")
 
     # Golden data
     if mode in ("diy", "both"):
-        if existing_golden:
+        if has_ai:
+            if existing_golden:
+                table.add_row("[green]updated[/]", "eval_data/golden_dataset.json", "AI queries merged with existing (previous version backed up)")
+            else:
+                table.add_row("[green]new[/]", "eval_data/golden_dataset.json", "AI-generated test queries with expected behaviors")
+        elif existing_golden:
             table.add_row("[yellow]kept[/]", "[dim]eval_data/golden_dataset.json[/]", "[dim]Your current test queries (unchanged)[/]")
-            if has_ai:
-                table.add_row("[green]new[/]", "eval_data/golden_dataset.ai_generated.json", "AI-suggested test queries — review and merge into the main file")
         else:
             table.add_row("[green]new[/]", "eval_data/golden_dataset.json", "Single-turn test queries with expected behaviors")
 
@@ -540,43 +588,37 @@ def _display_next_steps(
     custom_metrics: dict | None = None,
 ) -> None:
     eval_path = agent_dir / "eval"
-    has_ai_files = custom_metrics and (eval_path / "metrics" / "metric_definitions.ai_generated.json").exists()
+    has_ai = custom_metrics is not None
 
     lines = []
+    step = 1
 
-    # Step 0: Review AI-generated files (if applicable)
-    if has_ai_files:
-        lines.append("[bold]1.[/] Review AI-generated files and merge what you want:")
-        lines.append(f"   [cyan]{eval_path}/metrics/metric_definitions.ai_generated.json[/]")
-        if (eval_path / "scenarios" / "conversation_scenarios.ai_generated.json").exists():
-            lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.ai_generated.json[/]")
-        if (eval_path / "eval_data" / "golden_dataset.ai_generated.json").exists():
-            lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.ai_generated.json[/]")
-        lines.append("")
-        lines.append("   [dim]Copy the metrics/scenarios/queries you want into the main files,[/]")
-        lines.append("   [dim]then delete the .ai_generated files.[/]")
-        lines.append("")
-        lines.append("[bold]2.[/] Run the full evaluation pipeline:")
-        lines.append(f"   [dim]$[/] uv run agent-eval run --agent-dir {agent_dir}")
-    else:
-        # Standard flow — review files, then run
-        step = 1
-        if mode in ("user-sim", "both"):
-            lines.append(f"[bold]{step}.[/] Review your scenarios:")
-            lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.json[/]")
-            step += 1
-        if mode in ("diy", "both"):
-            lines.append(f"[bold]{step}.[/] Review your golden dataset:")
-            lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.json[/]")
-            step += 1
+    # Review files
+    lines.append(f"[bold]{step}.[/] Review your metric definitions:")
+    lines.append(f"   [cyan]{eval_path}/metrics/metric_definitions.json[/]")
+    step += 1
+    if mode in ("user-sim", "both"):
+        lines.append(f"[bold]{step}.[/] Review your scenarios:")
+        lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.json[/]")
+        step += 1
+    if mode in ("diy", "both"):
+        lines.append(f"[bold]{step}.[/] Review your golden dataset:")
+        lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.json[/]")
+        step += 1
 
-        lines.append("")
-        lines.append(f"[bold]{step}.[/] Run the full evaluation pipeline:")
-        lines.append(f"   [dim]$[/] uv run agent-eval run --agent-dir {agent_dir}")
+    lines.append("")
+    lines.append(f"[bold]{step}.[/] Run the full evaluation pipeline:")
+    lines.append(f"   [dim]$[/] uv run agent-eval run --agent-dir {agent_dir}")
 
     lines.append("")
     lines.append("   [dim]This runs: simulate + interact + evaluate + analyze[/]")
     lines.append("   [dim]in a single command with progress tracking.[/]")
+
+    if has_ai and (eval_path / ".backup").exists():
+        lines.append("")
+        lines.append("[dim]Your previous eval files are backed up in eval/.backup/[/]")
+        lines.append("[dim]Delete the backup when you're satisfied with the new files.[/]")
+
     lines.append("")
     lines.append("[dim]Note: The interact phase sends queries to a running agent.[/]")
     lines.append("[dim]Make sure your agent is serving (e.g. [bold]adk web[/bold]) before running.[/]")

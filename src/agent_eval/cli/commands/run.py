@@ -52,9 +52,11 @@ def _find_eval_dir(agent_dir: Path) -> Path | None:
               help="Developer focus for analysis: metric names to highlight (e.g., 'latency, cache').")
 @click.option("--skip-gemini", is_flag=True,
               help="Skip AI-powered analysis in the analyze phase.")
+@click.option("--debug", is_flag=True,
+              help="Show detailed logs from all phases (ADK, Vertex AI SDK, etc.).")
 def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         run_evaluate, app_name, questions_file, num_questions, skip_traces,
-        run_analyze, focus, skip_gemini):
+        run_analyze, focus, skip_gemini, debug):
     """Run the full evaluation pipeline: simulate, interact, evaluate, and analyze.
 
     \b
@@ -83,7 +85,11 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
       uv run agent-eval run --agent-dir agents/my-agent/app --focus "latency, cache"
     """
     from agent_eval.cli.main import _display_banner
+    from agent_eval.core.evaluator import configure_logging
     _display_banner()
+
+    # ── Logging ─────────────────────────────────────────────────────────────
+    configure_logging(debug=debug)
 
     # ── Validation ──────────────────────────────────────────────────────────
 
@@ -264,7 +270,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
 
         # Import the simulate internals — but we drive the steps ourselves
         # to avoid the nested "Step X/5" headers from simulate.py
-        _simulate_ok = _run_simulate_phase(agent_name, agent_path, eval_path, raw_dir)
+        _simulate_ok = _run_simulate_phase(agent_name, agent_path, eval_path, raw_dir, debug=debug)
 
         if _simulate_ok:
             sim_output = raw_dir / "processed_interaction_sim.jsonl"
@@ -285,6 +291,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         interact_output = _run_interact_phase(
             app_name, agent_path, questions_file, base_url,
             num_questions, skip_traces, raw_dir, str(results_dir),
+            debug=debug,
         )
 
         if interact_output:
@@ -307,7 +314,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         for f in interaction_files:
             console.print(f"    [dim]-[/] {f.name}")
 
-        _run_evaluate_phase(interaction_files, metrics_file, run_dir, run_id)
+        _run_evaluate_phase(interaction_files, metrics_file, run_dir, run_id, debug=debug)
 
     # ── Phase: Analyze ─────────────────────────────────────────────────────
 
@@ -334,7 +341,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
                 focus = focus_input
 
         analysis_result = _run_analyze_phase(
-            run_dir, agent_path, focus, skip_gemini,
+            run_dir, agent_path, focus, skip_gemini, debug=debug,
         )
 
     # ── Done ────────────────────────────────────────────────────────────────
@@ -407,7 +414,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
 # instead they call the underlying logic with consistent formatting.
 
 
-def _run_simulate_phase(agent_name: str, agent_path: Path, eval_path: Path, raw_dir: Path) -> bool:
+def _run_simulate_phase(agent_name: str, agent_path: Path, eval_path: Path, raw_dir: Path, debug: bool = False) -> bool:
     """Run the simulate workflow. Returns True on success."""
     import shutil
     import subprocess
@@ -508,19 +515,40 @@ def _run_simulate_phase(agent_name: str, agent_path: Path, eval_path: Path, raw_
         adk_cmd += ["--config_file_path", str(eval_config)]
     adk_cmd.append(eval_set_name)
 
-    result = subprocess.run(
-        adk_cmd, cwd=str(project_root), env=_clean_env(project_root),
-    )
+    # In debug mode, stream ADK output so the user can see everything.
+    # In normal mode, capture it — ADK is extremely verbose (EXPERIMENTAL
+    # warnings, plugin registrations, every LLM request/response).
+    if debug:
+        console.print("     [dim]Debug: streaming ADK output...[/]")
+        result = subprocess.run(
+            adk_cmd, cwd=str(project_root), env=_clean_env(project_root),
+            text=True,
+        )
+    else:
+        with console.status("     [bold blue]Simulating conversations...[/]", spinner="dots"):
+            result = subprocess.run(
+                adk_cmd, cwd=str(project_root), env=_clean_env(project_root),
+                capture_output=True, text=True,
+            )
 
     eval_history = agent_path / ".adk" / "eval_history"
     has_traces = eval_history.exists() and any(eval_history.rglob("*.json"))
 
     if result.returncode != 0 and not has_traces:
-        console.print(f"\n     [red]ADK eval failed — no traces generated.[/]")
+        console.print(f"     [red]ADK eval failed — no traces generated.[/]")
+        if result.stderr.strip():
+            # Show last few lines of error for debugging
+            last_lines = result.stderr.strip().split("\n")[-3:]
+            for line in last_lines:
+                console.print(f"     [dim]{line}[/]")
         return False
     if result.returncode != 0 and has_traces:
-        console.print(f"\n     [yellow]![/] ADK eval finished with errors, but traces were captured.")
-        console.print(f"     [dim]Errors are from ADK's built-in scoring, not the simulation itself.[/]")
+        console.print(f"     [yellow]![/] ADK eval finished with warnings, but traces were captured.")
+        console.print(f"     [dim]Warnings are from ADK's built-in scoring, not the simulation.[/]")
+
+    if has_traces:
+        n_traces = sum(1 for _ in eval_history.rglob("*.json"))
+        console.print(f"     [green]+[/] Simulation complete — {n_traces} trace file{'s' if n_traces != 1 else ''} generated")
 
     # 5. Convert traces
     console.print()
@@ -545,7 +573,7 @@ def _run_simulate_phase(agent_name: str, agent_path: Path, eval_path: Path, raw_
 def _run_interact_phase(
     app_name: str, agent_path: Path, questions_file: str,
     base_url: str, num_questions: int, skip_traces: bool,
-    raw_dir: Path, results_dir: str,
+    raw_dir: Path, results_dir: str, debug: bool = False,
 ) -> Path | None:
     """Run the interact workflow. Returns the output path on success, None on failure."""
     import asyncio
@@ -610,7 +638,7 @@ def _run_interact_phase(
 
 def _run_evaluate_phase(
     interaction_files: list[Path], metrics_file: Path,
-    run_dir: Path, run_id: str,
+    run_dir: Path, run_id: str, debug: bool = False,
 ) -> None:
     """Run the evaluate workflow."""
     from agent_eval.core.evaluator import Evaluator
@@ -640,7 +668,7 @@ def _run_evaluate_phase(
 
 def _run_analyze_phase(
     run_dir: Path, agent_path: Path,
-    focus: str = None, skip_gemini: bool = False,
+    focus: str = None, skip_gemini: bool = False, debug: bool = False,
 ) -> dict:
     """Run the analyze workflow. Returns the analysis result dict or None."""
     from agent_eval.core.analyzer import Analyzer

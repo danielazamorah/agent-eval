@@ -145,7 +145,7 @@ uv run agent-eval init
 
 **AI-generated metrics:** When you select "Generate with AI" in Step 3 (the default, or use `--ai-metrics` with `-y`), Gemini analyzes your agent's source code, tools, and any existing eval files (metrics, scenarios, golden data, previous analysis reports) to generate custom LLM-as-judge metrics tailored to your agent. It also provides recommendations for scenarios and test queries in structured tables. You can provide evaluation priorities (e.g., "accuracy of billing lookups, response tone") to guide generation. Requires `GOOGLE_CLOUD_PROJECT` to be set.
 
-**Non-destructive updates:** If eval files already exist, AI-generated content is saved as `.ai_generated.json` files (e.g., `metric_definitions.ai_generated.json`) instead of overwriting. Review and merge what you want into the main files, then delete the `.ai_generated` versions.
+**Non-destructive updates:** If eval files already exist, they are backed up to `eval/.backup/<timestamp>/` before AI content is written. For scenarios and golden data, AI-generated entries are merged with your existing ones. Delete the backup when you're satisfied with the new files.
 
 ```bash
 # Interactive — choose AI generation in Step 3
@@ -186,6 +186,7 @@ uv run agent-eval run --agent-dir agents/my-agent/app --focus "latency, cache"
 | `--questions-file` | No | auto-detected | Golden dataset JSON for interact mode |
 | `--num-questions` | No | `-1` (all) | Limit number of questions for interact |
 | `--skip-traces` | No | `false` | Skip trace retrieval in interact mode |
+| `--debug` | No | `false` | Show detailed logs from all phases (ADK subprocess output, Vertex AI SDK retries, etc.) |
 
 **Graceful fallback:** If the agent is not reachable at `--base-url`, the interact phase is skipped automatically and the pipeline continues with simulation data. If simulate fails but interact succeeds, evaluation proceeds with interaction data only.
 
@@ -204,6 +205,7 @@ uv run agent-eval simulate --agent-dir <path-to-agent-module>
 | `--agent-dir` | Yes | — | Path to agent module directory (containing agent.py) |
 | `--eval-dir` | No | (auto-detected) | Path to eval/ directory |
 | `--run-id` | No | (prompted, or timestamp) | Name for the results folder (e.g., "baseline") |
+| `--debug` | No | `false` | Show detailed ADK subprocess output and internal logs |
 
 **What it does (5 steps):**
 
@@ -265,6 +267,7 @@ Before running, start your agent in a separate terminal:
 | `--run-id` | No | prompted | Name for results folder (prompted if omitted) |
 | `--user-id` | No | `eval_user` | User ID for session |
 | `--runs` | No | `1` | Number of runs per question |
+| `--debug` | No | `false` | Show detailed logs from agent interactions and trace retrieval |
 
 **Output:** `<results-dir>/<run-id>/raw/processed_interaction_<app_name>.jsonl`
 
@@ -296,6 +299,7 @@ uv run agent-eval evaluate \
 | `--results-dir` | Yes | Output directory (use same timestamp folder) |
 | `--input-label` | No | Run label (e.g., "baseline") |
 | `--test-description` | No | Description for this run |
+| `--debug` | No | Show detailed logs from Vertex AI SDK (retries, errors, etc.) |
 
 **Output:** `eval_summary.json`, `evaluation_results_*.csv`
 
@@ -328,6 +332,7 @@ uv run agent-eval analyze --results-dir eval/results/v3 --compare-to eval/result
 | `--location` | No | `global` | Vertex AI region (use `global` for Gemini 3+ models) |
 | `--skip-gemini` | No | `false` | Skip AI analysis |
 | `--gcs-bucket` | No | — | GCS bucket for upload |
+| `--debug` | No | `false` | Show detailed logs from Gemini API and other services |
 
 **Output:** `question_answer_log.md`, `gemini_analysis.md`, `OPTIMIZATION_LOG.md` (in parent results dir)
 
@@ -506,6 +511,7 @@ Choose based on your agent's conversation pattern:
     "my_metric": {
       "metric_type": "llm",
       "agents": ["my_agent"],
+      "applies_to": "all",
       "score_range": {"min": 0, "max": 5, "description": "0=Fail, 5=Perfect"},
       "dataset_mapping": {
         "prompt": {"source_column": "user_inputs"},
@@ -513,6 +519,40 @@ Choose based on your agent's conversation pattern:
       },
       "template": "Evaluate...\n\n{prompt}\n{response}\n\nScore: [0-5]"
     }
+  }
+}
+```
+
+### Metric Routing with `applies_to`
+
+Evaluation data comes from two sources, and not all metrics make sense for both:
+
+| `applies_to` | Runs on | Use when your metric... |
+|---|---|---|
+| `"all"` (default) | All evaluation data | Evaluates the response itself, regardless of how it was generated. Examples: safety checks, general quality, tool usage quality. |
+| `"scenarios"` | Multi-turn scenario data only (from `simulate`) | Evaluates conversation flow, trajectory, or turn-by-turn coherence. This data has **no** reference answers — the agent is judged on how it handles the full conversation. |
+| `"golden_dataset"` | Single-turn golden dataset data only (from `interact`) | Compares the agent's output against expected behavior. This data **has** reference answers — the agent is judged on correctness against ground truth. |
+
+**Why does this matter?**
+
+- **Scenarios** (multi-turn) are generated by ADK User Sim following conversation scripts. They take longer to run (sequential turns) but test real conversational behavior. There's no "right answer" — metrics evaluate the agent's approach, not its exact output.
+- **Golden dataset** queries (single-turn) are sent in parallel to a running agent. They're fast and include expected behavior, so metrics can check if the agent got the right answer.
+
+**Recommendation:** Use fewer scenarios (they're slow) and more golden dataset entries (they run in parallel). Assign metrics that need reference data to `"golden_dataset"`, trajectory metrics to `"scenarios"`, and general quality metrics to `"all"`.
+
+```json
+{
+  "trajectory_accuracy": {
+    "applies_to": "scenarios",
+    "comment": "Only runs on multi-turn data — evaluates the path, not the answer"
+  },
+  "factual_accuracy": {
+    "applies_to": "golden_dataset",
+    "comment": "Only runs on golden data — needs expected answers to compare against"
+  },
+  "safety": {
+    "applies_to": "all",
+    "comment": "Runs on everything — safety applies regardless of data source"
   }
 }
 ```
@@ -575,6 +615,7 @@ Uses `reference` for the available tool list:
   "trajectory_accuracy": {
     "metric_type": "llm",
     "agents": ["my_agent"],
+    "applies_to": "scenarios",
     "score_range": {"min": 0, "max": 5, "description": "0=Wrong, 5=Perfect"},
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},

@@ -57,8 +57,21 @@ def _display_metrics_summary(results_dir: str) -> None:
 
             table.add_row(name, f"[{color}]{avg:.1f}[/]", range_str, f"[{color}]{indicator}[/]")
 
+        # Show metrics that failed all retries
+        failed = overall.get("failed_metrics", [])
+        for name in failed:
+            table.add_row(name, "[red]FAILED[/]", "—", "[red]Retry later[/]")
+
         console.print()
         console.print(table)
+
+        if failed:
+            console.print(
+                f"  [yellow]Warning:[/] {len(failed)} metric(s) failed due to API rate limits."
+            )
+            console.print(
+                "  [dim]Try again later or reduce the number of metrics/eval cases.[/]"
+            )
 
     # ── Key deterministic metrics ──────────────────────────────────────
     det = overall.get("deterministic_metrics", {})
@@ -96,8 +109,12 @@ def _display_metrics_summary(results_dir: str) -> None:
 @click.option("--input-label", default="manual", help="Label for this run (e.g. 'baseline').")
 @click.option("--test-description", default="Automated evaluation", help="Description of this evaluation run.")
 @click.option("--filter", "metric_filter", multiple=True, help="Metric filters (key:val).")
-def evaluate(interaction_file, metrics_files, results_dir, input_label, test_description, metric_filter):
+@click.option("--debug", is_flag=True, help="Show detailed logs from Vertex AI SDK and other services.")
+def evaluate(interaction_file, metrics_files, results_dir, input_label, test_description, metric_filter, debug):
     """Run evaluation metrics on processed interaction data."""
+    from agent_eval.core.evaluator import configure_logging
+    configure_logging(debug=debug)
+
     console.print("\n[bold blue]Running Evaluation[/]")
     if len(interaction_file) > 1:
         console.print(f"  [dim]Combining {len(interaction_file)} interaction files[/]")

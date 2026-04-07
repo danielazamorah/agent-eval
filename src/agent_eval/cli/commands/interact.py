@@ -154,8 +154,9 @@ def _prompt_for_config(agent_dir, app_name, questions_file, base_url, results_di
 @click.option("--filter", "metadata_filters", multiple=True, help="Metadata filters (key:val).")
 @click.option("--state", "state_variables", multiple=True, help="State variables (key:val).")
 @click.option("--user", default=os.environ.get("USER"), help="Operator username.")
+@click.option("--debug", is_flag=True, help="Show detailed logs from agent interactions and trace retrieval.")
 def interact(agent_dir, app_name, questions_file, base_url, user_id, results_dir,
-             run_id, num_questions, runs, skip_traces, metadata_filters, state_variables, user):
+             run_id, num_questions, runs, skip_traces, metadata_filters, state_variables, user, debug):
     """Run interactions against a live agent and collect traces.
 
     Sends queries from a golden dataset to a running agent endpoint, collects
@@ -170,7 +171,9 @@ def interact(agent_dir, app_name, questions_file, base_url, user_id, results_dir
     If options are not provided, the command will prompt interactively.
     """
     from agent_eval.cli.main import _display_banner
+    from agent_eval.core.evaluator import configure_logging
     _display_banner()
+    configure_logging(debug=debug)
 
     # ── Interactive prompts for missing config ─────────────────────────────
 

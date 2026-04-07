@@ -215,7 +215,7 @@ def _step_create_eval_set(agent_name: str, agent_dir: Path) -> bool:
     return True
 
 
-def _step_run_sim(agent_name: str, agent_dir: Path) -> bool:
+def _step_run_sim(agent_name: str, agent_dir: Path, debug: bool = False) -> bool:
     """Step 4: Run adk eval (the actual User Sim)."""
     _step_header(4, "Run ADK User Sim",
                  "An LLM will now play the role of a user, following each scenario.\n"
@@ -240,16 +240,25 @@ def _step_run_sim(agent_name: str, agent_dir: Path) -> bool:
         adk_cmd += ["--config_file_path", str(eval_config)]
     adk_cmd.append(eval_set_name)
 
-    # Capture ADK output — its "Tests passed/failed" summary refers to ADK's
-    # built-in eval scoring, not the simulation quality. This confuses users
-    # since agent-eval runs its own separate batch evaluation.
-    result = subprocess.run(
-        adk_cmd,
-        cwd=str(project_root),
-        env=_clean_env(project_root),
-        capture_output=True,
-        text=True,
-    )
+    # In debug mode, stream ADK output so the user sees everything.
+    # In normal mode, capture it — ADK's "Tests passed/failed" summary refers
+    # to its built-in scoring, not the simulation quality, which confuses users.
+    if debug:
+        console.print(f"    [dim]Debug: streaming ADK output...[/]")
+        result = subprocess.run(
+            adk_cmd,
+            cwd=str(project_root),
+            env=_clean_env(project_root),
+            text=True,
+        )
+    else:
+        result = subprocess.run(
+            adk_cmd,
+            cwd=str(project_root),
+            env=_clean_env(project_root),
+            capture_output=True,
+            text=True,
+        )
 
     # Check if traces were generated, regardless of exit code.
     # ADK's built-in scoring can fail (e.g., missing expected_invocations)
@@ -325,7 +334,8 @@ def _step_convert(agent_dir: Path, eval_dir: Path, run_id: str | None = None) ->
               help="Name for the results folder (e.g., 'baseline', 'tool-hardening'). "
                    "Defaults to a timestamp like 20260319_060430. Use meaningful names "
                    "to keep track of optimization iterations.")
-def simulate(agent_dir, eval_dir, run_id):
+@click.option("--debug", is_flag=True, help="Show detailed logs from ADK, Vertex AI SDK, and other services.")
+def simulate(agent_dir, eval_dir, run_id, debug):
     """Run ADK User Sim scenarios and convert traces to evaluation format.
 
     This command wraps the full ADK User Sim workflow into a single step:
@@ -347,7 +357,9 @@ def simulate(agent_dir, eval_dir, run_id):
     and analyze on traces from any agent framework.
     """
     from agent_eval.cli.main import _display_banner
+    from agent_eval.core.evaluator import configure_logging
     _display_banner()
+    configure_logging(debug=debug)
 
     agent_path = Path(agent_dir).resolve()
 
@@ -435,7 +447,7 @@ def simulate(agent_dir, eval_dir, run_id):
     if not _step_create_eval_set(agent_name, agent_path):
         sys.exit(1)
 
-    if not _step_run_sim(agent_name, agent_path):
+    if not _step_run_sim(agent_name, agent_path, debug=debug):
         sys.exit(1)
 
     run_dir = _step_convert(agent_path, eval_path, run_id)

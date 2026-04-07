@@ -81,6 +81,7 @@ Each metric must follow this exact JSON structure:
 {{
     "metric_name_snake_case": {{
         "metric_type": "llm",
+        "applies_to": "all",
         "score_range": {{
             "min": 0,
             "max": 5,
@@ -95,6 +96,21 @@ Each metric must follow this exact JSON structure:
     }}
 }}
 ```
+
+### `applies_to` — which data a metric runs on
+
+Evaluation data comes from two sources with different characteristics:
+
+| Value | Runs on | When to use |
+|---|---|---|
+| `"all"` (default) | All eval data | Metrics that evaluate any agent response regardless of how it was generated (e.g., safety, general quality, tool usage) |
+| `"scenarios"` | Multi-turn scenario data only (from ADK User Sim) | Metrics that evaluate conversation flow, trajectory, turn-by-turn coherence. This data has NO reference/expected answers — the agent is evaluated on how it handles the conversation. |
+| `"golden_dataset"` | Single-turn golden dataset data only (from interact) | Metrics that compare agent output against expected behavior or reference data. This data HAS reference answers — the agent is evaluated on correctness against ground truth. |
+
+Choose `applies_to` based on what your metric actually evaluates:
+- Does it need `reference_data` (expected answers)? → `"golden_dataset"`
+- Does it evaluate conversation flow or trajectory across turns? → `"scenarios"`
+- Does it evaluate the response itself regardless of context? → `"all"`
 
 ### ONLY these three placeholder names are allowed:
 
@@ -171,10 +187,11 @@ Note: In the `template` field inside `source_columns`, colons are replaced with 
 
 **Part 1 — Metrics:**
 1. Analyze the agent's tools, instruction/prompt, sub-agents, state usage, and domain
-2. Generate 2-4 custom metrics that evaluate aspects SPECIFIC to this agent
+2. Generate 2-3 custom metrics that evaluate aspects SPECIFIC to this agent (fewer focused metrics are better than many vague ones — each metric costs API calls per eval case)
 3. Each metric should target a distinct quality dimension
-4. Reference the agent's actual tool names, state variables, and capabilities in templates
-5. If existing metrics are provided, improve or complement them — don't duplicate
+4. Set `applies_to` correctly: use `"golden_dataset"` for metrics that need reference data, `"scenarios"` for metrics that evaluate multi-turn conversation flow, `"all"` for general metrics
+5. Reference the agent's actual tool names, state variables, and capabilities in templates
+6. If existing metrics are provided, improve or complement them — don't duplicate
 
 **Part 2 — Recommendations:**
 Provide expert recommendations for the developer's evaluation strategy:
@@ -191,6 +208,7 @@ Provide expert recommendations for the developer's evaluation strategy:
 - The template placeholders `{{prompt}}`, `{{response}}`, `{{reference}}` must match the dataset_mapping keys
 - Score range must be 0-5 for all custom metrics
 - Only use valid source_columns from the table above
+- Set `applies_to` to `"all"`, `"scenarios"`, or `"golden_dataset"` — see table above for guidance
 
 **Respond with ONLY a JSON object** (no markdown fences, no extra text):
 
@@ -227,6 +245,7 @@ def generate_metrics_with_gemini(
     agent_name: str,
     user_priorities: str = "",
     model: str = "gemini-3.1-pro-preview",
+    exclude_context: set[str] | None = None,
 ) -> Tuple[Dict[str, Any], str, Dict[str, Any]]:
     """Analyze agent source code and generate tailored evaluation metrics.
 
@@ -236,6 +255,8 @@ def generate_metrics_with_gemini(
         user_priorities: Free-text description of what the user considers
             important to evaluate.
         model: Gemini model to use.
+        exclude_context: Set of context keys to exclude from the Gemini prompt.
+            Valid keys: 'metrics', 'scenarios', 'golden_data', 'analysis'.
 
     Returns:
         Tuple of (metrics_dict, rationale_string, recommendations_dict).
@@ -253,6 +274,13 @@ def generate_metrics_with_gemini(
 
     # 2. Discover existing eval files
     existing_eval = _discover_existing_eval_files(agent_dir)
+
+    # Remove excluded context
+    if exclude_context:
+        key_map = {"analysis": "gemini_analysis"}
+        for key in exclude_context:
+            mapped = key_map.get(key, key)
+            existing_eval.pop(mapped, None)
 
     # 3. Build prompt
     prompt = _build_prompt(agent_context, user_priorities, existing_eval)
@@ -556,6 +584,13 @@ def _validate_single_metric(name: str, defn: Dict) -> List[str]:
 
     if not isinstance(defn, dict):
         return [f"'{name}': not a dict"]
+
+    # Validate applies_to
+    applies_to = defn.get("applies_to", "all")
+    if applies_to not in ("all", "scenarios", "golden_dataset"):
+        errors.append(
+            f"'{name}': applies_to must be 'all', 'scenarios', or 'golden_dataset', got '{applies_to}'"
+        )
 
     # Check required fields
     if "score_range" not in defn:

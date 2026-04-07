@@ -1,6 +1,8 @@
 """Scaffolds the eval/ folder structure for a new agent project."""
 
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -14,10 +16,12 @@ METRIC_TEMPLATES = {
         "is_managed": True,
         "managed_metric_name": "GENERAL_QUALITY",
         "use_gemini_format": True,
+        "applies_to": "all",
         "score_range": {"min": 0, "max": 1, "description": "Passing rate for quality rubrics"},
     },
     "trajectory_accuracy": {
         "metric_type": "llm",
+        "applies_to": "scenarios",
         "score_range": {"min": 0, "max": 5, "description": "0=Wrong, 5=Perfect trajectory"},
         "dataset_mapping": {
             "prompt": {"source_column": "user_inputs"},
@@ -39,6 +43,7 @@ METRIC_TEMPLATES = {
     },
     "tool_use_quality": {
         "metric_type": "llm",
+        "applies_to": "all",
         "score_range": {"min": 0, "max": 5, "description": "0=Poor, 5=Excellent"},
         "dataset_mapping": {
             "prompt": {"source_column": "user_inputs"},
@@ -65,6 +70,7 @@ METRIC_TEMPLATES = {
         "is_managed": True,
         "managed_metric_name": "SAFETY",
         "use_gemini_format": True,
+        "applies_to": "all",
         "score_range": {"min": 0, "max": 1, "description": "Passing rate for safety rubrics"},
     },
 }
@@ -89,10 +95,7 @@ def scaffold_eval_structure(
         ai_recommendations: Gemini's recommendations dict with scenarios/golden_data.
     """
     eval_dir = target_dir / "eval"
-    is_existing = eval_dir.exists()
-
-    if is_existing:
-        console.print(f"  [dim]Existing eval/ folder found — existing files will not be overwritten.[/]")
+    has_ai = custom_metric_definitions is not None
 
     # Resolve which metrics to include
     if metrics is None:
@@ -121,6 +124,14 @@ def scaffold_eval_structure(
     for d in [eval_dir, eval_dir / "metrics", eval_dir / "scenarios", eval_dir / "results"]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # If AI content is provided and existing files exist, back them up
+    backup_dir = None
+    if has_ai:
+        backed_up = _backup_existing_files(eval_dir, mode)
+        if backed_up:
+            backup_dir = backed_up
+            console.print(f"  [dim]Previous files backed up to eval/.backup/[/]")
+
     display_prefix = str(eval_dir)
 
     _write_if_missing(eval_dir / "__init__.py", "")
@@ -128,15 +139,15 @@ def scaffold_eval_structure(
 
     # ── Metrics ───────────────────────────────────────────────────────────
     metrics_path = eval_dir / "metrics" / "metric_definitions.json"
-    if custom_metric_definitions and metrics_path.exists():
-        ai_path = eval_dir / "metrics" / "metric_definitions.ai_generated.json"
-        ai_path.write_text(json.dumps(metric_defs, indent=2) + "\n")
-        console.print(f"  [green]created[/]  {display_prefix}/metrics/metric_definitions.ai_generated.json")
-        console.print(f"  [yellow]kept[/]     {display_prefix}/metrics/metric_definitions.json [dim](review and merge)[/]")
+    if has_ai:
+        # AI mode: always write (backup already taken if file existed)
+        metrics_path.write_text(json.dumps(metric_defs, indent=2) + "\n")
+        console.print(f"  [green]created[/]  {display_prefix}/metrics/metric_definitions.json")
     else:
+        existed = metrics_path.exists()
         _write_json_if_missing(metrics_path, metric_defs)
-        if metrics_path.exists():
-            console.print(f"  [green]created[/]  {display_prefix}/metrics/metric_definitions.json")
+        status = "[yellow]kept[/]" if existed else "[green]created[/]"
+        console.print(f"  {status}     {display_prefix}/metrics/metric_definitions.json")
 
     # ── Session input ─────────────────────────────────────────────────────
     session_path = eval_dir / "scenarios" / "session_input.json"
@@ -150,15 +161,23 @@ def scaffold_eval_structure(
     # ── Scenarios ─────────────────────────────────────────────────────────
     if mode in ("user-sim", "both"):
         scenarios_path = eval_dir / "scenarios" / "conversation_scenarios.json"
-        if scenarios_path.exists():
-            console.print(f"  [yellow]kept[/]     {display_prefix}/scenarios/conversation_scenarios.json")
-            # Write AI-recommended scenarios as a separate file
-            if ai_recommendations and ai_recommendations.get("scenarios"):
-                ai_scenarios = _build_ai_scenarios(ai_recommendations["scenarios"])
-                ai_path = eval_dir / "scenarios" / "conversation_scenarios.ai_generated.json"
-                ai_path.write_text(json.dumps(ai_scenarios, indent=2) + "\n")
-                console.print(f"  [green]created[/]  {display_prefix}/scenarios/conversation_scenarios.ai_generated.json [dim](review and merge)[/]")
-        else:
+        if has_ai and ai_recommendations and ai_recommendations.get("scenarios"):
+            # AI mode: write AI scenarios (backup already taken)
+            ai_scenarios = _build_ai_scenarios(ai_recommendations["scenarios"])
+            # If file didn't exist, start fresh; if it did, merge AI scenarios
+            if scenarios_path.exists() and backup_dir:
+                # Existing file was backed up — read old scenarios, append AI ones
+                try:
+                    old = json.loads(scenarios_path.read_text())
+                    old_scenarios = old.get("scenarios", [])
+                    merged = {"scenarios": old_scenarios + ai_scenarios["scenarios"]}
+                    scenarios_path.write_text(json.dumps(merged, indent=2) + "\n")
+                except Exception:
+                    scenarios_path.write_text(json.dumps(ai_scenarios, indent=2) + "\n")
+            else:
+                scenarios_path.write_text(json.dumps(ai_scenarios, indent=2) + "\n")
+            console.print(f"  [green]created[/]  {display_prefix}/scenarios/conversation_scenarios.json")
+        elif not scenarios_path.exists():
             default_scenarios = {
                 "scenarios": [
                     {
@@ -167,25 +186,31 @@ def scaffold_eval_structure(
                     }
                 ]
             }
-            # If we have AI recommendations, use those instead of the generic default
-            if ai_recommendations and ai_recommendations.get("scenarios"):
-                default_scenarios = _build_ai_scenarios(ai_recommendations["scenarios"])
             _write_json_if_missing(scenarios_path, default_scenarios)
             console.print(f"  [green]created[/]  {display_prefix}/scenarios/conversation_scenarios.json")
+        else:
+            console.print(f"  [yellow]kept[/]     {display_prefix}/scenarios/conversation_scenarios.json")
 
     # ── Golden dataset ────────────────────────────────────────────────────
     if mode in ("diy", "both"):
         (eval_dir / "eval_data").mkdir(parents=True, exist_ok=True)
         golden_path = eval_dir / "eval_data" / "golden_dataset.json"
-        if golden_path.exists():
-            console.print(f"  [yellow]kept[/]     {display_prefix}/eval_data/golden_dataset.json")
-            # Write AI-recommended golden data as a separate file
-            if ai_recommendations and ai_recommendations.get("golden_data"):
-                ai_golden = _build_ai_golden_data(ai_recommendations["golden_data"], agent_name)
-                ai_path = eval_dir / "eval_data" / "golden_dataset.ai_generated.json"
-                ai_path.write_text(json.dumps(ai_golden, indent=2) + "\n")
-                console.print(f"  [green]created[/]  {display_prefix}/eval_data/golden_dataset.ai_generated.json [dim](review and merge)[/]")
-        else:
+        if has_ai and ai_recommendations and ai_recommendations.get("golden_data"):
+            # AI mode: write AI golden data (backup already taken)
+            ai_golden = _build_ai_golden_data(ai_recommendations["golden_data"], agent_name)
+            if golden_path.exists() and backup_dir:
+                # Existing file was backed up — read old entries, append AI ones
+                try:
+                    old = json.loads(golden_path.read_text())
+                    old_questions = old.get("golden_questions", [])
+                    merged = {"golden_questions": old_questions + ai_golden["golden_questions"]}
+                    golden_path.write_text(json.dumps(merged, indent=2) + "\n")
+                except Exception:
+                    golden_path.write_text(json.dumps(ai_golden, indent=2) + "\n")
+            else:
+                golden_path.write_text(json.dumps(ai_golden, indent=2) + "\n")
+            console.print(f"  [green]created[/]  {display_prefix}/eval_data/golden_dataset.json")
+        elif not golden_path.exists():
             default_golden = {
                 "golden_questions": [
                     {
@@ -199,14 +224,17 @@ def scaffold_eval_structure(
                     }
                 ]
             }
-            # If we have AI recommendations, add those entries
-            if ai_recommendations and ai_recommendations.get("golden_data"):
-                extra = _build_ai_golden_data(ai_recommendations["golden_data"], agent_name)
-                default_golden["golden_questions"].extend(extra["golden_questions"])
             _write_json_if_missing(golden_path, default_golden)
             console.print(f"  [green]created[/]  {display_prefix}/eval_data/golden_dataset.json")
+        else:
+            console.print(f"  [yellow]kept[/]     {display_prefix}/eval_data/golden_dataset.json")
 
     console.print(f"  [green]created[/]  {display_prefix}/results/.gitkeep")
+
+    if backup_dir:
+        console.print()
+        console.print(f"  [dim]Your previous files are in:[/]  [cyan]{backup_dir}[/]")
+        console.print(f"  [dim]Delete when satisfied:[/]       rm -rf {backup_dir}")
 
 
 def _build_ai_scenarios(scenario_recs: list) -> dict:
@@ -243,6 +271,34 @@ def _build_ai_golden_data(golden_recs: list, agent_name: str) -> dict:
             },
         })
     return {"golden_questions": questions}
+
+
+def _backup_existing_files(eval_dir: Path, mode: str) -> Path | None:
+    """Back up existing eval files before AI overwrites them.
+
+    Returns the backup directory path if any files were backed up, else None.
+    """
+    files_to_backup = [eval_dir / "metrics" / "metric_definitions.json"]
+    if mode in ("user-sim", "both"):
+        files_to_backup.append(eval_dir / "scenarios" / "conversation_scenarios.json")
+    if mode in ("diy", "both"):
+        files_to_backup.append(eval_dir / "eval_data" / "golden_dataset.json")
+
+    existing = [f for f in files_to_backup if f.exists()]
+    if not existing:
+        return None
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = eval_dir / ".backup" / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    for f in existing:
+        rel = f.relative_to(eval_dir)
+        dest = backup_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, dest)
+
+    return backup_dir
 
 
 def _write_if_missing(path: Path, content: str) -> None:
