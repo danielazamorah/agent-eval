@@ -52,8 +52,8 @@ A single-turn multi-agent AI pipeline for retail site selection. Given a busines
 
 | Agent | Type | Evaluation Method |
 |-------|------|-------------------|
-| [customer-service](tutorial/example_agents/customer-service/) | Multi-turn | ADK User Sim |
-| [retail-ai-location-strategy](tutorial/example_agents/retail-ai-location-strategy/) | Single-turn | DIY Interactions |
+| [customer-service](../tutorial/example_agents/customer-service/) | Multi-turn | ADK User Sim |
+| [retail-ai-location-strategy](../tutorial/example_agents/retail-ai-location-strategy/) | Single-turn | DIY Interactions |
 
 ---
 
@@ -78,11 +78,11 @@ gcloud services enable aiplatform.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
 **Customer Service Agent:**
 
 ```bash
-cp docs/tutorial/example_agents/customer-service/.env.example \
-   docs/tutorial/example_agents/customer-service/.env
+cp tutorial/example_agents/customer-service/.env.example \
+   tutorial/example_agents/customer-service/.env
 ```
 
-Edit `docs/tutorial/example_agents/customer-service/.env` and set:
+Edit `tutorial/example_agents/customer-service/.env` and set:
 ```
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
@@ -92,11 +92,11 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE
 **Retail AI Agent:**
 
 ```bash
-cp docs/tutorial/example_agents/retail-ai-location-strategy/.env.example \
-   docs/tutorial/example_agents/retail-ai-location-strategy/.env
+cp tutorial/example_agents/retail-ai-location-strategy/.env.example \
+   tutorial/example_agents/retail-ai-location-strategy/.env
 ```
 
-Edit `docs/tutorial/example_agents/retail-ai-location-strategy/.env` and set:
+Edit `tutorial/example_agents/retail-ai-location-strategy/.env` and set:
 ```
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
@@ -113,8 +113,8 @@ MAPS_API_KEY=your-maps-api-key
 uv sync
 
 # Install example agent dependencies
-uv sync --directory docs/tutorial/example_agents/customer-service
-uv sync --directory docs/tutorial/example_agents/retail-ai-location-strategy
+uv sync --directory tutorial/example_agents/customer-service
+uv sync --directory tutorial/example_agents/retail-ai-location-strategy
 ```
 
 ---
@@ -128,7 +128,7 @@ ADK User Sim generates multi-turn conversations from scenario definitions. Inste
 ```bash
 # From the agent-eval repository root:
 uv run agent-eval simulate \
-  --agent-dir docs/tutorial/example_agents/customer-service/customer_service
+  --agent-dir tutorial/example_agents/customer-service/customer_service
 ```
 
 The `simulate` command handles the full workflow: symlinks scenario files, clears previous traces, creates a fresh eval set, runs ADK User Sim, and converts traces to evaluation format.
@@ -140,15 +140,15 @@ The `simulate` command prints the exact commands to run next — copy and paste 
 ```bash
 # Run evaluation
 uv run agent-eval evaluate \
-  --interaction-file docs/tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp>/raw/processed_interaction_sim.jsonl \
-  --metrics-files docs/tutorial/example_agents/customer-service/customer_service/eval/metrics/metric_definitions.json \
-  --results-dir docs/tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp> \
+  --interaction-file tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp>/raw/processed_interaction_sim.jsonl \
+  --metrics-files tutorial/example_agents/customer-service/customer_service/eval/metrics/metric_definitions.json \
+  --results-dir tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp> \
   --input-label baseline
 
 # Analyze
 uv run agent-eval analyze \
-  --results-dir docs/tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp> \
-  --agent-dir docs/tutorial/example_agents/customer-service/customer_service \
+  --results-dir tutorial/example_agents/customer-service/customer_service/eval/results/<timestamp> \
+  --agent-dir tutorial/example_agents/customer-service/customer_service \
   --location global
 ```
 
@@ -180,7 +180,7 @@ cat $CS_RUN_DIR/eval_summary.json     # Raw metrics
 ### 3.1 Start the Agent (Terminal 1)
 
 ```bash
-cd docs/tutorial/example_agents/retail-ai-location-strategy
+cd tutorial/example_agents/retail-ai-location-strategy
 make dev  # Starts on port 8502
 ```
 
@@ -192,22 +192,22 @@ Keep this terminal running.
 # From repo root
 export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
-  --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/eval_data/golden_dataset.json \
+  --questions-file tutorial/example_agents/retail-ai-location-strategy/app/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
-  --results-dir docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/results \
+  --results-dir tutorial/example_agents/retail-ai-location-strategy/app/eval/results \
   2>&1 | grep "Run folder:" | awk '{print $3}')
 
 echo "Results saved to: $RETAIL_RUN_DIR"
 
 uv run agent-eval evaluate \
   --interaction-file $RETAIL_RUN_DIR/raw/processed_interaction_app.jsonl \
-  --metrics-files docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/metrics/metric_definitions.json \
+  --metrics-files tutorial/example_agents/retail-ai-location-strategy/app/eval/metrics/metric_definitions.json \
   --results-dir $RETAIL_RUN_DIR \
   --input-label baseline
 
 uv run agent-eval analyze \
   --results-dir $RETAIL_RUN_DIR \
-  --agent-dir docs/tutorial/example_agents/retail-ai-location-strategy \
+  --agent-dir tutorial/example_agents/retail-ai-location-strategy \
   --location global
 ```
 
@@ -261,7 +261,7 @@ Then generate an OPTIMIZATION_LOG.md that documents:
 4. Which Context Engineering principle applies (Offload, Reduce, Retrieve, Isolate, Cache)
 ```
 
-The assistant will produce a structured optimization log — save it to `docs/tutorial/example_agents/customer-service/customer_service/eval/results/OPTIMIZATION_LOG.md`.
+The assistant will produce a structured optimization log — save it to `tutorial/example_agents/customer-service/customer_service/eval/results/OPTIMIZATION_LOG.md`.
 
 This is the format you'll update after every optimization cycle.
 
@@ -278,7 +278,7 @@ After modifying agent code, always run the full cycle from the **agent-eval repo
 ```bash
 # Step 1: Re-run simulation (handles clearing traces, creating eval set, etc.)
 uv run agent-eval simulate \
-  --agent-dir docs/tutorial/example_agents/customer-service/customer_service
+  --agent-dir tutorial/example_agents/customer-service/customer_service
 
 # Step 2: Copy the evaluate and analyze commands printed by simulate
 # They include the correct paths for this run's timestamp
@@ -305,7 +305,7 @@ Update the OPTIMIZATION_LOG.md with this iteration.
 
 **Hypothesis:** Swapping to a newer, smarter model should improve all metrics.
 
-**The change:** Edit `docs/tutorial/example_agents/customer-service/customer_service/config.py`:
+**The change:** Edit `tutorial/example_agents/customer-service/customer_service/config.py`:
 
 ```python
 # BEFORE (line 30):
@@ -351,7 +351,7 @@ Also change the location (line 46):
 
 #### 1. Add KNOWN LIMITATIONS to tool docstrings
 
-Edit `docs/tutorial/example_agents/customer-service/customer_service/tools/tools.py`. For each tool, add a `**KNOWN LIMITATIONS**` section to the docstring. Here are the key ones:
+Edit `tutorial/example_agents/customer-service/customer_service/tools/tools.py`. For each tool, add a `**KNOWN LIMITATIONS**` section to the docstring. Here are the key ones:
 
 **`send_call_companion_link`** — add after the existing docstring:
 ```python
@@ -460,7 +460,7 @@ def sync_ask_for_approval(discount_type: str, value: float, reason: str) -> str:
 
 #### 2. Add CORE OPERATIONAL BOUNDARIES to the system prompt
 
-Edit `docs/tutorial/example_agents/customer-service/customer_service/prompts.py`. Add this section at the beginning of `INSTRUCTION`, right after the first paragraph:
+Edit `tutorial/example_agents/customer-service/customer_service/prompts.py`. Add this section at the beginning of `INSTRUCTION`, right after the first paragraph:
 
 ```python
 INSTRUCTION = """
@@ -501,7 +501,7 @@ Always use conversation context/state or tools to get information. Prefer tools 
 
 **The change:** Add a `before_model_compaction` callback.
 
-Edit `docs/tutorial/example_agents/customer-service/customer_service/shared_libraries/callbacks.py`. Add this new function:
+Edit `tutorial/example_agents/customer-service/customer_service/shared_libraries/callbacks.py`. Add this new function:
 
 ```python
 def before_model_compaction(
@@ -534,7 +534,7 @@ def before_model_compaction(
                 logger.debug(f"Compacted output from {tool_name}")
 ```
 
-Then register it in `docs/tutorial/example_agents/customer-service/customer_service/agent.py`. Add the import and callback:
+Then register it in `tutorial/example_agents/customer-service/customer_service/agent.py`. Add the import and callback:
 
 ```python
 from .shared_libraries.callbacks import (
@@ -577,7 +577,7 @@ root_agent = Agent(
 
 #### 1. Create specialized instructions
 
-Edit `docs/tutorial/example_agents/customer-service/customer_service/prompts.py`. Add these new instruction constants:
+Edit `tutorial/example_agents/customer-service/customer_service/prompts.py`. Add these new instruction constants:
 
 ```python
 TRIAGE_INSTRUCTION = """
@@ -620,7 +620,7 @@ You handle: scheduling planting services, sending care instructions, and video c
 
 #### 2. Restructure agent.py
 
-Replace the contents of `docs/tutorial/example_agents/customer-service/customer_service/agent.py` with:
+Replace the contents of `tutorial/example_agents/customer-service/customer_service/agent.py` with:
 
 ```python
 """Agent module for the customer service agent."""
@@ -732,26 +732,26 @@ After modifying Retail AI code:
 
 ```bash
 # Terminal 1: Restart the agent
-cd docs/tutorial/example_agents/retail-ai-location-strategy
+cd tutorial/example_agents/retail-ai-location-strategy
 make dev
 
 # Terminal 2: Run evaluation
 export RETAIL_RUN_DIR=$(uv run agent-eval interact \
   --app-name app \
-  --questions-file docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/eval_data/golden_dataset.json \
+  --questions-file tutorial/example_agents/retail-ai-location-strategy/app/eval/eval_data/golden_dataset.json \
   --base-url http://localhost:8502 \
-  --results-dir docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/results \
+  --results-dir tutorial/example_agents/retail-ai-location-strategy/app/eval/results \
   2>&1 | grep "Run folder:" | awk '{print $3}')
 
 uv run agent-eval evaluate \
   --interaction-file $RETAIL_RUN_DIR/raw/processed_interaction_app.jsonl \
-  --metrics-files docs/tutorial/example_agents/retail-ai-location-strategy/app/eval/metrics/metric_definitions.json \
+  --metrics-files tutorial/example_agents/retail-ai-location-strategy/app/eval/metrics/metric_definitions.json \
   --results-dir $RETAIL_RUN_DIR \
   --input-label <optimization-name>
 
 uv run agent-eval analyze \
   --results-dir $RETAIL_RUN_DIR \
-  --agent-dir docs/tutorial/example_agents/retail-ai-location-strategy \
+  --agent-dir tutorial/example_agents/retail-ai-location-strategy \
   --location global
 ```
 
@@ -767,7 +767,7 @@ uv run agent-eval analyze \
 
 #### 1. Offload search results to disk
 
-Edit `docs/tutorial/example_agents/retail-ai-location-strategy/app/tools/places_search.py`. Modify the `search_places` function to save full results to a file and return only a preview:
+Edit `tutorial/example_agents/retail-ai-location-strategy/app/tools/places_search.py`. Modify the `search_places` function to save full results to a file and return only a preview:
 
 After the line `places.append({...})` and before the `return` statement, add:
 
@@ -794,7 +794,7 @@ And remove the old return block that returned all results.
 
 #### 2. Minify data in the callback
 
-Edit `docs/tutorial/example_agents/retail-ai-location-strategy/app/callbacks/pipeline_callbacks.py`. In the `before_gap_analysis` function, add data minification before the `return None`:
+Edit `tutorial/example_agents/retail-ai-location-strategy/app/callbacks/pipeline_callbacks.py`. In the `before_gap_analysis` function, add data minification before the `return None`:
 
 ```python
 def before_gap_analysis(callback_context: CallbackContext) -> Optional[types.Content]:
@@ -827,7 +827,7 @@ def before_gap_analysis(callback_context: CallbackContext) -> Optional[types.Con
 
 #### 3. Update gap analysis to use minified data
 
-Edit `docs/tutorial/example_agents/retail-ai-location-strategy/app/sub_agents/gap_analysis/agent.py`. In `GAP_ANALYSIS_INSTRUCTION`, add this line to the `## Available Data` section:
+Edit `tutorial/example_agents/retail-ai-location-strategy/app/sub_agents/gap_analysis/agent.py`. In `GAP_ANALYSIS_INSTRUCTION`, add this line to the `## Available Data` section:
 
 ```
 ### COMPETITOR DATA (Minified JSON):
@@ -866,7 +866,7 @@ Load it with `json.loads()` into a pandas DataFrame for analysis.
 
 #### 1. Add a data validity check to gap analysis
 
-Edit `docs/tutorial/example_agents/retail-ai-location-strategy/app/sub_agents/gap_analysis/agent.py`. In `GAP_ANALYSIS_INSTRUCTION`, add a new **Step 0** before Step 1:
+Edit `tutorial/example_agents/retail-ai-location-strategy/app/sub_agents/gap_analysis/agent.py`. In `GAP_ANALYSIS_INSTRUCTION`, add a new **Step 0** before Step 1:
 
 ```
 ## Analysis Steps
@@ -887,7 +887,7 @@ Before ANY analysis, check if the competitor data is valid:
 
 #### 2. Add a fail-safe to strategy advisor
 
-Edit `docs/tutorial/example_agents/retail-ai-location-strategy/app/sub_agents/strategy_advisor/agent.py`. In `STRATEGY_ADVISOR_INSTRUCTION`, add a **Step 0** before "### 1. Data Integration":
+Edit `tutorial/example_agents/retail-ai-location-strategy/app/sub_agents/strategy_advisor/agent.py`. In `STRATEGY_ADVISOR_INSTRUCTION`, add a **Step 0** before "### 1. Data Integration":
 
 ```
 ## Analysis Framework
@@ -929,11 +929,11 @@ After running multiple optimizations, use your AI assistant to generate a compre
 
 ```
 I have the following evaluation runs for the Customer Service agent:
-- Baseline: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<baseline_dir>/eval_summary.json
-- Model Swap: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m0_dir>/eval_summary.json
-- Tool Hardening: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m1_dir>/eval_summary.json
-- Context Compaction: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m2_dir>/eval_summary.json
-- Functional Isolation: docs/tutorial/example_agents/customer-service/customer_service/eval/results/<m3_dir>/eval_summary.json
+- Baseline: tutorial/example_agents/customer-service/customer_service/eval/results/<baseline_dir>/eval_summary.json
+- Model Swap: tutorial/example_agents/customer-service/customer_service/eval/results/<m0_dir>/eval_summary.json
+- Tool Hardening: tutorial/example_agents/customer-service/customer_service/eval/results/<m1_dir>/eval_summary.json
+- Context Compaction: tutorial/example_agents/customer-service/customer_service/eval/results/<m2_dir>/eval_summary.json
+- Functional Isolation: tutorial/example_agents/customer-service/customer_service/eval/results/<m3_dir>/eval_summary.json
 
 Read all of them and:
 1. Create a full progression table showing every metric across all iterations

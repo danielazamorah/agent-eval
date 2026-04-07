@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
@@ -52,6 +54,194 @@ def robust_json_loads(x: Any) -> Optional[Dict[str, Any]]:
         except (ValueError, SyntaxError):
             pass
         return None
+
+
+# Metric prefixes where a lower value means better performance.
+# Everything else (cache_hit_rate, tool_success_rate, all LLM metrics) = higher is better.
+LOWER_IS_BETTER = {
+    "token_usage.",
+    "latency_metrics.",
+    "thinking_metrics.",
+    "tool_success_rate.failed_tool_calls",
+    "context_saturation.",
+    "estimated_cost",
+}
+
+# Threshold: changes smaller than this percentage are considered neutral.
+NEUTRAL_THRESHOLD_PCT = 1.0
+
+
+def _is_lower_better(metric_name: str) -> bool:
+    """Check if a metric improves when its value decreases."""
+    return any(metric_name.startswith(prefix) if prefix.endswith(".")
+               else metric_name == prefix
+               for prefix in LOWER_IS_BETTER)
+
+
+def _compute_pct_change(baseline: float, current: float) -> float:
+    """Compute percentage change from baseline to current."""
+    if baseline == 0:
+        return 0.0 if current == 0 else 100.0
+    return ((current - baseline) / abs(baseline)) * 100
+
+
+def _classify_direction(metric_name: str, pct_change: float) -> tuple[str, str]:
+    """Returns (direction, emoji) for a metric change."""
+    if abs(pct_change) < NEUTRAL_THRESHOLD_PCT:
+        return "neutral", "⚪"
+
+    lower_better = _is_lower_better(metric_name)
+    # For lower-is-better: negative change = improvement
+    # For higher-is-better: positive change = improvement
+    is_improvement = (pct_change < 0) if lower_better else (pct_change > 0)
+    if is_improvement:
+        return "improvement", "🟢"
+    return "regression", "🔴"
+
+
+def compute_comparison(baseline_summary: dict, current_summary: dict) -> dict:
+    """Compute metric deltas between two evaluation runs.
+
+    Args:
+        baseline_summary: eval_summary.json content from the baseline run.
+        current_summary: eval_summary.json content from the current run.
+
+    Returns:
+        Dict with baseline/current IDs, git info, deltas list, and new/removed metrics.
+    """
+    b_overall = baseline_summary.get("overall_summary", {})
+    c_overall = current_summary.get("overall_summary", {})
+
+    b_det = b_overall.get("deterministic_metrics", {})
+    c_det = c_overall.get("deterministic_metrics", {})
+    b_llm = b_overall.get("llm_based_metrics", {})
+    c_llm = c_overall.get("llm_based_metrics", {})
+
+    deltas = []
+    new_metrics = []
+    removed_metrics = []
+
+    # --- Deterministic metrics ---
+    all_det_keys = set(b_det.keys()) | set(c_det.keys())
+    for key in sorted(all_det_keys):
+        b_val = b_det.get(key)
+        c_val = c_det.get(key)
+
+        if b_val is None:
+            new_metrics.append({"metric": key, "type": "deterministic", "current": c_val})
+            continue
+        if c_val is None:
+            removed_metrics.append({"metric": key, "type": "deterministic", "baseline": b_val})
+            continue
+
+        try:
+            b_num, c_num = float(b_val), float(c_val)
+        except (TypeError, ValueError):
+            continue
+
+        pct = _compute_pct_change(b_num, c_num)
+        direction, emoji = _classify_direction(key, pct)
+        deltas.append({
+            "metric": key,
+            "type": "deterministic",
+            "baseline": b_num,
+            "current": c_num,
+            "delta": round(c_num - b_num, 4),
+            "pct_change": round(pct, 2),
+            "direction": direction,
+            "emoji": emoji,
+        })
+
+    # --- LLM metrics ---
+    all_llm_keys = set(b_llm.keys()) | set(c_llm.keys())
+    for key in sorted(all_llm_keys):
+        b_info = b_llm.get(key)
+        c_info = c_llm.get(key)
+
+        if b_info is None:
+            c_avg = c_info.get("average", c_info) if isinstance(c_info, dict) else c_info
+            new_metrics.append({"metric": key, "type": "llm", "current": c_avg})
+            continue
+        if c_info is None:
+            b_avg = b_info.get("average", b_info) if isinstance(b_info, dict) else b_info
+            removed_metrics.append({"metric": key, "type": "llm", "baseline": b_avg})
+            continue
+
+        b_avg = b_info.get("average", b_info) if isinstance(b_info, dict) else b_info
+        c_avg = c_info.get("average", c_info) if isinstance(c_info, dict) else c_info
+
+        try:
+            b_num, c_num = float(b_avg), float(c_avg)
+        except (TypeError, ValueError):
+            continue
+
+        # For LLM metrics, compute % relative to score range if available
+        score_range = (c_info if isinstance(c_info, dict) else {}).get("score_range", {})
+        range_width = score_range.get("max", 5) - score_range.get("min", 0) if score_range else None
+        if range_width and range_width > 0:
+            pct = ((c_num - b_num) / range_width) * 100
+        else:
+            pct = _compute_pct_change(b_num, c_num)
+
+        direction, emoji = _classify_direction(key, pct)
+        deltas.append({
+            "metric": key,
+            "type": "llm",
+            "baseline": b_num,
+            "current": c_num,
+            "delta": round(c_num - b_num, 4),
+            "pct_change": round(pct, 2),
+            "direction": direction,
+            "emoji": emoji,
+            "score_range": score_range or None,
+        })
+
+    # --- Git diff ---
+    b_git = baseline_summary.get("git_info", {})
+    c_git = current_summary.get("git_info", {})
+    git_diff = ""
+    if b_git.get("commit") and c_git.get("commit") and b_git["commit"] != c_git["commit"]:
+        try:
+            diff_result = subprocess.run(
+                ["git", "diff", b_git["commit"], c_git["commit"]],
+                capture_output=True, text=True, timeout=10,
+            )
+            if diff_result.returncode == 0 and diff_result.stdout:
+                git_diff = diff_result.stdout[:5000]
+                if len(diff_result.stdout) > 5000:
+                    git_diff += "\n... (truncated)"
+        except Exception:
+            pass
+
+    return {
+        "baseline_id": baseline_summary.get("experiment_id", "unknown"),
+        "current_id": current_summary.get("experiment_id", "unknown"),
+        "baseline_git": b_git,
+        "current_git": c_git,
+        "deltas": deltas,
+        "new_metrics": new_metrics,
+        "removed_metrics": removed_metrics,
+        "git_diff": git_diff,
+    }
+
+
+def format_comparison_table(comparison: dict) -> str:
+    """Format comparison deltas as a markdown table."""
+    lines = ["| Metric | Baseline | Current | Delta | % Change | Status |",
+             "|--------|----------|---------|-------|----------|--------|"]
+    for d in comparison["deltas"]:
+        b_str = f"{d['baseline']:.2f}" if isinstance(d["baseline"], float) else str(d["baseline"])
+        c_str = f"{d['current']:.2f}" if isinstance(d["current"], float) else str(d["current"])
+        d_str = f"{d['delta']:+.2f}" if isinstance(d["delta"], float) else str(d["delta"])
+        pct_str = f"{d['pct_change']:+.1f}%"
+        lines.append(f"| {d['metric']} | {b_str} | {c_str} | {d_str} | {pct_str} | {d['emoji']} {d['direction']} |")
+
+    for m in comparison.get("new_metrics", []):
+        lines.append(f"| {m['metric']} | — | {m['current']} | — | NEW | 🆕 |")
+    for m in comparison.get("removed_metrics", []):
+        lines.append(f"| {m['metric']} | {m['baseline']} | — | — | REMOVED | ➖ |")
+
+    return "\n".join(lines)
 
 
 class Analyzer:
@@ -374,13 +564,149 @@ class Analyzer:
 
         return context
 
+    def _auto_find_previous_run(self, results_dir: Path, current_run_folder: Path) -> Optional[Path]:
+        """Find the most recent previous run folder in results_dir.
+
+        Scans for subdirectories containing eval_summary.json, sorted by
+        modification time. Returns the most recent one that isn't the current run.
+        """
+        candidates = []
+        for subdir in results_dir.iterdir():
+            if not subdir.is_dir() or subdir == current_run_folder:
+                continue
+            if (subdir / "eval_summary.json").exists():
+                candidates.append(subdir)
+
+        if not candidates:
+            return None
+
+        # Most recently modified first
+        candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        return candidates[0]
+
+    def _load_baseline_summary(self, compare_to_path: Path) -> Optional[dict]:
+        """Load eval_summary.json from a baseline run directory."""
+        run_folder = self._find_run_folder(compare_to_path)
+        if not run_folder:
+            # Try direct path
+            summary_file = compare_to_path / "eval_summary.json"
+            if summary_file.exists():
+                run_folder = compare_to_path
+            else:
+                return None
+
+        summary_file = run_folder / "eval_summary.json"
+        if not summary_file.exists():
+            return None
+
+        try:
+            return json.loads(summary_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def generate_optimization_log(
+        self,
+        comparison: dict,
+        focus: Optional[str],
+        run_folder: Path,
+        gemini_comparison_text: Optional[str] = None,
+        current_summary: Optional[dict] = None,
+    ) -> Path:
+        """Generate or append to OPTIMIZATION_LOG.md in the results directory.
+
+        Args:
+            comparison: Output from compute_comparison() (None for baseline entry).
+            focus: Developer focus text (if any).
+            run_folder: Current run's results folder.
+            gemini_comparison_text: Gemini's comparison analysis (if available).
+            current_summary: Current eval_summary.json for baseline entries.
+
+        Returns:
+            Path to the OPTIMIZATION_LOG.md file.
+        """
+        log_path = run_folder.parent / "OPTIMIZATION_LOG.md"
+
+        # Determine iteration number
+        iteration = 1
+        existing_content = ""
+        if log_path.exists():
+            existing_content = log_path.read_text()
+            # Find the highest iteration number
+            matches = re.findall(r"## Iteration (\d+)", existing_content)
+            if matches:
+                iteration = max(int(m) for m in matches) + 1
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if comparison is None:
+            # Baseline entry — no comparison data yet
+            entry = f"\n\n## Iteration {iteration} — Baseline\n\n"
+            entry += f"**Date:** {timestamp}\n"
+            entry += f"**Run:** {run_folder.name}\n"
+            if current_summary:
+                git = current_summary.get("git_info", {})
+                if git.get("commit"):
+                    entry += f"**Git:** `{git['commit'][:8]}` ({git.get('branch', 'unknown')})"
+                    if git.get("dirty"):
+                        entry += " ⚠️ uncommitted changes"
+                    entry += "\n"
+            if focus:
+                entry += f"**Focus:** {focus}\n"
+            entry += "\n*Baseline run — no comparison available yet.*\n"
+        else:
+            entry = f"\n\n## Iteration {iteration} — {run_folder.name} vs {comparison['baseline_id']}\n\n"
+            entry += f"**Date:** {timestamp}\n"
+            entry += f"**Current Run:** {comparison['current_id']} (`{run_folder.name}`)\n"
+            entry += f"**Baseline Run:** {comparison['baseline_id']}\n"
+
+            # Git info
+            c_git = comparison.get("current_git", {})
+            b_git = comparison.get("baseline_git", {})
+            if c_git.get("commit"):
+                entry += f"**Git:** `{b_git.get('commit', '?')[:8]}` → `{c_git['commit'][:8]}`"
+                if c_git.get("dirty"):
+                    entry += " ⚠️ uncommitted changes"
+                entry += "\n"
+            if focus:
+                entry += f"**Focus:** {focus}\n"
+
+            # Summary counts
+            improvements = sum(1 for d in comparison["deltas"] if d["direction"] == "improvement")
+            regressions = sum(1 for d in comparison["deltas"] if d["direction"] == "regression")
+            neutral = sum(1 for d in comparison["deltas"] if d["direction"] == "neutral")
+            entry += f"\n**Summary:** {improvements} 🟢 improvements, {regressions} 🔴 regressions, {neutral} ⚪ neutral\n\n"
+
+            # Comparison table
+            entry += format_comparison_table(comparison) + "\n"
+
+            # Gemini's analysis excerpt
+            if gemini_comparison_text:
+                # Extract first ~500 chars as a summary
+                excerpt = gemini_comparison_text[:500]
+                if len(gemini_comparison_text) > 500:
+                    excerpt += "..."
+                entry += f"\n### AI Analysis\n\n{excerpt}\n"
+
+        # Write
+        if not existing_content:
+            header = "# Optimization Log\n\n"
+            header += "Cumulative record of evaluation runs and metric changes.\n"
+            header += "Generated automatically by `agent-eval analyze`.\n"
+            log_path.write_text(header + entry, encoding="utf-8")
+        else:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+
+        return log_path
+
     def generate_gemini_analysis(
         self,
         summary_data: dict,
         analysis_content: str,
         raw_dir: Path,
         output_path: Path,
-    ) -> None:
+        comparison_data: Optional[dict] = None,
+    ) -> str:
         """Generates a detailed technical diagnosis using Gemini.
 
         Args:
@@ -388,6 +714,10 @@ class Analyzer:
             analysis_content: Pre-formatted analysis content.
             raw_dir: Directory for raw/debug files (prompt goes here).
             output_path: Path for the analysis output file.
+            comparison_data: Output from compute_comparison() (if comparing runs).
+
+        Returns:
+            The comparison analysis text from Call 2 (empty string if no comparison).
         """
         # Find relevant context files dynamically
         consolidated_metrics_file = raw_dir / "temp_consolidated_metrics.json"
@@ -433,6 +763,8 @@ class Analyzer:
             else:
                 print(f"  Warning: Strategy file not found: {strategy_file}")
 
+        focus = self.config.get("focus")
+
         prompter = GeminiAnalysisPrompter(
             summary_data=summary_data,
             analysis_content=analysis_content,
@@ -444,62 +776,82 @@ class Analyzer:
             tone=self.config.get("report_tone"),
             length=self.config.get("report_length"),
             custom_strategy_content=custom_strategy_content,
+            focus_directive=focus,
         )
         prompt = prompter.build_prompt()
 
         # Save prompt to raw/ folder for debugging
         (raw_dir / "gemini_prompt.txt").write_text(prompt, encoding="utf-8")
 
-        # Get model from config (default: gemini-3-pro-preview)
-        model = self.config.get("model", "gemini-3-pro-preview")
+        model, client = self._get_gemini_client()
 
-        # Validate model is a supported Gemini model
-        supported_models = [
-            "gemini-3-pro-preview", "gemini-3-flash-preview",
-            "gemini-2.5-pro", "gemini-2.5-flash",
-            "gemini-2.0-flash"
-        ]
-        if model not in supported_models:
-            print(f"Warning: Model '{model}' may not be supported. Supported: {', '.join(supported_models)}")
-
-        print(f"\n--- Calling Vertex AI ({model}) to generate root-cause analysis ---")
+        print(f"\n--- Calling Vertex AI ({model}) — Call 1: Current run diagnosis ---")
+        analysis_text = ""
         try:
-            # Use Vertex AI with project/location from environment
-            project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
-
-            # Check for explicit config location first
-            location = self.config.get("location")
-
-            if not location:
-                # Gemini 3 models require 'global' location, others use us-central1
-                # See: https://cloud.google.com/vertex-ai/generative-ai/docs/learn/model-versions
-                if model.startswith("gemini-3"):
-                    location = "global"
-                    print(f"  Using 'global' location for {model} (required for Gemini 3 models)")
-                else:
-                    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-
-            if not project:
-                print("Warning: GOOGLE_CLOUD_PROJECT not set. Trying default credentials...")
-
-            client = genai.Client(
-                vertexai=True,
-                project=project,
-                location=location,
-                http_options=HttpOptions(api_version="v1")
-            )
-
             response = client.models.generate_content(
                 model=model, contents=prompt
             )
-
             analysis_text = response.text
             output_path.write_text(analysis_text, encoding="utf-8")
             print(f"Analysis report saved to {output_path}")
-
         except Exception as e:
             print(f"An error occurred while calling the Vertex AI API: {e}")
             print("Tip: Ensure GOOGLE_CLOUD_PROJECT is set and you're authenticated with gcloud.")
+
+        # --- Call 2: Comparison analysis (if comparison data provided) ---
+        comparison_text = ""
+        if comparison_data is not None:
+            comparison_table = format_comparison_table(comparison_data)
+            comparison_prompt = prompter.build_comparison_prompt(
+                comparison_data=comparison_data,
+                comparison_table=comparison_table,
+            )
+            # Save comparison prompt for debugging
+            (raw_dir / "gemini_comparison_prompt.txt").write_text(
+                comparison_prompt, encoding="utf-8"
+            )
+
+            print(f"\n--- Calling Vertex AI ({model}) — Call 2: Comparison analysis ---")
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=comparison_prompt
+                )
+                comparison_text = response.text
+
+                # Append comparison to the analysis file
+                combined = analysis_text + "\n\n---\n\n# Run Comparison\n\n" + comparison_text
+                output_path.write_text(combined, encoding="utf-8")
+                print(f"Comparison analysis appended to {output_path}")
+            except Exception as e:
+                print(f"An error occurred during comparison analysis: {e}")
+
+        return comparison_text
+
+    def _get_gemini_client(self):
+        """Initialize and return (model_name, genai.Client) for Gemini calls."""
+        model = self.config.get("model", "gemini-3.1-pro-preview")
+
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
+        location = self.config.get("location")
+
+        if not location:
+            # Gemini 3+ models require global region
+            if model.startswith("gemini-3"):
+                location = "global"
+                print(f"  Using 'global' location for {model} (required for Gemini 3+ models)")
+            else:
+                location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        if not project:
+            print("Warning: GOOGLE_CLOUD_PROJECT not set. Trying default credentials...")
+
+        client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+            http_options=HttpOptions(api_version="v1")
+        )
+        return model, client
 
     def _find_run_folder(self, results_dir: Path) -> Optional[Path]:
         """
@@ -533,17 +885,24 @@ class Analyzer:
 
         return None
 
-    def run(self):
-        """Main entry point for analysis."""
+    def run(self) -> Optional[dict]:
+        """Main entry point for analysis.
+
+        Returns:
+            Dict with current_summary, comparison_data, and optimization_log_path
+            for use by the CLI display layer. None if analysis failed.
+        """
         results_dir = Path(self.config["results_dir"])
         skip_gemini = self.config.get("skip_gemini", False)
         gcs_bucket = self.config.get("gcs_bucket")
+        compare_to = self.config.get("compare_to")
+        focus = self.config.get("focus")
 
         # Find the run folder (supports datetime folder structure)
         run_folder = self._find_run_folder(results_dir)
         if not run_folder:
             print(f"Error: No evaluation results found in '{results_dir}'")
-            return
+            return None
 
         print(f"Analyzing run folder: {run_folder}")
 
@@ -554,13 +913,12 @@ class Analyzer:
         else:
             # Legacy structure
             results_files = list(run_folder.glob("evaluation_results_*.csv"))
-            raw_dir = run_folder  # Use run_folder for raw files in legacy mode
+            raw_dir = run_folder
 
         if not results_files:
             print(f"Error: No 'evaluation_results_*.csv' file found")
-            return
+            return None
 
-        # Sort by modification time, newest first
         results_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         results_file = results_files[0]
         print(f"Analyzing results file: {results_file.name}")
@@ -568,23 +926,70 @@ class Analyzer:
         summary_file = run_folder / "eval_summary.json"
         if not summary_file.exists():
             print(f"Error: summary file not found in '{run_folder}'")
-            return
+            return None
 
-        # 1. Generate Q&A Log (save to run folder)
+        current_summary = json.loads(summary_file.read_text())
+
+        # 1. Generate Q&A Log
         qa_log_path = run_folder / "question_answer_log.md"
         self.generate_question_answer_log(results_file, qa_log_path)
 
-        # 2. Generate Gemini Analysis
+        # 2. Find baseline for comparison
+        comparison_data = None
+        if compare_to:
+            # Explicit baseline
+            print(f"\n--- Loading baseline from {compare_to} ---")
+            baseline_summary = self._load_baseline_summary(Path(compare_to))
+            if baseline_summary:
+                comparison_data = compute_comparison(baseline_summary, current_summary)
+                print(f"Comparison computed: {len(comparison_data['deltas'])} metrics compared")
+            else:
+                print(f"Warning: Could not load baseline from {compare_to}")
+        else:
+            # Auto-detect previous run
+            # The results parent is either run_folder.parent (normal) or results_dir itself
+            results_parent = run_folder.parent
+            if results_parent == run_folder:
+                results_parent = results_dir
+            previous_run = self._auto_find_previous_run(results_parent, run_folder)
+            if previous_run:
+                print(f"\n--- Auto-detected previous run: {previous_run.name} ---")
+                baseline_summary = self._load_baseline_summary(previous_run)
+                if baseline_summary:
+                    comparison_data = compute_comparison(baseline_summary, current_summary)
+                    print(f"Comparison computed: {len(comparison_data['deltas'])} metrics compared")
+            else:
+                print("\n--- No previous run found (this is the baseline) ---")
+
+        # 3. Generate Gemini Analysis (Call 1 + optional Call 2)
+        gemini_comparison_text = ""
         if not skip_gemini:
             summary, analysis_content = self.analyze_evaluation_results(
                 summary_file, results_file
             )
             if summary and analysis_content:
                 analysis_path = run_folder / "gemini_analysis.md"
-                self.generate_gemini_analysis(
-                    summary, analysis_content, raw_dir, analysis_path
+                gemini_comparison_text = self.generate_gemini_analysis(
+                    summary, analysis_content, raw_dir, analysis_path,
+                    comparison_data=comparison_data,
                 )
 
-        # 3. GCS Upload (Placeholder)
+        # 4. Generate / append OPTIMIZATION_LOG.md
+        log_path = self.generate_optimization_log(
+            comparison=comparison_data,
+            focus=focus,
+            run_folder=run_folder,
+            gemini_comparison_text=gemini_comparison_text or None,
+            current_summary=current_summary,
+        )
+        print(f"Optimization log updated: {log_path}")
+
+        # 5. GCS Upload (Placeholder)
         if gcs_bucket:
             print(f"\n--- [PLACEHOLDER] Uploading Results to GCS: gs://{gcs_bucket} ---")
+
+        return {
+            "current_summary": current_summary,
+            "comparison_data": comparison_data,
+            "optimization_log_path": log_path,
+        }

@@ -51,17 +51,12 @@ def _clean_env(project_root: Path) -> dict[str, str]:
 # Files ADK expects inside the agent module directory
 _ADK_REQUIRED_FILES = ["session_input.json", "conversation_scenarios.json", "eval_config.json"]
 
-# Default eval_config if none exists
+# Default eval_config — empty criteria so ADK skips its built-in per-interaction
+# LLM scoring (hallucination, safety). These are slow because ADK scores each
+# interaction individually. agent-eval runs its own evaluation in batch via
+# Vertex AI Evaluation, which is faster and more configurable.
 _DEFAULT_EVAL_CONFIG = {
-    "criteria": {
-        "hallucinations_v1": {
-            "threshold": 0.5,
-            "evaluate_intermediate_nl_responses": True,
-        },
-        "safety_v1": {
-            "threshold": 0.8,
-        },
-    }
+    "criteria": {}
 }
 
 TOTAL_STEPS = 5
@@ -115,7 +110,7 @@ def _step_symlinks(agent_dir: Path, eval_dir: Path) -> None:
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(json.dumps(_DEFAULT_EVAL_CONFIG, indent=2) + "\n")
             console.print(f"    [green]+[/] Created {source}")
-            console.print(f"      [dim]Default config: hallucination threshold 0.5, safety threshold 0.8[/]")
+            console.print(f"      [dim]Empty criteria — ADK's built-in scoring is skipped (agent-eval runs its own batch evaluation)[/]")
 
         if not source.exists():
             console.print(f"    [yellow]![/] Skipping {filename} — not found in {scenarios_dir}")
@@ -245,11 +240,17 @@ def _step_run_sim(agent_name: str, agent_dir: Path) -> bool:
         adk_cmd += ["--config_file_path", str(eval_config)]
     adk_cmd.append(eval_set_name)
 
+    # Capture ADK output — its "Tests passed/failed" summary refers to ADK's
+    # built-in eval scoring, not the simulation quality. This confuses users
+    # since agent-eval runs its own separate batch evaluation.
     result = subprocess.run(
         adk_cmd,
         cwd=str(project_root),
         env=_clean_env(project_root),
+        capture_output=True,
+        text=True,
     )
+
     # Check if traces were generated, regardless of exit code.
     # ADK's built-in scoring can fail (e.g., missing expected_invocations)
     # even when the simulations ran fine and traces were captured.
@@ -257,13 +258,14 @@ def _step_run_sim(agent_name: str, agent_dir: Path) -> bool:
     has_traces = eval_history.exists() and any(eval_history.rglob("*.json"))
 
     if result.returncode != 0 and has_traces:
-        console.print(f"\n    [yellow]![/] ADK eval finished with errors, but traces were captured.")
-        console.print(f"    [dim]The errors above are from ADK's built-in scoring (hallucination/safety),[/]")
-        console.print(f"    [dim]not from the simulation itself. The agent interactions ran successfully.[/]")
-        console.print(f"    [dim]agent-eval runs its own evaluation in the next step — you can ignore these.[/]")
+        console.print(f"\n    [yellow]![/] ADK simulation completed, but ADK's built-in scoring had errors.")
+        console.print(f"    [dim]This is expected — agent-eval runs its own evaluation separately.[/]")
         return True
 
     if result.returncode != 0:
+        # Show captured output only on real failures
+        if result.stderr:
+            console.print(f"\n    [dim]{result.stderr.strip()}[/]")
         console.print(f"\n    [red]ADK eval failed with exit code {result.returncode}[/]")
         console.print(f"    [dim]No traces were generated. Common issues:[/]")
         console.print(f"    [dim]  - Missing GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_LOCATION[/]")

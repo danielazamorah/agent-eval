@@ -90,7 +90,7 @@ def _display_metrics_summary(results_dir: str) -> None:
 
 
 @click.command()
-@click.option("--interaction-file", required=True, help="Path to processed interaction JSONL or CSV.")
+@click.option("--interaction-file", required=True, multiple=True, help="Path(s) to processed interaction JSONL or CSV. Can be specified multiple times.")
 @click.option("--metrics-files", required=True, multiple=True, help="Paths to metric definition JSONs.")
 @click.option("--results-dir", required=True, help="Directory for outputs.")
 @click.option("--input-label", default="manual", help="Label for this run (e.g. 'baseline').")
@@ -99,6 +99,10 @@ def _display_metrics_summary(results_dir: str) -> None:
 def evaluate(interaction_file, metrics_files, results_dir, input_label, test_description, metric_filter):
     """Run evaluation metrics on processed interaction data."""
     console.print("\n[bold blue]Running Evaluation[/]")
+    if len(interaction_file) > 1:
+        console.print(f"  [dim]Combining {len(interaction_file)} interaction files[/]")
+        for f in interaction_file:
+            console.print(f"    [dim]- {f}[/]")
 
     config = {
         "metric_filters": None,
@@ -117,7 +121,7 @@ def evaluate(interaction_file, metrics_files, results_dir, input_label, test_des
 
     try:
         evaluator.evaluate(
-            interaction_file=Path(interaction_file),
+            interaction_files=[Path(f) for f in interaction_file],
             metrics_files=list(metrics_files),
             results_dir=Path(results_dir),
         )

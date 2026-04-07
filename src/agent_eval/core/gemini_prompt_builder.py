@@ -33,6 +33,8 @@ You are an expert AI evaluation analyst. Your task is to produce a deep technica
 **Tone:** {tone}
 **Report Length:** {length}
 
+{focus_section}
+
 {custom_strategy_section}
 
 **CRITICAL INSTRUCTIONS:**
@@ -41,6 +43,7 @@ You are an expert AI evaluation analyst. Your task is to produce a deep technica
 3.  **Reference Your Sources:** When you make a claim or analyze a metric, you MUST reference the specific source file (e.g., `metric_definitions.json`, `deterministic_metrics.py`, `agent.py`).
 4.  **Analyze Calculation Methods:** For each metric you discuss, you MUST explain how its calculation method (deterministic vs. LLM-judged) influences its interpretation.
 5.  **Cite Quantitative and Qualitative Evidence:** You MUST quote specific examples from the conversation logs (user inputs, tool calls, or agent responses) AND cite the corresponding metric scores to justify your findings. Don't just say "the agent failed"; say "The agent's score of 1.2 on `tool_usage_accuracy` is justified by question `q_billing_01`, where it failed to call `lookup_invoice` despite the user explicitly asking for it."
+6.  **If a developer focus is provided:** Dedicate the opening section of your report to the focus area before proceeding with the general analysis. Highlight metrics, code patterns, and evidence most relevant to the developer's priority.
 
 ---
 
@@ -74,6 +77,49 @@ You are provided with the following context files to perform your diagnosis. Use
 Format your entire response as a single Markdown document.
 """
 
+    COMPARISON_TEMPLATE = """
+You are an expert evaluating how an AI agent's performance changed between two evaluation runs.
+
+Your task is to explain *what changed in the code* and *what was the impact on metrics*. This analysis will be appended to a cumulative optimization log that tracks the agent's improvement over time.
+
+{focus_section}
+
+**Baseline Run:** {baseline_id}
+**Current Run:** {current_id}
+
+---
+
+**1. Metric Deltas:**
+
+The following table shows how each metric changed. 🟢 = improvement, 🔴 = regression, ⚪ = neutral (<1% change).
+
+{comparison_table}
+
+**2. What Changed in the Code:**
+
+{git_diff_section}
+
+**3. Current Run Summary:**
+
+```json
+{current_summary}
+```
+
+**4. Agent Source Code:**
+
+{source_code_section}
+
+---
+
+**Instructions:**
+1.  Start with a **## What Changed** section: describe the code changes in plain language. What did the developer modify? Reference specific files, functions, or prompt changes from the git diff.
+2.  Follow with an **## Impact Analysis** section: for each significant metric delta (🟢 or 🔴), explain *why* it changed. Connect the code change to the metric movement. Be specific — cite the metric name, the delta, and the code change that caused it.
+3.  End with a **## Summary** section: 2-3 sentences summarizing the overall impact. Was this iteration a net positive? What should the developer focus on next?
+4.  Use the emoji indicators (🟢/🔴/⚪) consistently throughout your analysis.
+
+Format your entire response as a single Markdown document.
+"""
+
     def __init__(
         self,
         summary_data: Dict[str, Any],
@@ -86,17 +132,19 @@ Format your entire response as a single Markdown document.
         tone: Optional[str] = None,
         length: Optional[str] = None,
         custom_strategy_content: Optional[str] = None,
+        focus_directive: Optional[str] = None,
     ):
         self.summary_data = summary_data
         self.analysis_content = analysis_content
         self.context_files = context_files
         self.question_file_path = question_file_path
         self.consolidated_metrics_path = consolidated_metrics_path
-        
+
         self.audience = audience or self.DEFAULT_AUDIENCE
         self.tone = tone or self.DEFAULT_TONE
         self.length = length or self.DEFAULT_LENGTH
         self.custom_strategy_content = custom_strategy_content
+        self.focus_directive = focus_directive
 
     def _format_context_section(self, title: str, content: str, lang: str = "") -> str:
         return f"**{title}**\n```{lang}\n{content}\n```"
@@ -107,8 +155,20 @@ Format your entire response as a single Markdown document.
         )
         return self._format_context_section(f"File: `{file_path}`", content, lang)
 
+    def _build_focus_section(self) -> str:
+        """Build the focus directive section for prompts."""
+        if not self.focus_directive:
+            return ""
+        return (
+            "**DEVELOPER PRIORITY:**\n"
+            f"The developer has indicated the following priority for this analysis:\n"
+            f"> {self.focus_directive}\n\n"
+            "Weight your analysis toward these areas. Highlight metrics, code patterns, "
+            "and evidence that are most relevant to this priority."
+        )
+
     def build_prompt(self) -> str:
-        """Builds the final prompt string with all context included."""
+        """Builds the final prompt string for Call 1 (current run diagnosis)."""
         summary_section = self._format_context_section(
             "Evaluation Summary", json.dumps(self.summary_data, indent=2), "json"
         )
@@ -147,7 +207,7 @@ Format your entire response as a single Markdown document.
             ),
             "json",
         )
-        
+
         # Format the custom strategy section if provided
         custom_strategy_section = ""
         if self.custom_strategy_content:
@@ -162,6 +222,7 @@ Format your entire response as a single Markdown document.
             audience=self.audience,
             tone=self.tone,
             length=self.length,
+            focus_section=self._build_focus_section(),
             custom_strategy_section=custom_strategy_section,
             summary_section=summary_section,
             explanations_section=explanations_section,
@@ -169,4 +230,64 @@ Format your entire response as a single Markdown document.
             deterministic_logic_section=deterministic_logic_section,
             source_code_section=source_code_section,
             questions_section=questions_section,
+        )
+
+    def build_comparison_prompt(
+        self,
+        comparison_data: dict,
+        comparison_table: str,
+    ) -> str:
+        """Builds the prompt for Call 2 (comparison analysis).
+
+        Args:
+            comparison_data: Output from compute_comparison().
+            comparison_table: Pre-formatted markdown table from format_comparison_table().
+
+        Returns:
+            Prompt string for the comparison Gemini call.
+        """
+        # Git diff section
+        git_diff = comparison_data.get("git_diff", "")
+        if git_diff:
+            git_diff_section = f"```diff\n{git_diff}\n```"
+        else:
+            b_git = comparison_data.get("baseline_git", {})
+            c_git = comparison_data.get("current_git", {})
+            if not b_git.get("commit") or not c_git.get("commit"):
+                git_diff_section = (
+                    "*No git information available. The runs were either made outside a git repo "
+                    "or git info was not captured. Analyze metric changes based on the agent source code below.*"
+                )
+            elif b_git["commit"] == c_git["commit"]:
+                git_diff_section = (
+                    "*Both runs share the same git commit (`{}`). The metric changes are likely due "
+                    "to non-determinism in LLM responses, not code changes.*".format(b_git["commit"][:8])
+                )
+            else:
+                git_diff_section = "*Git diff could not be computed between the two commits.*"
+
+        # Agent source code
+        source_code_parts = []
+        for file_path in self.context_files:
+            if file_path.endswith(".py") and "deterministic_metrics.py" not in file_path:
+                source_code_parts.append(self._format_code_section(file_path))
+        source_code_section = (
+            "\n".join(source_code_parts)
+            if source_code_parts
+            else "No agent source code provided."
+        )
+
+        # Current summary (compact)
+        current_summary = json.dumps(
+            self.summary_data.get("overall_summary", {}), indent=2
+        )
+
+        return self.COMPARISON_TEMPLATE.format(
+            focus_section=self._build_focus_section(),
+            baseline_id=comparison_data.get("baseline_id", "unknown"),
+            current_id=comparison_data.get("current_id", "unknown"),
+            comparison_table=comparison_table,
+            git_diff_section=git_diff_section,
+            current_summary=current_summary,
+            source_code_section=source_code_section,
         )

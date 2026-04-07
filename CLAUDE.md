@@ -54,9 +54,10 @@ my-agent/
 | Command | Purpose |
 |---------|---------|
 | `uv run agent-eval init` | Scaffold eval folder structure |
+| `uv run agent-eval run` | Full pipeline: simulate + interact + evaluate + analyze |
 | `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
 | `uv run agent-eval interact` | Run queries against a live agent endpoint (single-turn) |
-| `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
+| `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics (supports multiple `--interaction-file`) |
 | `uv run agent-eval analyze` | Generate AI-powered analysis reports |
 | `uv run agent-eval convert` | Convert ADK traces to evaluation format (used by simulate) |
 | `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
@@ -100,9 +101,25 @@ Metrics live in `eval/metrics/metric_definitions.json`. Help users write LLM-as-
 
 ## Creating Optimization Logs (Comparing Results)
 
-When users run evaluations on baseline vs optimized code, help them create an **OPTIMIZATION_LOG.md**. Save to: `eval/results/OPTIMIZATION_LOG.md`
+The `analyze` command **automatically** creates and maintains `OPTIMIZATION_LOG.md` in the parent results directory. Every time you run `analyze`, it:
+- First run: creates a baseline entry (Iteration 1)
+- Subsequent runs: auto-detects the previous run, computes deltas, and appends a new iteration with metric changes, git diff info, and Gemini's comparison summary
 
-Use this prompt structure:
+```bash
+# First run — creates baseline entry
+uv run agent-eval analyze --results-dir eval/results/baseline --agent-dir ./my_agent
+
+# Second run — auto-compares to baseline, appends Iteration 2
+uv run agent-eval analyze --results-dir eval/results/v2 --agent-dir ./my_agent
+
+# Override which run to compare against
+uv run agent-eval analyze --results-dir eval/results/v3 --compare-to eval/results/v1
+
+# Highlight specific metrics in the terminal table
+uv run agent-eval analyze --results-dir eval/results/v2 --focus "latency, cache"
+```
+
+**For manual optimization logs** (e.g., when using an AI assistant to create a more detailed log), use this prompt structure:
 
 ```text
 Role: You are a Senior Agent Architect and QA Analyst.

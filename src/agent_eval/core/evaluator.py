@@ -4,12 +4,13 @@ import json
 import logging
 import math
 import os
+import subprocess
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 from google.cloud import aiplatform
@@ -202,6 +203,23 @@ def filter_metrics_by_criteria(
     return filtered
 
 
+def _get_git_info() -> dict:
+    """Capture current git state for comparison across runs."""
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True
+        ).stdout.strip()
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        return {"commit": commit, "branch": branch, "dirty": bool(dirty)}
+    except Exception:
+        return {}
+
+
 def save_metrics_summary(
     df: pd.DataFrame,
     results_dir: Path,
@@ -223,6 +241,7 @@ def save_metrics_summary(
     grouped = df.groupby("question_id")
     all_question_summaries = []
     per_metric_scores = defaultdict(list)
+    adk_sourced_metrics = set()  # Track metrics from ADK's built-in eval
 
     for question_id, group in grouped:
         group["eval_results"] = group["eval_results"].apply(robust_json_loads)
@@ -233,6 +252,11 @@ def save_metrics_summary(
             for metric, val in result_dict.items():
                 if not isinstance(val, dict):
                     continue
+
+                # Track ADK-sourced metrics separately
+                if val.get("_adk_source"):
+                    adk_sourced_metrics.add(metric)
+
                 is_det = metric in DETERMINISTIC_METRICS or any(
                     metric.endswith(f"_{k}") for k in DETERMINISTIC_METRICS
                 )
@@ -282,10 +306,15 @@ def save_metrics_summary(
             "deterministic_metrics": det_metrics,
             "llm_metrics": llm_metrics,
         }
+        # Include source_type when available (simulation vs interaction)
+        if "source_type" in group.columns:
+            source_type = group.iloc[0].get("source_type")
+            if source_type:
+                summary["source_type"] = source_type
         summary.update(metadata)
         all_question_summaries.append(summary)
 
-    det_summary, llm_summary = {}, {}
+    det_summary, llm_summary, adk_summary = {}, {}, {}
     for metric, scores in per_metric_scores.items():
         if not scores:
             continue
@@ -294,6 +323,10 @@ def save_metrics_summary(
             det_summary[metric] = avg
         elif metric in DETERMINISTIC_METRICS:
             continue
+        elif metric in adk_sourced_metrics:
+            # ADK's built-in eval scores (hallucination, safety from eval_config.json)
+            # are kept separate from agent-eval's LLM-as-judge metrics
+            adk_summary[metric] = {"average": avg}
         else:
             # Include score_range if available
             metric_data = {"average": avg}
@@ -306,12 +339,48 @@ def save_metrics_summary(
         "run_type": run_type,
         "test_description": test_description,
         "interaction_datetime": datetime.now().isoformat(),
+        "git_info": _get_git_info(),
         "overall_summary": {
             "deterministic_metrics": det_summary,
             "llm_based_metrics": llm_summary,
         },
         "per_question_summary": all_question_summaries,
     }
+
+    # ADK's built-in eval scores (from eval_config.json criteria) are separate
+    # from agent-eval's LLM-as-judge metrics. Only include if present.
+    if adk_summary:
+        output["overall_summary"]["adk_eval_scores"] = adk_summary
+
+    # Per-source breakdown (only when multiple source types present)
+    if "source_type" in df.columns:
+        source_types = df["source_type"].dropna().unique()
+        if len(source_types) > 1:
+            per_source_summary = {}
+            for src in source_types:
+                src_df = df[df["source_type"] == src]
+                src_metric_scores = defaultdict(list)
+                src_grouped = src_df.groupby("question_id")
+                for qid, group in src_grouped:
+                    eval_results = group["eval_results"].apply(robust_json_loads)
+                    for result_dict in eval_results.dropna():
+                        if not isinstance(result_dict, dict):
+                            continue
+                        for metric, val in result_dict.items():
+                            if not isinstance(val, dict) or "score" not in val or val["score"] is None:
+                                continue
+                            try:
+                                s = float(val["score"])
+                                if not math.isnan(s):
+                                    src_metric_scores[metric].append(s)
+                            except (ValueError, TypeError):
+                                pass
+                per_source_summary[src] = {
+                    metric: {"average": round(sum(scores) / len(scores), 4), "count": len(scores)}
+                    for metric, scores in src_metric_scores.items() if scores
+                }
+            output["per_source_summary"] = per_source_summary
+
     with open(results_dir / "eval_summary.json", "w") as f:
         json.dump(output, f, indent=4, default=str)
     logger.info(f"Metrics summary saved to {results_dir / 'eval_summary.json'}")
@@ -329,25 +398,37 @@ class Evaluator:
         aiplatform.init(project=self.project_id, location=self.location)
         self.client = Client(project=self.project_id, location=self.location)
 
-    def evaluate(self, interaction_file: Path, metrics_files: List[str], results_dir: Path):
-        logger.info(f"Starting evaluation on {interaction_file}")
+    def evaluate(self, metrics_files: List[str], results_dir: Path,
+                 interaction_files: Union[List[Path], Path, None] = None,
+                 interaction_file: Optional[Path] = None):
+        # Backward compat: accept singular interaction_file
+        if interaction_files is None and interaction_file is not None:
+            interaction_files = [interaction_file]
+        elif isinstance(interaction_files, Path):
+            interaction_files = [interaction_files]
+        if not interaction_files:
+            raise ValueError("No interaction files provided.")
 
-        # Load Data - support both CSV and JSONL formats
-        file_ext = interaction_file.suffix.lower()
-        if file_ext == '.jsonl':
-            # JSONL format: use standard json module to avoid ujson "Value is too big" errors
-            # with large response payloads (e.g., retail AI full analysis)
-            from agent_eval.core.converters import read_jsonl
-            records = read_jsonl(str(interaction_file))
-            interaction_results = pd.DataFrame(records)
-            # Ensure question_id is string
-            if 'question_id' in interaction_results.columns:
-                interaction_results['question_id'] = interaction_results['question_id'].astype(str)
-            is_jsonl = True
-        else:
-            # CSV format: nested structures are JSON strings
-            interaction_results = pd.read_csv(interaction_file, dtype={"question_id": str})
-            is_jsonl = False
+        logger.info(f"Starting evaluation on {len(interaction_files)} file(s)")
+
+        # Load Data - support both CSV and JSONL formats, multiple files
+        all_dfs = []
+        is_jsonl = False
+        for ifile in interaction_files:
+            logger.info(f"Loading interaction data from {ifile}")
+            file_ext = ifile.suffix.lower()
+            if file_ext == '.jsonl':
+                from agent_eval.core.converters import read_jsonl
+                records = read_jsonl(str(ifile))
+                df = pd.DataFrame(records)
+                if 'question_id' in df.columns:
+                    df['question_id'] = df['question_id'].astype(str)
+                is_jsonl = True
+            else:
+                df = pd.read_csv(ifile, dtype={"question_id": str})
+            all_dfs.append(df)
+
+        interaction_results = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
 
         results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -492,18 +573,20 @@ class Evaluator:
         final_df = original_df.copy()
         eval_results_list = [{} for _ in range(len(final_df))]
 
-        # Add Pre-calculated ADK scores from simulation (if present)
+        # Add Pre-calculated ADK scores from simulation (if present).
+        # These are tagged with _adk_source so save_metrics_summary can
+        # separate them from agent-eval's own LLM-as-judge metrics.
         adk_score_cols = [c for c in original_df.columns if c.startswith("adk_score.")]
         for col in adk_score_cols:
             metric_name = col.replace("adk_score.", "")
             for idx, val in original_df[col].items():
                 if idx < len(eval_results_list):
-                    # Handle potential NaN values from pandas
                     try:
                         if pd.notna(val):
                             eval_results_list[idx][metric_name] = {
                                 "score": float(val),
-                                "explanation": "Extracted from ADK simulation history."
+                                "explanation": "Extracted from ADK simulation history.",
+                                "_adk_source": True,
                             }
                     except (ValueError, TypeError):
                         continue

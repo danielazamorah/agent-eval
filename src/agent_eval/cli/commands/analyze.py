@@ -1,14 +1,17 @@
 """agent-eval analyze — generate reports and AI-powered root cause analysis."""
 
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import click
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.table import Table
 
 from agent_eval.core.analyzer import Analyzer
 
@@ -33,25 +36,220 @@ def _display_analysis(results_dir: str) -> None:
     console.print(Rule(style="magenta"))
 
 
+def _display_metrics_table(
+    current_summary: dict,
+    comparison_data: Optional[dict] = None,
+    focus: Optional[str] = None,
+) -> None:
+    """Display a Rich table of metrics with optional delta columns.
+
+    Shows all metrics. When --focus contains metric name substrings,
+    matching rows are highlighted in bold for easy screenshotting.
+    """
+    overall = current_summary.get("overall_summary", {})
+    det_metrics = overall.get("deterministic_metrics", {})
+    llm_metrics = overall.get("llm_based_metrics", {})
+
+    if not det_metrics and not llm_metrics:
+        return
+
+    # Parse focus keywords for highlighting
+    focus_keywords = []
+    if focus:
+        focus_keywords = [k.strip().lower() for k in focus.split(",")]
+
+    def _is_focused(metric_name: str) -> bool:
+        if not focus_keywords:
+            return False
+        name_lower = metric_name.lower()
+        return any(kw in name_lower for kw in focus_keywords)
+
+    # Build delta lookup from comparison data
+    delta_lookup = {}
+    if comparison_data:
+        for d in comparison_data.get("deltas", []):
+            delta_lookup[d["metric"]] = d
+
+    has_comparison = bool(delta_lookup)
+
+    # Determine table title
+    run_name = current_summary.get("experiment_id", "current")
+    if has_comparison:
+        baseline_name = comparison_data.get("baseline_id", "baseline")
+        title = f"Evaluation Results: {run_name} vs {baseline_name}"
+    else:
+        title = f"Evaluation Results: {run_name}"
+
+    table = Table(title=title, border_style="blue", padding=(0, 2))
+    table.add_column("Metric", style="bold")
+    if has_comparison:
+        table.add_column("Baseline", justify="right")
+    table.add_column("Current", justify="right")
+    if has_comparison:
+        table.add_column("Change", justify="right")
+
+    def _format_value(val, metric_name: str = "") -> str:
+        """Format a metric value for display."""
+        if isinstance(val, float):
+            # Use the last segment of dotted metric names for format detection
+            # e.g., "tool_success_rate.total_tool_calls" → "total_tool_calls"
+            field_name = metric_name.rsplit(".", 1)[-1] if "." in metric_name else metric_name
+            if field_name.endswith("_rate") or field_name.endswith("_ratio") or field_name == "reasoning_ratio":
+                return f"{val:.0%}"
+            elif "cost" in field_name:
+                return f"${val:.4f}"
+            elif "seconds" in field_name or "latency" in field_name:
+                return f"{val:.2f}s"
+            elif val == int(val):
+                return f"{int(val):,}"
+            else:
+                return f"{val:.2f}"
+        return str(val)
+
+    def _add_metric_row(metric_name: str, current_val, metric_type: str = "deterministic"):
+        focused = _is_focused(metric_name)
+        delta = delta_lookup.get(metric_name)
+
+        # Format current value
+        if metric_type == "llm" and isinstance(current_val, dict):
+            avg = current_val.get("average", 0)
+            sr = current_val.get("score_range", {})
+            max_v = sr.get("max", 5) if sr else 5
+            current_str = f"{avg:.2f}/{max_v}"
+            current_num = avg
+        else:
+            current_str = _format_value(current_val, metric_name)
+            current_num = current_val
+
+        # Style for focused rows
+        name_style = "bold cyan" if focused else ""
+        val_style = "bold" if focused else ""
+        marker = " ★" if focused else ""
+
+        row = [f"[{name_style}]{metric_name}{marker}[/]" if name_style else metric_name]
+
+        if has_comparison and delta:
+            baseline_val = delta["baseline"]
+            if metric_type == "llm":
+                sr = (current_val if isinstance(current_val, dict) else {}).get("score_range", {})
+                max_v = sr.get("max", 5) if sr else 5
+                baseline_str = f"{baseline_val:.2f}/{max_v}"
+            else:
+                baseline_str = _format_value(baseline_val, metric_name)
+            row.append(f"[{val_style}]{baseline_str}[/]" if val_style else baseline_str)
+            row.append(f"[{val_style}]{current_str}[/]" if val_style else current_str)
+
+            # Change column with emoji
+            emoji = delta["emoji"]
+            pct = delta["pct_change"]
+            direction = delta["direction"]
+
+            if direction == "improvement":
+                color = "green"
+            elif direction == "regression":
+                color = "red"
+            else:
+                color = "dim"
+
+            change_str = f"{emoji} [{color}]{pct:+.1f}%[/]"
+            if focused:
+                change_str = f"[bold]{change_str}[/]"
+            row.append(change_str)
+        elif has_comparison:
+            # No delta for this metric (new or not comparable)
+            row.append("—")
+            row.append(f"[{val_style}]{current_str}[/]" if val_style else current_str)
+            row.append("[dim]NEW[/]")
+        else:
+            # No comparison at all
+            row.append(f"[{val_style}]{current_str}[/]" if val_style else current_str)
+
+        table.add_row(*row)
+
+    # Add deterministic metrics
+    for metric_name, val in sorted(det_metrics.items()):
+        _add_metric_row(metric_name, val, "deterministic")
+
+    # Separator between deterministic and LLM metrics
+    if det_metrics and llm_metrics:
+        sep = ["[dim]─── LLM Metrics ───[/]"]
+        if has_comparison:
+            sep.extend(["", "", ""])
+        else:
+            sep.append("")
+        table.add_row(*sep)
+
+    # Add LLM metrics
+    for metric_name, val in sorted(llm_metrics.items()):
+        _add_metric_row(metric_name, val, "llm")
+
+    console.print()
+    console.print(table)
+
+    # Summary line for comparisons
+    if has_comparison and comparison_data.get("deltas"):
+        deltas = comparison_data["deltas"]
+        improvements = sum(1 for d in deltas if d["direction"] == "improvement")
+        regressions = sum(1 for d in deltas if d["direction"] == "regression")
+        neutral = sum(1 for d in deltas if d["direction"] == "neutral")
+        console.print()
+        console.print(
+            f"  {improvements} 🟢 improvements, "
+            f"{regressions} 🔴 regressions, "
+            f"{neutral} ⚪ neutral"
+        )
+
+
 @click.command()
 @click.option("--results-dir", required=True, help="Directory containing evaluation results.")
 @click.option("--agent-dir", default=None, help="Path to agent directory (for source code context).")
+@click.option("--compare-to", default=None,
+              help="Previous run's results dir for comparison (auto-detected if omitted).")
+@click.option("--focus", default=None,
+              help="Developer focus: metric names to highlight + analysis priority (e.g., 'latency, cache efficiency').")
 @click.option("--strategy-file", default=None, help="Path to optimization strategy Markdown file.")
 @click.option("--report-audience", default=None, help="Target audience for the analysis report.")
 @click.option("--report-tone", default=None, help="Tone of the analysis report.")
 @click.option("--report-length", default=None, help="Length of the analysis report.")
-@click.option("--model", default="gemini-3-pro-preview", help="Gemini model for analysis.")
+@click.option("--model", default="gemini-3.1-pro-preview", help="Gemini model for analysis.")
 @click.option("--location", default=None, help="Vertex AI location (e.g. us-central1, global).")
 @click.option("--skip-gemini", is_flag=True, help="Skip AI-powered analysis.")
 @click.option("--gcs-bucket", default=None, help="GCS bucket for upload.")
-def analyze(results_dir, agent_dir, strategy_file, report_audience, report_tone,
-            report_length, model, location, skip_gemini, gcs_bucket):
-    """Analyze evaluation results and generate reports."""
+def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_audience,
+            report_tone, report_length, model, location, skip_gemini, gcs_bucket):
+    """Analyze evaluation results and generate reports.
+
+    \b
+    Compares metrics across runs, generates AI-powered root cause analysis,
+    and maintains a cumulative OPTIMIZATION_LOG.md.
+
+    \b
+    Features:
+      - Auto-detects the previous run for comparison (override with --compare-to)
+      - Highlights developer priorities with --focus
+      - Tracks code changes via git diff between runs
+      - Displays a screenshot-friendly metrics table in the terminal
+
+    \b
+    Examples:
+      # Basic analysis (auto-compares to previous run if available)
+      uv run agent-eval analyze --results-dir eval/results/baseline --agent-dir ./my_agent
+
+    \b
+      # With developer focus (highlights specific metrics)
+      uv run agent-eval analyze --results-dir eval/results/v2 --focus "latency, cache"
+
+    \b
+      # Compare to a specific previous run
+      uv run agent-eval analyze --results-dir eval/results/v3 --compare-to eval/results/v1
+    """
     console.print("\n[bold blue]Analyzing Results[/]")
 
     config = {
         "results_dir": results_dir,
         "agent_dir": agent_dir,
+        "compare_to": compare_to,
+        "focus": focus,
         "model": model,
         "location": location,
         "skip_gemini": skip_gemini,
@@ -65,25 +263,48 @@ def analyze(results_dir, agent_dir, strategy_file, report_audience, report_tone,
     analyzer = Analyzer(config)
 
     try:
-        analyzer.run()
+        analysis_result = analyzer.run()
     except Exception as e:
         console.print(f"\n[bold red]Error during analysis:[/] {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
-    # ── Display the analysis ───────────────────────────────────────────
+    # ── Display metrics table ─────────────────────────────────────────
+    if analysis_result and analysis_result.get("current_summary"):
+        _display_metrics_table(
+            analysis_result["current_summary"],
+            analysis_result.get("comparison_data"),
+            focus,
+        )
+
+    # ── Display the AI analysis ───────────────────────────────────────
     _display_analysis(results_dir)
 
     # ── Done ───────────────────────────────────────────────────────────
     cwd = Path.cwd()
     rel_results = os.path.relpath(results_dir, cwd)
 
-    console.print(Panel(
-        f"[bold green]Analysis complete![/]\n\n"
-        f"[bold]Saved to:[/]  {rel_results}/gemini_analysis.md\n\n"
-        "[bold]All result files:[/]\n"
-        f"  {rel_results}/eval_summary.json         — Aggregated metrics\n"
-        f"  {rel_results}/gemini_analysis.md         — AI diagnosis (shown above)\n"
+    output_files = [
+        f"  {rel_results}/eval_summary.json         — Aggregated metrics",
+        f"  {rel_results}/gemini_analysis.md         — AI diagnosis (shown above)",
         f"  {rel_results}/question_answer_log.md     — Per-question breakdown",
+    ]
+
+    if analysis_result and analysis_result.get("optimization_log_path"):
+        rel_log = os.path.relpath(analysis_result["optimization_log_path"], cwd)
+        output_files.append(f"  {rel_log}  — Cumulative comparison log")
+
+    comparison_info = ""
+    if analysis_result and analysis_result.get("comparison_data"):
+        baseline_id = analysis_result["comparison_data"].get("baseline_id", "previous")
+        comparison_info = f"\n[bold]Compared to:[/]  {baseline_id}\n"
+
+    console.print(Panel(
+        f"[bold green]Analysis complete![/]\n"
+        f"{comparison_info}\n"
+        f"[bold]Saved to:[/]\n"
+        + "\n".join(output_files),
         title="[bold]Done[/]",
         border_style="green",
         padding=(1, 2),

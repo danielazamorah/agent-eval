@@ -63,7 +63,7 @@ The repository contains the `agent-eval` CLI package and example agents, each wi
 agent-eval/
 ├── pyproject.toml                       # agent-eval CLI tool
 ├── uv.lock
-├── docs/tutorial/example_agents/
+├── tutorial/example_agents/
 │   ├── customer-service/                # Example: multi-turn agent
 │   │   ├── pyproject.toml
 │   │   └── uv.lock
@@ -119,6 +119,7 @@ You can define **custom metrics** with your own scoring rubrics — see [Creatin
 | Command | Purpose | Mode |
 |---------|---------|------|
 | \`uv run agent-eval init` | Scaffold eval folder structure | Setup |
+| \`uv run agent-eval run` | Full pipeline: simulate + interact + evaluate + analyze | Both |
 | \`uv run agent-eval simulate` | Run ADK User Sim + convert traces | ADK User Sim |
 | \`uv run agent-eval interact` | Run interactions against live agent | DIY Interactions |
 | \`uv run agent-eval evaluate` | Run metrics on interactions | Both |
@@ -141,6 +142,42 @@ uv run agent-eval init
 | `--mode` | (prompted) | Interaction mode: `user-sim`, `diy`, or `both` |
 | `--auto-approve`, `-y` | `false` | Skip interactive prompts, use defaults |
 
+### \`uv run agent-eval run`
+
+Orchestrates the full evaluation pipeline in a single command: simulate, interact, evaluate, and analyze. By default, all four phases run. If the agent is not reachable at `--base-url`, the interact phase is skipped gracefully.
+
+```bash
+# Full pipeline (simulate + interact + evaluate + analyze)
+uv run agent-eval run --agent-dir agents/my-agent/app
+
+# Skip interact (simulation only)
+uv run agent-eval run --agent-dir agents/my-agent/app --no-interact
+
+# With focus highlighting in analysis
+uv run agent-eval run --agent-dir agents/my-agent/app --focus "latency, cache"
+```
+
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `--agent-dir` | Yes | — | Path to agent module directory (containing agent.py) |
+| `--eval-dir` | No | (auto-detected) | Path to eval/ directory |
+| `--run-id` | No | (prompted, or timestamp) | Name for the results folder |
+| `--simulate/--no-simulate` | No | `--simulate` | Run ADK User Sim scenarios |
+| `--interact/--no-interact` | No | `--interact` | Run DIY interactions against live agent (skipped gracefully if unreachable) |
+| `--base-url` | No | `http://localhost:8501` | Agent API URL for interact mode |
+| `--evaluate/--no-evaluate` | No | `--evaluate` | Run evaluation metrics after collecting data |
+| `--analyze/--no-analyze` | No | `--analyze` | Run AI-powered analysis after evaluation |
+| `--focus` | No | — | Developer focus for analysis: metric names to highlight (e.g., `"latency, cache"`) |
+| `--skip-gemini` | No | `false` | Skip AI-powered analysis in the analyze phase |
+| `--app-name` | No | dir name | Agent app name for interact |
+| `--questions-file` | No | auto-detected | Golden dataset JSON for interact mode |
+| `--num-questions` | No | `-1` (all) | Limit number of questions for interact |
+| `--skip-traces` | No | `false` | Skip trace retrieval in interact mode |
+
+**Graceful fallback:** If the agent is not reachable at `--base-url`, the interact phase is skipped automatically and the pipeline continues with simulation data. If simulate fails but interact succeeds, evaluation proceeds with interaction data only.
+
+**Output:** All interaction files are saved to `eval/results/<run-id>/raw/`, evaluation results and analysis go to `eval/results/<run-id>/`.
+
 ### \`uv run agent-eval simulate`
 
 Runs the full ADK User Sim workflow in a single command: creates symlinks so ADK can find scenario files, clears previous traces, sets up a fresh eval set, runs the simulation, and converts traces to agent-eval format.
@@ -153,6 +190,7 @@ uv run agent-eval simulate --agent-dir <path-to-agent-module>
 |--------|----------|---------|-------------|
 | `--agent-dir` | Yes | — | Path to agent module directory (containing agent.py) |
 | `--eval-dir` | No | (auto-detected) | Path to eval/ directory |
+| `--run-id` | No | (prompted, or timestamp) | Name for the results folder (e.g., "baseline") |
 
 **What it does (5 steps):**
 
@@ -228,9 +266,19 @@ uv run agent-eval evaluate \
   --results-dir <path-to-results>
 ```
 
+**Combining simulation + DIY results:** Specify `--interaction-file` multiple times to evaluate both data sources together:
+
+```bash
+uv run agent-eval evaluate \
+  --interaction-file results/run1/raw/processed_interaction_sim.jsonl \
+  --interaction-file results/run1/raw/processed_interaction_app.jsonl \
+  --metrics-files eval/metrics/metric_definitions.json \
+  --results-dir results/run1
+```
+
 | Option | Required | Description |
 |--------|----------|-------------|
-| `--interaction-file` | Yes | Path to processed JSONL |
+| `--interaction-file` | Yes | Path to processed JSONL or CSV (can specify multiple times) |
 | `--metrics-files` | Yes | Metric definition JSON (can specify multiple) |
 | `--results-dir` | Yes | Output directory (use same timestamp folder) |
 | `--input-label` | No | Run label (e.g., "baseline") |
@@ -240,24 +288,49 @@ uv run agent-eval evaluate \
 
 ### \`uv run agent-eval analyze`
 
-Generates reports and AI-powered root cause analysis.
+Generates reports and AI-powered root cause analysis. Automatically compares against the previous evaluation run, displays a terminal metrics table, and maintains a cumulative `OPTIMIZATION_LOG.md`.
 
 ```bash
-uv run agent-eval analyze \
-  --results-dir <path-to-results> \
-  --agent-dir <path-to-agent>
+# Basic analysis (auto-compares to previous run if available)
+uv run agent-eval analyze --results-dir eval/results/baseline --agent-dir ./my_agent
+
+# With developer focus (highlights specific metrics)
+uv run agent-eval analyze --results-dir eval/results/v2 --focus "latency, cache"
+
+# Compare to a specific previous run
+uv run agent-eval analyze --results-dir eval/results/v3 --compare-to eval/results/v1
 ```
 
 | Option | Required | Default | Description |
 |--------|----------|---------|-------------|
 | `--results-dir` | Yes | — | Directory with eval results |
 | `--agent-dir` | No | — | Agent source (adds context to AI analysis) |
+| `--compare-to` | No | (auto-detected) | Previous run's results dir for comparison |
+| `--focus` | No | — | Metric names to highlight + analysis priority (e.g., `"latency, cache"`) |
 | `--strategy-file` | No | — | Optimization strategy markdown |
-| `--model` | No | `gemini-2.5-pro` | Gemini model for analysis |
-| `--location` | No | — | Vertex AI region (use `global` for Gemini 2.5) |
+| `--report-audience` | No | — | Target audience for the analysis report |
+| `--report-tone` | No | — | Tone of the analysis report |
+| `--report-length` | No | — | Length of the analysis report |
+| `--model` | No | `gemini-3.1-pro-preview` | Gemini model for analysis |
+| `--location` | No | `global` | Vertex AI region (use `global` for Gemini 3+ models) |
 | `--skip-gemini` | No | `false` | Skip AI analysis |
+| `--gcs-bucket` | No | — | GCS bucket for upload |
 
-**Output:** `question_answer_log.md`, `gemini_analysis.md`
+**Output:** `question_answer_log.md`, `gemini_analysis.md`, `OPTIMIZATION_LOG.md` (in parent results dir)
+
+#### Comparing Runs
+
+The analyze command automatically compares your current evaluation against the most recent previous run in the same results directory. This powers three features:
+
+1. **Terminal metrics table** — A Rich table showing all metrics with baseline, current, and change columns. Metrics matching `--focus` keywords are highlighted in bold cyan with a ★ marker, making the table screenshot-friendly for sharing with leadership.
+
+2. **Two Gemini calls** — Call 1 diagnoses the current run. Call 2 analyzes *what changed* between runs: which code changes (via `git diff`) caused which metric movements. Both are combined into `gemini_analysis.md`.
+
+3. **OPTIMIZATION_LOG.md** — A cumulative log in the parent results directory. The first run creates a baseline entry; subsequent runs append iterations with metric deltas (🟢 improvement / 🔴 regression / ⚪ neutral), git info, and Gemini's comparison summary.
+
+**Direction classification:** Metrics are classified as "lower is better" (tokens, latency, cost, failed calls) or "higher is better" (quality scores, cache hit rate). Changes under 1% are marked neutral.
+
+**Override auto-detection:** Use `--compare-to` to compare against a specific previous run instead of the most recent one.
 
 ### \`uv run agent-eval create-dataset`
 
@@ -492,6 +565,43 @@ Use `:` to access nested fields within JSON responses:
 }
 ```
 
+### Custom Placeholder Names
+
+You are **not limited** to `prompt`, `response`, and `reference`. Any valid Python identifier works as a placeholder name. Each key in `dataset_mapping` becomes a column that's substituted into `{key}` in your template:
+
+```json
+"dataset_mapping": {
+  "prompt": {"source_column": "user_inputs"},
+  "response": {"source_column": "final_response"},
+  "tool_calls": {"source_column": "extracted_data:tool_interactions"},
+  "available_tools": {"source_column": "extracted_data:tool_declarations"}
+},
+"template": "Request: {prompt}\nTools available: {available_tools}\nCalls made: {tool_calls}\nResponse: {response}\n\nScore: [0-5]"
+```
+
+> **Note:** `prompt` and `response` are auto-populated from `user_inputs` and `final_response` if you don't include them in `dataset_mapping`. All other placeholders must be explicitly mapped.
+
+### Combining Multiple Columns (Meta-Columns)
+
+To merge several source columns into a single placeholder, use the `template` + `source_columns` syntax instead of `source_column`:
+
+```json
+"dataset_mapping": {
+  "prompt": {"source_column": "user_inputs"},
+  "combined_context": {
+    "template": "Agent reasoning: {agent_reasoning}\nSearch output: {extracted_data_search_results}",
+    "source_columns": ["agent_reasoning", "extracted_data:search_results"]
+  }
+},
+"template": "Evaluate the agent's analysis.\n\nUser: {prompt}\n\n{combined_context}\n\nScore: [0-5]"
+```
+
+**Rules for meta-columns:**
+- `source_columns` lists the columns to pull values from
+- `template` is a Python format string with `{variable}` placeholders
+- Colons in source column names are replaced with underscores in the template variables (e.g., `extracted_data:search_results` → `{extracted_data_search_results}`)
+- Placeholder names must be valid Python identifiers (letters, digits, underscores only — no hyphens or dots)
+
 ### Tips for Custom Metrics
 
 1. **Be specific** — Define exactly what each score level means
@@ -616,6 +726,12 @@ Primary output with aggregated metrics:
   "experiment_id": "eval-20260127_143022",
   "run_type": "baseline",
   "test_description": "Baseline evaluation",
+  "interaction_datetime": "2026-01-27T14:30:22.123456",
+  "git_info": {
+    "commit": "a1b2c3d4e5f6...",
+    "branch": "main",
+    "dirty": false
+  },
   "overall_summary": {
     "deterministic_metrics": {
       "token_usage.total_tokens": 15420,
@@ -630,6 +746,7 @@ Primary output with aggregated metrics:
   "per_question_summary": [
     {
       "question_id": "scenario_001",
+      "source_type": "simulation",
       "deterministic_metrics": {},
       "llm_metrics": {
         "trajectory_accuracy": {
@@ -639,9 +756,28 @@ Primary output with aggregated metrics:
         }
       }
     }
-  ]
+  ],
+  "per_source_summary": {
+    "simulation": {
+      "trajectory_accuracy": {"average": 4.2, "count": 5}
+    },
+    "interaction": {
+      "trajectory_accuracy": {"average": 3.8, "count": 3}
+    }
+  }
 }
 ```
+
+> **`git_info`**: Captured automatically during `evaluate`. Records the git commit hash, branch, and whether there were uncommitted changes (`dirty: true`). This is used by `analyze` to run `git diff` between runs and explain *what code changes* caused metric improvements or regressions. **For this to be meaningful, commit your agent changes before each evaluation run.** If `dirty` is `true`, the diff may not fully represent what was evaluated. An easy workflow:
+>
+> 1. Make changes to your agent code
+> 2. `git commit` the changes
+> 3. Run `evaluate` (or `run`) — the commit hash is captured
+> 4. Run `analyze` — it auto-detects the previous run and diffs the two commits
+>
+> If you're not in a git repo or git is unavailable, `git_info` will be an empty object and comparison will still work (just without code diffs).
+
+> **`source_type`**: Appears in per-question summaries when records include it (simulation or interaction). `per_source_summary` is only generated when evaluating multiple data sources together (e.g., combining `--interaction-file` from both `simulate` and `interact` outputs). It shows per-source metric averages alongside the overall summary.
 
 ### gemini_analysis.md
 
@@ -748,6 +884,7 @@ The evaluation pipeline produces JSONL with these fields:
 | Field | Description | Used By |
 |-------|-------------|---------|
 | `question_id` | Unique test case ID | All metrics |
+| `source_type` | `"simulation"` or `"interaction"` — identifies data origin | Per-source summaries, filtering |
 | `user_inputs` | User messages (JSON list) | LLM metrics |
 | `final_response` | Agent's final response (text or JSON) | LLM metrics |
 | `reference_data` | Ground truth (DIY mode) | Reference metrics |
@@ -884,6 +1021,47 @@ It prints the exact `evaluate` and `analyze` commands to run next.
 
 ---
 
+## Supported Models & Pricing
+
+### Analysis Models
+
+The `analyze` command uses Gemini to generate AI-powered root cause analysis. The default model is `gemini-3.1-pro-preview` (requires `global` region, auto-configured).
+
+| Model | Region | Status | Notes |
+|-------|--------|--------|-------|
+| `gemini-3.1-pro-preview` | `global` | **Default** | Latest Pro model |
+| `gemini-3-flash-preview` | `global` | Active | Faster, lower cost |
+| `gemini-2.5-pro` | `us-central1` | Sunsetting June 2026 | Use `--location us-central1` |
+| `gemini-2.5-flash` | `us-central1` | Sunsetting June 2026 | Use `--location us-central1` |
+
+Override with `--model` and `--location`:
+```bash
+uv run agent-eval analyze --results-dir eval/results/v2 --model gemini-3-flash-preview
+```
+
+### Cost Estimation Pricing
+
+The `evaluate` command estimates per-run cost using model pricing stored in `src/agent_eval/core/deterministic_metrics.py` (`MODEL_PRICING` dict). The pricing table uses list prices per 1K tokens for the standard tier (prompts ≤ 200K tokens).
+
+**Maintainer note:** This table must be updated when:
+- New models are released (add their pricing)
+- Models are deprecated or shut down (keep for backward compat with old traces)
+- Google updates pricing tiers
+
+Current pricing (April 2026):
+
+| Model | Input / 1M tokens | Output / 1M tokens |
+|-------|-------------------|-------------------- |
+| `gemini-3.1-pro` | $2.00 | $12.00 |
+| `gemini-3-flash` | $0.50 | $3.00 |
+| `gemini-2.5-pro` | $1.25 | $10.00 |
+| `gemini-2.5-flash` | $0.30 | $2.50 |
+| `gemini-2.0-flash` | $0.15 | $0.60 |
+
+Source: [Vertex AI Generative AI Pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing)
+
+---
+
 ## Troubleshooting
 
 ### "ModuleNotFoundError: No module named '...'"
@@ -921,10 +1099,10 @@ gcloud auth application-default set-quota-project $GOOGLE_CLOUD_PROJECT
 **Cause:** Using `GOOGLE_API_KEY` instead of Vertex AI.
 **Fix:** Remove `GOOGLE_API_KEY`, set `GOOGLE_CLOUD_PROJECT` instead.
 
-### Gemini 2.5 model location errors
+### Gemini model location errors
 
-**Cause:** Model not available in specified region.
-**Fix:** Use `--location global` in the analyze command.
+**Cause:** Gemini 3+ and 2.5 models require specific regions.
+**Fix:** Use `--location global` for Gemini 3+ models. The default (`gemini-3.1-pro-preview`) auto-configures to `global`.
 
 ### Trajectory accuracy penalizing for missing tools
 
@@ -952,28 +1130,11 @@ Do NOT penalize the agent for correctly relaying mock data.
 
 ### ADK UserSim: "Error rendering metric prompt template" during `adk eval`
 
-**Cause:** ADK UserSim runs a built-in evaluation by default after the simulation completes. If no eval config file is provided, the default metrics may fail. This does not affect the simulation runs themselves — the agent interactions and traces are captured successfully. `agent-eval` runs its own separate evaluation step using the Vertex AI SDK.
-**Fix:** The `simulate` command auto-creates a default `eval_config.json` if one doesn't exist. If running ADK manually, provide an eval config file:
+**Cause:** ADK runs its own built-in LLM-as-judge evaluation per interaction during `adk eval`. This is separate from `agent-eval`'s evaluation (which runs in batch via the Vertex AI Evaluation SDK). ADK's per-interaction scoring is slow and unnecessary when using `agent-eval`.
 
-```bash
-uv run adk eval my_agent --config_file_path my_agent/eval_config.json eval_set_name
-```
+**Fix:** The `simulate` command defaults to an empty `eval_config.json` (`{"criteria": {}`), which skips ADK's built-in scoring entirely. The agent interactions and traces are still captured — only ADK's own LLM scoring is skipped.
 
-If you need to create one manually (e.g., `eval/scenarios/eval_config.json`):
-
-```json
-{
-  "criteria": {
-    "hallucinations_v1": {
-      "threshold": 0.5,
-      "evaluate_intermediate_nl_responses": true
-    },
-    "safety_v1": {
-      "threshold": 0.8
-    }
-  }
-}
-```
+If you see old results with ADK scores, they appear in a separate `adk_eval_scores` section in `eval_summary.json` and are not mixed with `agent-eval`'s LLM-as-judge metrics.
 
 For more details, see the [ADK User Simulation docs](https://google.github.io/adk-docs/evaluate/user-sim/).
 

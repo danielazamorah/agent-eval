@@ -142,7 +142,7 @@ All `uv run agent-eval` commands run from the **agent-eval repository root**. Yo
 > uvx agent-starter-pack create my-agent
 > ```
 >
-> Or to follow along with the [tutorial](docs/tutorial.md), use one of the [example agents](docs/tutorial/example_agents/).
+> Or to follow along with the [tutorial](docs/tutorial.md), use one of the [example agents](tutorial/example_agents/).
 
 ### 1. Initialize your project
 
@@ -154,42 +154,26 @@ The CLI scans for `agent.py` files and lets you select which agent to scaffold e
 
 Use `uv run agent-eval init -y` for non-interactive mode with defaults.
 
-### 2. Generate interactions
+### 2. Run the full pipeline
 
-Choose the method that fits your agent:
+The fastest way to evaluate is the `run` command — it executes all four phases in sequence with interactive prompts at each step:
+
+```bash
+uv run agent-eval run --agent-dir path/to/your/agent_module
+```
+
+This runs: **simulate** → **interact** → **evaluate** → **analyze**, prompting you for configuration at each phase. If your agent isn't reachable for live interactions, it skips gracefully.
+
+### 3. Or run individual steps
+
+You can also run each phase independently:
 
 | Method | Best for | Command |
 |--------|----------|---------|
-| **ADK User Sim** | Multi-turn conversational agents | `uv run agent-eval simulate` |
-| **DIY Interactions** | Single-turn agents, deployed endpoints | `uv run agent-eval interact` |
+| **ADK User Sim** | Multi-turn conversational agents | `uv run agent-eval simulate --agent-dir path/to/agent` |
+| **DIY Interactions** | Single-turn agents, deployed endpoints | `uv run agent-eval interact --agent-dir path/to/agent` |
 
-**ADK User Sim** (multi-turn):
-
-```bash
-# Pass the full path to your agent module (the folder with agent.py)
-uv run agent-eval simulate --agent-dir path/to/your/agent_module
-```
-
-This single command handles the full workflow: creates symlinks for ADK, clears previous traces, sets up a fresh eval set, runs the simulation, and converts traces to evaluation format.
-
-**DIY Interactions** (single-turn or live agents):
-
-```bash
-# First, start your agent (in a separate terminal):
-# ADK Starter Pack agents: cd path/to/your/agent && make playground
-# Custom agents: start your server on any port
-
-# Then run the interactive command:
-uv run agent-eval interact --agent-dir path/to/your/agent_module
-```
-
-The command prompts for any missing configuration (questions file, base URL, run ID). Pass `--base-url`, `--questions-file`, etc. to skip prompts in CI.
-
-### 3. Evaluate & Analyze
-
-> **Don't type these commands manually!** Both `simulate` and `interact` print the exact `evaluate` and `analyze` commands with the correct paths pre-filled at the end of their output. Just copy and paste them.
-
-The commands look like this:
+After generating interactions, evaluate and analyze:
 
 ```bash
 uv run agent-eval evaluate \
@@ -202,7 +186,7 @@ uv run agent-eval analyze \
   --agent-dir <path-to-agent-module>
 ```
 
-The `evaluate` command displays a metrics summary table directly in the terminal. The `analyze` command renders the full AI diagnosis report in the terminal. Results are also saved to files for deeper review.
+> **Tip:** Both `simulate` and `interact` print the exact `evaluate` and `analyze` commands with the correct paths pre-filled at the end of their output. Just copy and paste them.
 
 ---
 
@@ -211,6 +195,7 @@ The `evaluate` command displays a metrics summary table directly in the terminal
 | Command | Purpose |
 |---------|---------|
 | `uv run agent-eval init` | Scaffold eval folder structure for a new project |
+| `uv run agent-eval run` | Full pipeline: simulate + interact + evaluate + analyze |
 | `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
 | `uv run agent-eval interact` | Run interactions against a live agent endpoint (single-turn) |
 | `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics |
@@ -224,12 +209,12 @@ Run `uv run agent-eval --help` or `uv run agent-eval <command> --help` for detai
 
 ## Examples
 
-The [`docs/tutorial/example_agents/`](docs/tutorial/example_agents/) folder contains two complete agent projects with pre-configured evaluation setups:
+The [`tutorial/example_agents/`](tutorial/example_agents/) folder contains two complete agent projects with pre-configured evaluation setups:
 
 | Example | Type | Description |
 |---------|------|-------------|
-| [customer-service](docs/tutorial/example_agents/customer-service/) | Multi-turn | ADK conversational agent evaluated with User Sim |
-| [retail-ai-location-strategy](docs/tutorial/example_agents/retail-ai-location-strategy/) | Single-turn | ADK pipeline agent evaluated with DIY Interactions |
+| [customer-service](tutorial/example_agents/customer-service/) | Multi-turn | ADK conversational agent evaluated with User Sim |
+| [retail-ai-location-strategy](tutorial/example_agents/retail-ai-location-strategy/) | Single-turn | ADK pipeline agent evaluated with DIY Interactions |
 
 See the [tutorial](docs/tutorial.md) for a guided walkthrough using these examples.
 
@@ -241,7 +226,33 @@ See the [tutorial](docs/tutorial.md) for a guided walkthrough using these exampl
 |----------|----------|
 | [Reference Guide](docs/reference.md) | CLI reference, metrics deep dive, data formats, custom metrics, troubleshooting |
 | [Tutorial](docs/tutorial.md) | Step-by-step walkthrough using the example agents |
-| [Examples](docs/tutorial/example_agents/README.md) | Overview of the example agent projects |
+| [Examples](tutorial/example_agents/README.md) | Overview of the example agent projects |
+
+---
+
+## Building & Distributing
+
+To use `agent-eval` in another project without copying the full repo, build a wheel:
+
+```bash
+./build_wheel.sh
+```
+
+This produces `dist/agent_eval-<version>-py3-none-any.whl`. To install it in a downstream project:
+
+```bash
+# Copy the wheel to your project
+cp dist/agent_eval-*.whl your-project/vendor/
+
+# Install separately (do NOT add to pyproject.toml — use pip install)
+uv pip install ./vendor/agent_eval-*.whl
+```
+
+To build from source in another repo, copy these files:
+- `build_wheel.sh`
+- `pyproject.toml`
+- `src/agent_eval/`
+- `uv.lock` (optional but recommended)
 
 ---
 

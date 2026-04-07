@@ -8,28 +8,22 @@ and session state, without requiring LLM-as-judge evaluation.
 import json
 from typing import Any, Dict, List, Tuple
 
-# Pricing per 1K tokens (approximate list prices for prompts <= 200k tokens)
-# Format: {model_name: (prompt_price, completion_price)}
-# Source: https://ai.google.dev/gemini-api/docs/pricing
+# Pricing per 1K tokens (standard tier, prompts <= 200k tokens)
+# Format: {model_substring: (input_price_per_1k, output_price_per_1k)}
+# Source: https://cloud.google.com/vertex-ai/generative-ai/pricing (April 2026)
 MODEL_PRICING = {
-    # Gemini 3 (Latest Preview)
-    "gemini-3-pro-preview": (0.002, 0.012),  # $2.00 / $12.00 per 1M
-    "gemini-3-flash-preview": (0.0005, 0.003),  # $0.50 / $3.00 per 1M
-    # Gemini 2.5 (Current Flagship)
-    "gemini-2.5-pro": (0.00125, 0.01),  # $1.25 / $10.00 per 1M
-    "gemini-2.5-flash": (0.0003, 0.0025),  # $0.30 / $2.50 per 1M
-    # Gemini 2.0
-    "gemini-2.0-flash": (0.0001, 0.0004),  # $0.10 / $0.40 per 1M
-    "gemini-2.0-flash-exp": (0.0001, 0.0004),  # Same as 2.0 flash
-    "gemini-2.0-flash-lite": (0.000075, 0.0003),  # $0.075 / $0.30 per 1M
-    # Gemini 1.5 (Updated/Reduced Prices)
-    "gemini-1.5-pro": (0.00125, 0.01),  # Reduced from 0.0035/0.0105
-    "gemini-1.5-pro-001": (0.00125, 0.01),
-    "gemini-1.5-flash": (0.000075, 0.0003),  # $0.075 / $0.30 per 1M
-    "gemini-1.5-flash-001": (0.000075, 0.0003),
-    # Legacy
-    "gemini-1.0-pro": (0.0005, 0.0015),  # $0.50 / $1.50 per 1M
-    "default": (0.0001, 0.0004),  # Fallback to 2.0 Flash
+    # Gemini 3.1 (Current)
+    "gemini-3.1-pro": (0.002, 0.012),           # $2.00 / $12.00 per 1M
+    "gemini-3.1-flash-lite": (0.00025, 0.0015),  # $0.25 / $1.50 per 1M
+    # Gemini 3 (Flash still active, Pro shut down 2026-03-09)
+    "gemini-3-flash": (0.0005, 0.003),           # $0.50 / $3.00 per 1M
+    "gemini-3-pro": (0.002, 0.012),              # $2.00 / $12.00 per 1M (legacy)
+    # Gemini 2.5 (sunsetting 2026-06-17)
+    "gemini-2.5-pro": (0.00125, 0.01),           # $1.25 / $10.00 per 1M
+    "gemini-2.5-flash": (0.0003, 0.0025),        # $0.30 / $2.50 per 1M
+    # Gemini 2.0 (deprecated, sunsetting 2026-06-01)
+    "gemini-2.0-flash": (0.00015, 0.0006),       # $0.15 / $0.60 per 1M
+    "default": (0.0005, 0.003),                  # Fallback to Flash-tier pricing
 }
 
 
@@ -72,15 +66,17 @@ def calculate_token_usage(
                     llm_calls += 1
                     models_used.add(model_name)
 
-                    p_tokens = usage.get("prompt_token_count", 0)
-                    c_tokens = usage.get("candidates_token_count", 0)
-                    ch_tokens = usage.get("cached_content_token_count", 0)
-                    t_tokens = usage.get("total_token_count", 0)
+                    p_tokens = usage.get("prompt_token_count") or 0
+                    c_tokens = usage.get("candidates_token_count") or 0
+                    ch_tokens = usage.get("cached_content_token_count") or 0
+                    t_tokens = usage.get("total_token_count") or 0
 
                     total_prompt_tokens += p_tokens
                     total_completion_tokens += c_tokens
                     total_cached_tokens += ch_tokens
-                    total_tokens += t_tokens
+                    # Some models report 0 for total_token_count;
+                    # fall back to prompt + completion when that happens
+                    total_tokens += t_tokens if t_tokens else (p_tokens + c_tokens)
 
                     # Match model pricing
                     pricing = MODEL_PRICING["default"]

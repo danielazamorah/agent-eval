@@ -412,6 +412,7 @@ class AdkHistoryConverter:
                 "question_id": eval_id,
                 "session_id": session_id,
                 "base_url": "simulation",
+                "source_type": "simulation",
                 "app_name": app_name,
                 "ADK_USER_ID": user_id,
                 "status": {"boolean": "success"},

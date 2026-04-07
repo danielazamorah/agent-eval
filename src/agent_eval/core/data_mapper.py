@@ -318,26 +318,16 @@ def map_dataset_columns(
                         eval_dataset[placeholder] = val_series.apply(parse_if_needed)
                     else:
                         # Robust Flattening for custom placeholders (Templates need strings)
-                        # For grounding context, SDK expects valid JSON - use array format
-                        is_grounding_context = placeholder == "context"
-
                         def normalize_input(x):
                             if isinstance(x, list):
-                                # For grounding context, convert to JSON array (not newline-separated)
-                                # SDK's grounding API fails with "Extra data" on multiple JSON objects
-                                if is_grounding_context:
+                                if not x:
+                                    return ""
+                                # Structured data (dicts) → valid JSON array
+                                # This handles tool_interactions, grounding context, etc.
+                                if any(isinstance(item, dict) for item in x):
                                     return json.dumps(x)
-                                # For other list fields, convert each item to JSON string
-                                try:
-                                    json_items = []
-                                    for item in x:
-                                        if isinstance(item, dict):
-                                            json_items.append(json.dumps(item))
-                                        else:
-                                            json_items.append(str(item))
-                                    return "\n".join(json_items) if json_items else ""
-                                except (TypeError, ValueError):
-                                    return json.dumps(x)
+                                # Simple values → newline-joined for template readability
+                                return "\n".join(str(item) for item in x)
                             elif isinstance(x, dict):
                                 return json.dumps(x)
                             return str(x) if x is not None else ""
@@ -391,9 +381,11 @@ def map_dataset_columns(
                         (c for c in cands if c in row.index and row[c] is not None),
                         None,
                     )
-                    template_vars[sc.replace(":", "_")] = (
-                        row[found_sc] if found_sc else ""
-                    )
+                    val = row[found_sc] if found_sc else ""
+                    # Serialize structured data to JSON for readable template output
+                    if isinstance(val, (dict, list)):
+                        val = json.dumps(val)
+                    template_vars[sc.replace(":", "_")] = val
                 return (
                     details["template"].format(**template_vars)
                     if template_vars

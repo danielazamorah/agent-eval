@@ -33,12 +33,12 @@ Each agent is a standalone Python project with its own `pyproject.toml` and depe
 
 ```bash
 # From the agent-eval repository root:
-cp docs/tutorial/example_agents/customer-service/.env.example \
-   docs/tutorial/example_agents/customer-service/.env
+cp tutorial/example_agents/customer-service/.env.example \
+   tutorial/example_agents/customer-service/.env
 # Edit the .env file with your GCP project and API keys
 
 # Install dependencies
-uv sync --directory docs/tutorial/example_agents/customer-service
+uv sync --directory tutorial/example_agents/customer-service
 ```
 
-See the [tutorial](../tutorial.md) for a complete walkthrough of evaluating and optimizing both agents step by step.
+See the [tutorial](../../docs/tutorial.md) for a complete walkthrough of evaluating and optimizing both agents step by step.
