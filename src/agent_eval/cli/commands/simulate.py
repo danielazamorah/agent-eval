@@ -382,10 +382,13 @@ def simulate(agent_dir, eval_dir, run_id, debug):
             console.print(f"  [dim]Run `uv run agent-eval init` first to scaffold one.[/]")
             sys.exit(1)
 
-    scenarios_file = eval_path / "scenarios" / "conversation_scenarios.json"
-    if not scenarios_file.exists():
-        console.print(f"\n  [red]Error:[/] No scenarios file at {scenarios_file}")
-        console.print(f"  [dim]Create your scenarios in eval/scenarios/conversation_scenarios.json[/]")
+    from agent_eval.core.config import find_eval_files
+    discovered = find_eval_files(eval_path)
+    if discovered["scenarios"]:
+        scenarios_file = discovered["scenarios"][0]
+    else:
+        console.print(f"\n  [red]Error:[/] No scenario files found in {eval_path / 'scenarios'}")
+        console.print(f"  [dim]Create your scenarios as .json files in eval/scenarios/[/]")
         sys.exit(1)
 
     session_file = eval_path / "scenarios" / "session_input.json"

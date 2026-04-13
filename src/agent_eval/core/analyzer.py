@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
-import os
+import logging
 import re
 import subprocess
 from datetime import datetime
@@ -15,6 +15,8 @@ from google.genai.types import HttpOptions
 
 from agent_eval.core.gemini_prompt_builder import GeminiAnalysisPrompter
 from agent_eval.core.utils import discover_agent_context
+
+logger = logging.getLogger("agent_eval.analyzer")
 
 
 class LogEntry(TypedDict):
@@ -317,7 +319,7 @@ class Analyzer:
                 agents_evaluated=agents_evaluated,
             )
         except Exception as e:
-            print(f"Error processing row {index}: {e}")
+            logger.warning("Error processing row %d: %s", index, e)
             return None
 
     def _format_log_entry_markdown(self, entry: LogEntry, entry_num: int) -> str:
@@ -406,10 +408,10 @@ class Analyzer:
 
     def generate_question_answer_log(self, results_file: Path, output_path: Path) -> bool:
         """Generates a detailed log comparing questions, reference data, and agent output."""
-        print(f"\n--- Generating Question-Answer Log from {results_file} ---")
+        logger.debug("Generating Question-Answer Log from %s", results_file)
         try:
             df = pd.read_csv(results_file)
-            print(f"Loaded {len(df)} evaluation results.")
+            logger.debug("Loaded %d evaluation results.", len(df))
 
             log_entries = [
                 entry
@@ -425,11 +427,11 @@ class Analyzer:
             )
 
             output_path.write_text("---".join(markdown_content), encoding="utf-8")
-            print(f"Question-answer log saved to {output_path}")
+            logger.debug("Question-answer log saved to %s", output_path)
             return True
 
         except Exception as e:
-            print(f"Error generating question-answer log: {e}")
+            logger.error("Error generating question-answer log: %s", e)
             return False
 
     def analyze_evaluation_results(
@@ -442,7 +444,7 @@ class Analyzer:
             summary_data = json.loads(summary_path.read_text())
             results_df = pd.read_csv(results_path)
         except FileNotFoundError as e:
-            print(f"Error: Input file not found: {e}")
+            logger.error("Input file not found: %s", e)
             return None, None
 
         # Use 'average_metrics' from summary_data (includes flattened sub-metrics)
@@ -683,7 +685,7 @@ class Analyzer:
         custom_strategy_content = None
         
         if agent_dir:
-            print("\n--- Discovering Agent Context ---")
+            logger.debug("Discovering agent context")
             agent_context = self._discover_agent_context(Path(agent_dir))
             context_content.update(agent_context)
             
@@ -694,11 +696,11 @@ class Analyzer:
             if strategy_file.exists():
                 try:
                     custom_strategy_content = strategy_file.read_text()
-                    print(f"  Found optimization strategy: {strategy_file}")
+                    logger.debug("Found optimization strategy: %s", strategy_file)
                 except Exception as e:
-                    print(f"  Warning: Could not read strategy file: {e}")
+                    logger.warning("Could not read strategy file: %s", e)
             else:
-                print(f"  Warning: Strategy file not found: {strategy_file}")
+                logger.warning("Strategy file not found: %s", strategy_file)
 
         focus = self.config.get("focus")
 
@@ -722,7 +724,7 @@ class Analyzer:
 
         model, client = self._get_gemini_client()
 
-        print(f"\n--- Calling Vertex AI ({model}) — Call 1: Current run diagnosis ---")
+        logger.debug("Calling Vertex AI (%s) — Call 1: Current run diagnosis", model)
         analysis_text = ""
         try:
             response = client.models.generate_content(
@@ -730,10 +732,10 @@ class Analyzer:
             )
             analysis_text = response.text
             output_path.write_text(analysis_text, encoding="utf-8")
-            print(f"Analysis report saved to {output_path}")
+            logger.debug("Analysis report saved to %s", output_path)
         except Exception as e:
-            print(f"An error occurred while calling the Vertex AI API: {e}")
-            print("Tip: Ensure GOOGLE_CLOUD_PROJECT is set and you're authenticated with gcloud.")
+            logger.error("Error calling Vertex AI API: %s", e)
+            logger.error("Tip: Ensure GOOGLE_CLOUD_PROJECT is set and you're authenticated with gcloud.")
 
         # --- Call 2: Comparison analysis (if comparison data provided) ---
         comparison_text = ""
@@ -748,7 +750,7 @@ class Analyzer:
                 comparison_prompt, encoding="utf-8"
             )
 
-            print(f"\n--- Calling Vertex AI ({model}) — Call 2: Comparison analysis ---")
+            logger.debug("Calling Vertex AI (%s) — Call 2: Comparison analysis", model)
             try:
                 response = client.models.generate_content(
                     model=model, contents=comparison_prompt
@@ -758,29 +760,25 @@ class Analyzer:
                 # Append comparison to the analysis file
                 combined = analysis_text + "\n\n---\n\n# Run Comparison\n\n" + comparison_text
                 output_path.write_text(combined, encoding="utf-8")
-                print(f"Comparison analysis appended to {output_path}")
+                logger.debug("Comparison analysis appended to %s", output_path)
             except Exception as e:
-                print(f"An error occurred during comparison analysis: {e}")
+                logger.error("Error during comparison analysis: %s", e)
 
         return comparison_text
 
     def _get_gemini_client(self):
         """Initialize and return (model_name, genai.Client) for Gemini calls."""
+        from agent_eval.core.config import get_project_id, get_location
+
         model = self.config.get("model", "gemini-3.1-pro-preview")
 
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
-        location = self.config.get("location")
+        project = get_project_id()
+        location = self.config.get("location") or get_location(model)
 
-        if not location:
-            # Gemini 3+ models require global region
-            if model.startswith("gemini-3"):
-                location = "global"
-                print(f"  Using 'global' location for {model} (required for Gemini 3+ models)")
-            else:
-                location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        logger.debug("Using location '%s' for model %s", location, model)
 
         if not project:
-            print("Warning: GOOGLE_CLOUD_PROJECT not set. Trying default credentials...")
+            logger.warning("GOOGLE_CLOUD_PROJECT not set. Trying default credentials...")
 
         client = genai.Client(
             vertexai=True,
@@ -817,7 +815,7 @@ class Analyzer:
         # Legacy: Check for results directly in results_dir (old structure)
         results_files = list(results_dir.glob("evaluation_results_*.csv"))
         if results_files:
-            print("Note: Found legacy folder structure (no raw/ subfolder)")
+            logger.debug("Found legacy folder structure (no raw/ subfolder)")
             return results_dir
 
         return None
@@ -838,10 +836,10 @@ class Analyzer:
         # Find the run folder (supports datetime folder structure)
         run_folder = self._find_run_folder(results_dir)
         if not run_folder:
-            print(f"Error: No evaluation results found in '{results_dir}'")
+            logger.error("No evaluation results found in '%s'", results_dir)
             return None
 
-        print(f"Analyzing run folder: {run_folder}")
+        logger.debug("Analyzing run folder: %s", run_folder)
 
         # Determine paths based on folder structure
         raw_dir = run_folder / "raw"
@@ -853,16 +851,16 @@ class Analyzer:
             raw_dir = run_folder
 
         if not results_files:
-            print(f"Error: No 'evaluation_results_*.csv' file found")
+            logger.error("No 'evaluation_results_*.csv' file found")
             return None
 
         results_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         results_file = results_files[0]
-        print(f"Analyzing results file: {results_file.name}")
+        logger.debug("Analyzing results file: %s", results_file.name)
 
         summary_file = run_folder / "eval_summary.json"
         if not summary_file.exists():
-            print(f"Error: summary file not found in '{run_folder}'")
+            logger.error("Summary file not found in '%s'", run_folder)
             return None
 
         current_summary = json.loads(summary_file.read_text())
@@ -875,13 +873,13 @@ class Analyzer:
         comparison_data = None
         if compare_to:
             # Explicit baseline
-            print(f"\n--- Loading baseline from {compare_to} ---")
+            logger.debug("Loading baseline from %s", compare_to)
             baseline_summary = self._load_baseline_summary(Path(compare_to))
             if baseline_summary:
                 comparison_data = compute_comparison(baseline_summary, current_summary)
-                print(f"Comparison computed: {len(comparison_data['deltas'])} metrics compared")
+                logger.debug("Comparison computed: %d metrics compared", len(comparison_data['deltas']))
             else:
-                print(f"Warning: Could not load baseline from {compare_to}")
+                logger.warning("Could not load baseline from %s", compare_to)
         else:
             # Auto-detect previous run
             # The results parent is either run_folder.parent (normal) or results_dir itself
@@ -890,13 +888,13 @@ class Analyzer:
                 results_parent = results_dir
             previous_run = self._auto_find_previous_run(results_parent, run_folder)
             if previous_run:
-                print(f"\n--- Auto-detected previous run: {previous_run.name} ---")
+                logger.debug("Auto-detected previous run: %s", previous_run.name)
                 baseline_summary = self._load_baseline_summary(previous_run)
                 if baseline_summary:
                     comparison_data = compute_comparison(baseline_summary, current_summary)
-                    print(f"Comparison computed: {len(comparison_data['deltas'])} metrics compared")
+                    logger.debug("Comparison computed: %d metrics compared", len(comparison_data['deltas']))
             else:
-                print("\n--- No previous run found (this is the baseline) ---")
+                logger.debug("No previous run found (this is the baseline)")
 
         # Check if comparison is meaningful (code or questions actually changed)
         skip_comparison_call = False
@@ -910,9 +908,10 @@ class Analyzer:
             no_diff = not comparison_data.get("git_diff")
             if same_commit and no_diff:
                 skip_comparison_call = True
-                print(
-                    f"\n--- Same code (commit {c_git['commit'][:8]}). "
-                    f"Skipping comparison analysis — metric changes are due to LLM non-determinism. ---"
+                logger.debug(
+                    "Same code (commit %s). Skipping comparison analysis — "
+                    "metric changes are due to LLM non-determinism.",
+                    c_git['commit'][:8],
                 )
 
         # 3. Generate Gemini Analysis (Call 1 + optional Call 2)
@@ -936,11 +935,11 @@ class Analyzer:
             gemini_comparison_text=gemini_comparison_text or None,
             current_summary=current_summary,
         )
-        print(f"Optimization log updated: {log_path}")
+        logger.debug("Optimization log updated: %s", log_path)
 
         # 5. GCS Upload (Placeholder)
         if gcs_bucket:
-            print(f"\n--- [PLACEHOLDER] Uploading Results to GCS: gs://{gcs_bucket} ---")
+            logger.debug("[PLACEHOLDER] Uploading Results to GCS: gs://%s", gcs_bucket)
 
         return {
             "current_summary": current_summary,

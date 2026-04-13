@@ -62,6 +62,13 @@ def _display_metrics_summary(results_dir: str) -> None:
         for name in failed:
             table.add_row(name, "[red]FAILED[/]", "—", "[red]Retry later[/]")
 
+        # Show metrics that were skipped by design (dimmed)
+        skipped = overall.get("skipped_metrics", [])
+        for entry in skipped:
+            reason = entry.get("reason", "skipped") if isinstance(entry, dict) else str(entry)
+            m_name = entry.get("metric", str(entry)) if isinstance(entry, dict) else str(entry)
+            table.add_row(f"[dim]{m_name}[/]", "[dim]SKIPPED[/]", "—", f"[dim]{reason}[/]")
+
         console.print()
         console.print(table)
 
@@ -71,6 +78,11 @@ def _display_metrics_summary(results_dir: str) -> None:
             )
             console.print(
                 "  [dim]Try again later or reduce the number of metrics/eval cases.[/]"
+            )
+
+        if skipped:
+            console.print(
+                f"  [dim]Note: {len(skipped)} metric(s) skipped (no matching data for their applies_to filter).[/]"
             )
 
     # ── Key deterministic metrics ──────────────────────────────────────

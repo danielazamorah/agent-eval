@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import subprocess
 import time
@@ -6,6 +7,8 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import requests
+
+logger = logging.getLogger("agent_eval.agent_client")
 
 
 class AgentClient:
@@ -84,10 +87,10 @@ class AgentClient:
         # which usually results in a request with no body.
         payload = session_data if session_data else None
 
-        print(f"Creating session: {session_id}...")
+        logger.debug("Creating session: %s...", session_id)
         self._make_request("POST", url, json=payload)
 
-        print("Session created successfully.")
+        logger.debug("Session created successfully.")
         return session_id
 
     def run_interaction(
@@ -112,7 +115,7 @@ class AgentClient:
             "streaming": streaming,
         }
 
-        print("Sending question to agent...")
+        logger.debug("Sending question to agent...")
         return self._make_request("POST", url, json=payload)
 
     def get_session_state(self, session_id: str) -> Dict[str, Any]:
@@ -126,7 +129,7 @@ class AgentClient:
             The session state dictionary.
         """
         url = f"{self.base_url}/apps/{self.app_name}/users/{self.user_id}/sessions/{session_id}"
-        print("Retrieving final session state...")
+        logger.debug("Retrieving final session state...")
         return self._make_request("GET", url)
 
     def get_session_trace(self, session_id: str) -> Dict[str, Any]:
@@ -153,10 +156,10 @@ class AgentClient:
                 # which is specific to traces being ready.
                 trace = self._make_request_with_custom_retry(url)
                 if trace:
-                    print(f"[SUCCESS] Retrieving [TRACE] for session {session_id}!")
+                    logger.debug("Retrieved trace for session %s", session_id)
                     return trace
             except Exception as e:
-                print(f"Failed to get trace from {url}: {e}")
+                logger.warning("Failed to get trace from %s: %s", url, e)
                 continue
 
         raise RuntimeError(
@@ -179,7 +182,7 @@ class AgentClient:
                 return response.json()
             except requests.exceptions.RequestException as e:
                 if i < retries - 1:
-                    print(f"Request failed with {e}. Retrying in {delay} seconds...")
+                    logger.debug("Request failed with %s. Retrying in %d seconds...", e, delay)
                     time.sleep(delay)
                     delay *= 2
                 else:
@@ -205,7 +208,7 @@ class AgentClient:
                 data = response.json()
                 if data:
                     return data
-                print(f"Trace empty, retrying in {delay} seconds...")
+                logger.debug("Trace empty, retrying in %d seconds...", delay)
             except requests.exceptions.RequestException:
                 if i < retries - 1:
                     time.sleep(delay)

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import glob
 import uuid
@@ -9,6 +10,8 @@ from typing import Dict, Any, List, Optional
 
 # Import AgentClient for consistent trace analysis logic
 from agent_eval.core.agent_client import AgentClient
+
+logger = logging.getLogger("agent_eval.converters")
 
 def robust_json_load(file_path: str) -> Optional[Dict[str, Any]]:
     try:
@@ -21,11 +24,11 @@ def robust_json_load(file_path: str) -> Optional[Dict[str, Any]]:
             except json.JSONDecodeError:
                 pass
         if not isinstance(data, dict):
-            print(f"Skipping {file_path}: Root content is not a dictionary.")
+            logger.warning("Skipping %s: Root content is not a dictionary.", file_path)
             return None
         return data
     except Exception as e:
-        print(f"Warning: Failed to parse {file_path}: {e}")
+        logger.warning("Failed to parse %s: %s", file_path, e)
         return None
 
 def to_camel_case(snake_str: str) -> str:
@@ -188,7 +191,7 @@ class AdkHistoryConverter:
                     if "id" in q:
                         mapping[q["id"]] = q
         except Exception as e:
-            print(f"Warning: Could not load golden dataset: {e}")
+            logger.warning("Could not load golden dataset: %s", e)
         return mapping
 
     def process_file(self, file_path: str) -> List[Dict[str, Any]]:
@@ -221,30 +224,17 @@ class AdkHistoryConverter:
                     continue
 
                 # No session_details and no per_invocation — configuration problem
-                print("\n" + "=" * 70)
-                print("ERROR: session_details is empty for eval case: " + str(eval_id))
-                print("=" * 70)
-                print("\nThis usually means the 'app_name' in your evalset.json file")
-                print("does not match the folder name containing your agent.")
-                print("\nThe app_name MUST match the folder name, NOT the agent's internal name.")
-                print("\nExample:")
-                print("  If your agent is in: retail-ai-location-strategy/app/agent.py")
-                print("  Then app_name must be: \"app\"")
-                print("")
-                print("  If your agent is in: customer-service/customer_service/agent.py")
-                print("  Then app_name must be: \"customer_service\"")
-                print("\nTo fix this:")
-                print("  1. Open your evalset.json file")
-                print("  2. Find the 'session_input' section")
-                print("  3. Change 'app_name' to match your agent's folder name")
-                print("  4. Clear the .adk folder: rm -rf <agent-dir>/.adk")
-                print("  5. Re-run the ADK simulation: uv run adk eval <folder> ...")
-                print("  6. Re-run this converter")
-                print("\nWithout session_details, critical data is missing:")
-                print("  - Token usage (prompt_tokens, completion_tokens)")
-                print("  - Session state variables")
-                print("  - Proper latency measurements")
-                print("=" * 70 + "\n")
+                logger.error(
+                    "session_details is empty for eval case: %s\n"
+                    "This usually means the 'app_name' in your evalset.json file "
+                    "does not match the folder name containing your agent.\n"
+                    "The app_name MUST match the folder name, NOT the agent's internal name.\n"
+                    "Example:\n"
+                    "  If your agent is in: retail-ai-location-strategy/app/agent.py\n"
+                    "  Then app_name must be: \"app\"\n"
+                    "To fix: change 'app_name' in evalset.json, clear .adk/, re-run simulation.",
+                    eval_id,
+                )
 
                 # Skip this case - don't process with incomplete data
                 continue
@@ -671,7 +661,7 @@ class TestToGoldenConverter:
             return result
         for p in pairs:
             if ":" not in p:
-                print(f"Warning: Invalid format '{p}'. Expected 'key:value'")
+                logger.warning("Invalid format '%s'. Expected 'key:value'", p)
                 continue
             key, value = p.split(":", 1)
             result[key.strip()] = value.strip()

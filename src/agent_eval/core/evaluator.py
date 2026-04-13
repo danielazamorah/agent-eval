@@ -17,20 +17,20 @@ from google.cloud import aiplatform
 from vertexai import Client, types
 from vertexai.preview.evaluation import PointwiseMetric
 
-from agent_eval.core.config import CONFIG
+from agent_eval.core.config import CONFIG, get_project_id
 from agent_eval.core.deterministic_metrics import DETERMINISTIC_METRICS, evaluate_deterministic_metrics
 from agent_eval.core.data_mapper import map_dataset_columns, robust_json_loads
 
-# Setup Logger — our own logs (agent_eval) are shown at INFO.
-# Third-party logs (Vertex AI SDK, ADK, Google Cloud) are suppressed by default
-# because they dump noisy tracebacks (e.g., 429 retries) that alarm users.
-# Use --debug to see everything.
+# Setup Logger — root logger at CRITICAL silences all third-party noise by default.
+# Our own logger (agent_eval) is explicitly set to INFO so our messages show.
+# Use --debug to open the floodgates (root → DEBUG, everything visible).
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.CRITICAL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("agent_eval")
+logger.setLevel(logging.INFO)
 
 # Suppress noisy third-party logs by default
 _NOISY_LOGGERS = [
@@ -51,14 +51,16 @@ for _name in _NOISY_LOGGERS:
 def configure_logging(debug: bool = False) -> None:
     """Configure logging levels based on debug flag.
 
-    Normal mode (default): agent_eval at INFO, third-party at CRITICAL.
-    Debug mode (--debug): everything at DEBUG (shows SDK retries, ADK internals).
+    Normal mode (default): root at CRITICAL, agent_eval at INFO, third-party at CRITICAL.
+    Debug mode (--debug): root at DEBUG, everything visible (SDK retries, ADK internals).
     """
     if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.DEBUG)
     else:
+        logging.getLogger().setLevel(logging.CRITICAL)
         logger.setLevel(logging.INFO)
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.CRITICAL)
@@ -262,6 +264,7 @@ def save_metrics_summary(
     test_description: str,
     metric_definitions: Dict[str, Any] = None,
     failed_metrics: list[str] | None = None,
+    skipped_metrics: list[dict] | None = None,
 ) -> None:
     """Calculate and save a comprehensive summary of metrics including full input/output."""
     logger.info("--- Generating Metrics Summary ---")
@@ -390,6 +393,8 @@ def save_metrics_summary(
     # Track metrics that failed all retries so the CLI can surface them
     if failed_metrics:
         output["overall_summary"]["failed_metrics"] = failed_metrics
+    if skipped_metrics:
+        output["overall_summary"]["skipped_metrics"] = skipped_metrics
 
     # Per-source breakdown (only when multiple source types present)
     if "source_type" in df.columns:
@@ -428,7 +433,7 @@ def save_metrics_summary(
 class Evaluator:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.project_id = CONFIG.GOOGLE_CLOUD_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        self.project_id = get_project_id()
         self.location = CONFIG.GOOGLE_CLOUD_LOCATION
         
         if not self.project_id:
@@ -534,7 +539,8 @@ class Evaluator:
                 metrics_by_agent[agent].append((name, info))
 
         eval_tasks = []
-        
+        skipped_metrics = []  # Metrics skipped by design (no matching data, applies_to filter)
+
         for agent, metrics in metrics_by_agent.items():
             # Filter rows relevant to this agent
             mask = expanded_df["agents_evaluated"].apply(
@@ -546,6 +552,10 @@ class Evaluator:
 
             agent_df = expanded_df[mask].copy()
             if agent_df.empty:
+                for metric_name, info in metrics:
+                    if info.get("metric_type") != "deterministic":
+                        skipped_metrics.append({"metric": metric_name, "reason": f"no data for agent '{agent}'"})
+                        logger.info("Skipping '%s' — no data for agent '%s'", metric_name, agent)
                 continue
 
             for metric_name, info in metrics:
@@ -561,7 +571,8 @@ class Evaluator:
                         source_mask = agent_df["source_type"] == required_source
                         agent_df_filtered = agent_df[source_mask].copy()
                         if agent_df_filtered.empty:
-                            logger.info(f"Skipping '{metric_name}' — no {applies_to} data available")
+                            skipped_metrics.append({"metric": metric_name, "reason": f"no {applies_to} data available"})
+                            logger.info("Skipping '%s' — no %s data available", metric_name, applies_to)
                             continue
                     else:
                         agent_df_filtered = agent_df
@@ -591,20 +602,35 @@ class Evaluator:
                     )
 
                 if eval_dataset.empty or len(eval_dataset.columns) == 0:
+                    skipped_metrics.append({"metric": metric_name, "reason": "empty dataset after column mapping"})
+                    logger.warning("Skipping '%s' — empty dataset after column mapping", metric_name)
                     continue
 
                 # Create Metric Object
                 if is_managed:
                     m_name = info.get("managed_metric_name", "").upper()
-                    metric_obj = getattr(types.RubricMetric, m_name, None) or PointwiseMetric(
-                        metric=metric_name, metric_prompt_template=info.get("template", "")
-                    )
+                    metric_obj = getattr(types.RubricMetric, m_name, None)
+                    if metric_obj is None:
+                        logger.warning(
+                            "Managed metric '%s' not found as RubricMetric.%s — "
+                            "falling back to PointwiseMetric with template. "
+                            "Check that managed_metric_name is a valid SDK metric.",
+                            metric_name, m_name,
+                        )
+                        template = info.get("template", "")
+                        if not template:
+                            skipped_metrics.append({"metric": metric_name, "reason": f"unknown managed metric '{m_name}' and no fallback template"})
+                            continue
+                        metric_obj = PointwiseMetric(
+                            metric=metric_name, metric_prompt_template=template
+                        )
                 else:
                     # Use template directly for custom LLM metrics
                     # The SDK will substitute placeholders from dataset columns
                     template = info.get("template", "")
                     if not template:
-                        logger.warning(f"Metric '{metric_name}' has no template defined, skipping")
+                        skipped_metrics.append({"metric": metric_name, "reason": "no template defined"})
+                        logger.warning("Metric '%s' has no template defined, skipping", metric_name)
                         continue
                     metric_obj = types.LLMMetric(
                         name=metric_name,
@@ -762,6 +788,7 @@ class Evaluator:
             self.config.get("test_description", "Automated run"),
             metric_definitions=metric_definitions,
             failed_metrics=failed_metrics,
+            skipped_metrics=skipped_metrics,
         )
 
         logger.info(f"Run folder: {results_dir}")

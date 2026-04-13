@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import asyncio
 import pandas as pd
@@ -6,6 +7,8 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 from agent_eval.core.agent_client import AgentClient
+
+logger = logging.getLogger("agent_eval.interactions")
 
 def get_golden_questions(filepath: str) -> List[Dict[str, Any]]:
     """Loads questions from a JSON file."""
@@ -43,7 +46,7 @@ def parse_metadata_filters(filter_strings: Optional[List[str]]) -> Dict[str, Lis
         return filters
     for filter_string in filter_strings:
         if ":" not in filter_string:
-            print(f"Warning: Invalid filter format '{filter_string}'. Expected 'key:value1,value2'")
+            logger.warning("Invalid filter format '%s'. Expected 'key:value1,value2'", filter_string)
             continue
         key, values_str = filter_string.split(":", 1)
         values = [v.strip() for v in values_str.split(",")]
@@ -60,7 +63,7 @@ def parse_state_variables(state_var_strings: Optional[List[str]]) -> Dict[str, A
         return state_vars
     for s in state_var_strings:
         if ":" not in s:
-            print(f"Warning: Invalid state variable format '{s}'. Expected 'key:value'")
+            logger.warning("Invalid state variable format '%s'. Expected 'key:value'", s)
             continue
         key, value = s.split(":", 1)
         state_vars[key.strip()] = value.strip()
@@ -82,7 +85,7 @@ async def process_single_question(
     question_metadata = question_data.get("metadata", {})
     reference_data = question_data.get("reference_data", {})
 
-    print(f"Running question ID: {question_id} (Run {run_id})...")
+    logger.debug("Running question ID: %s (Run %d)...", question_id, run_id)
 
     try:
         interaction_datetime = datetime.now().isoformat()
@@ -113,7 +116,7 @@ async def process_single_question(
 
     except Exception as e:
         error_message = str(e)
-        print(f"Error in question {question_id}: {error_message}")
+        logger.error("Error in question %s: %s", question_id, error_message)
         return {
             "status": json.dumps({"boolean": "failed", "error_message": error_message}),
             "run_id": run_id,
@@ -160,7 +163,7 @@ class InteractionRunner:
         state_vars = parse_state_variables(self.config.get("state_variables"))
         runs = self.config.get("runs", 1)
 
-        print(f"Starting execution for {len(filtered_questions)} questions, {runs} runs each.")
+        logger.debug("Starting execution for %d questions, %d runs each.", len(filtered_questions), runs)
         
         tasks = []
         for q in filtered_questions:

@@ -1,9 +1,12 @@
 import json
+import logging
 import asyncio
 import pandas as pd
 from typing import Dict, Any, Optional
 
 from agent_eval.core.agent_client import AgentClient
+
+logger = logging.getLogger("agent_eval.processor")
 
 async def enrich_single_interaction(
     row: pd.Series,
@@ -54,7 +57,7 @@ async def enrich_single_interaction(
             try:
                 session_trace = await asyncio.to_thread(agent_client.get_session_trace, session_id)
             except RuntimeError as e:
-                print(f"Warning: Could not retrieve trace for {session_id}: {e}")
+                logger.warning("Could not retrieve trace for %s: %s", session_id, e)
 
         # 3. Process Trace Data
         if not session_trace:
@@ -154,7 +157,7 @@ async def enrich_single_interaction(
         })
 
     except Exception as e:
-        print(f"Error enriching session {session_id}: {e}")
+        logger.error("Error enriching session %s: %s", session_id, e)
         row["missing_information"] = json.dumps({"boolean": True, "details": str(e)})
         # Ensure columns exist even on error
         for col in ["final_session_state", "session_trace", "latency_data", "extracted_data"]:
@@ -173,9 +176,9 @@ class InteractionProcessor:
         self.skip_traces = config.get("skip_traces", False)
 
     async def process(self, interaction_df: pd.DataFrame) -> pd.DataFrame:
-        print(f"Processing {len(interaction_df)} interactions...")
+        logger.debug("Processing %d interactions...", len(interaction_df))
         if self.skip_traces:
-            print("Skipping trace retrieval.")
+            logger.debug("Skipping trace retrieval.")
 
         tasks = [
             enrich_single_interaction(row, self.results_dir, self.skip_traces)

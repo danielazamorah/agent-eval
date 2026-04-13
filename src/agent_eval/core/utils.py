@@ -15,8 +15,11 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Dict, Optional
+
+logger = logging.getLogger("agent_eval.utils")
 
 
 # Directories to skip when scanning agent source trees.
@@ -46,7 +49,7 @@ def discover_agent_context(agent_dir: Optional[Path], quiet: bool = False) -> Di
 
     def _log(msg: str) -> None:
         if not quiet:
-            print(msg)
+            logger.debug(msg)
 
     # 1. Find agent.py files (only in project source, not dependencies)
     for pattern in ["agent.py", "**/agent.py"]:

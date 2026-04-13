@@ -1,0 +1,168 @@
+{
+  "_readme": "Vertex AI GenAI Evaluation SDK — Managed (Predefined) Metrics Catalog. Copy any entry below into your eval/metrics/metric_definitions.json under the 'metrics' key. These metrics are evaluated by Google's built-in rubric models — no custom template needed.",
+
+  "metrics": {
+
+    "_comment_single_turn": "=== SINGLE-TURN METRICS (work with both simulation and golden dataset data) ===",
+
+    "general_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "GENERAL_QUALITY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 0,
+        "max": 1,
+        "description": "Rubric pass rate (0.0-1.0). Evaluates overall response quality across multiple rubric criteria."
+      }
+    },
+
+    "text_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "TEXT_QUALITY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Poor, 5=Excellent. Evaluates writing quality: grammar, clarity, structure, and readability."
+      }
+    },
+
+    "instruction_following": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "INSTRUCTION_FOLLOWING",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Does not follow, 5=Follows perfectly. Evaluates how well the response adheres to the user's instructions."
+      }
+    },
+
+    "fluency": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "FLUENCY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Not fluent, 5=Perfectly fluent. Evaluates language fluency and naturalness."
+      }
+    },
+
+    "coherence": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "COHERENCE",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Incoherent, 5=Perfectly coherent. Evaluates logical flow and consistency of the response."
+      }
+    },
+
+    "safety": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "SAFETY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 0,
+        "max": 1,
+        "description": "Rubric pass rate (0.0-1.0). Evaluates whether the response is safe and free of harmful content."
+      }
+    },
+
+    "verbosity": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "VERBOSITY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": -2,
+        "max": 2,
+        "description": "-2=Much too brief, 0=Just right, 2=Much too verbose. Evaluates response length appropriateness."
+      }
+    },
+
+    "groundedness": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "GROUNDEDNESS",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Not grounded, 5=Fully grounded. Evaluates whether claims are supported by the provided context."
+      }
+    },
+
+    "_comment_multi_turn": "=== MULTI-TURN METRICS (require conversation_history — use applies_to: scenarios) ===",
+
+    "multi_turn_chat_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "MULTI_TURN_CHAT_QUALITY",
+      "use_gemini_format": true,
+      "applies_to": "scenarios",
+      "score_range": {
+        "min": 0,
+        "max": 1,
+        "description": "Rubric pass rate (0.0-1.0). Evaluates multi-turn conversation quality including context retention, coherence across turns, and helpfulness."
+      }
+    },
+
+    "multi_turn_safety": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "MULTI_TURN_SAFETY",
+      "use_gemini_format": true,
+      "applies_to": "scenarios",
+      "score_range": {
+        "min": 0,
+        "max": 1,
+        "description": "Rubric pass rate (0.0-1.0). Evaluates safety across multi-turn conversations, including adversarial prompt patterns."
+      }
+    },
+
+    "_comment_specialized": "=== SPECIALIZED METRICS (may require specific dataset columns) ===",
+
+    "summarization_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "SUMMARIZATION_QUALITY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Poor summary, 5=Excellent summary. Evaluates summarization quality: coverage, accuracy, and conciseness. Best used when the agent summarizes content."
+      }
+    },
+
+    "question_answering_quality": {
+      "metric_type": "llm",
+      "is_managed": true,
+      "managed_metric_name": "QUESTION_ANSWERING_QUALITY",
+      "use_gemini_format": true,
+      "applies_to": "all",
+      "score_range": {
+        "min": 1,
+        "max": 5,
+        "description": "1=Incorrect, 5=Perfect answer. Evaluates QA accuracy and completeness. Best used when the agent answers factual questions."
+      }
+    }
+  }
+}

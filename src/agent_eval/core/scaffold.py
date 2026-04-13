@@ -98,27 +98,28 @@ def scaffold_eval_structure(
     has_ai = custom_metric_definitions is not None
 
     # Resolve which metrics to include
-    if metrics is None:
-        if mode == "diy":
-            metrics = ["general_quality", "tool_use_quality", "safety"]
-        else:
-            metrics = ["general_quality", "trajectory_accuracy", "tool_use_quality", "safety"]
-
-    # Build metric definitions
     metric_defs = {"metrics": {}}
-    for key in metrics:
-        if key in METRIC_TEMPLATES:
-            defn = dict(METRIC_TEMPLATES[key])
-            if "agents" not in defn:
-                defn["agents"] = [agent_name]
-            metric_defs["metrics"][key] = defn
 
-    # Merge in AI-generated custom metrics
     if custom_metric_definitions:
+        # AI metrics provided — use ONLY what the AI generated (no forced defaults)
         for key, defn in custom_metric_definitions.items():
             if "agents" not in defn:
                 defn["agents"] = [agent_name]
             metric_defs["metrics"][key] = defn
+    else:
+        # No AI metrics — use standard defaults
+        if metrics is None:
+            if mode == "diy":
+                metrics = ["general_quality", "tool_use_quality", "safety"]
+            else:
+                metrics = ["general_quality", "trajectory_accuracy", "tool_use_quality", "safety"]
+
+        for key in metrics:
+            if key in METRIC_TEMPLATES:
+                defn = dict(METRIC_TEMPLATES[key])
+                if "agents" not in defn:
+                    defn["agents"] = [agent_name]
+                metric_defs["metrics"][key] = defn
 
     # Create directories
     for d in [eval_dir, eval_dir / "metrics", eval_dir / "scenarios", eval_dir / "results"]:

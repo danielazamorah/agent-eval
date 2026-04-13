@@ -11,6 +11,7 @@ import pandas as pd
 from agent_eval.core.evaluator import Evaluator
 
 
+@patch("agent_eval.core.evaluator.get_project_id", return_value="test-project")
 @patch("agent_eval.core.evaluator.CONFIG")
 @patch("agent_eval.core.evaluator.aiplatform")
 @patch("agent_eval.core.evaluator.Client")
@@ -28,8 +29,7 @@ class TestEvaluator(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir)
 
-    def test_initialization(self, mock_client, mock_aiplatform, mock_config):
-        mock_config.GOOGLE_CLOUD_PROJECT = "test-project"
+    def test_initialization(self, mock_client, mock_aiplatform, mock_config, mock_get_project_id):
         mock_config.GOOGLE_CLOUD_LOCATION = "us-central1"
         
         Evaluator(self.config)
@@ -41,19 +41,19 @@ class TestEvaluator(unittest.TestCase):
     @patch("agent_eval.core.evaluator.evaluate_deterministic_metrics")
     @patch("agent_eval.core.evaluator.save_metrics_summary")
     def test_evaluate_adk_score_integration_jsonl(
-        self, 
-        mock_save_summary, 
-        mock_det_metrics, 
+        self,
+        mock_save_summary,
+        mock_det_metrics,
         mock_load_metrics,
         mock_client,
         mock_aiplatform,
-        mock_config
+        mock_config,
+        mock_get_project_id,
     ):
         """
         Validates that ADK scores are correctly extracted from JSONL input
         and passed to the summary generation.
         """
-        mock_config.GOOGLE_CLOUD_PROJECT = "test-project"
         mock_config.MAX_WORKERS = 1
         
         # Setup Input Data with ADK Scores in JSONL format
@@ -108,10 +108,10 @@ class TestEvaluator(unittest.TestCase):
         mock_load_metrics,
         mock_client,
         mock_aiplatform,
-        mock_config
+        mock_config,
+        mock_get_project_id,
     ):
         """Test LLM metrics execution using JSONL input."""
-        mock_config.GOOGLE_CLOUD_PROJECT = "test-project"
         mock_config.MAX_WORKERS = 2
         
         # Input data

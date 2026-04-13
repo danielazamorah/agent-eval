@@ -118,12 +118,17 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
             console.print(f"  [dim]Run `uv run agent-eval init` first to scaffold one.[/]")
             sys.exit(1)
 
+    # Discover eval files dynamically
+    from agent_eval.core.config import find_eval_files
+    discovered = find_eval_files(eval_path)
+
     # Validate simulate prerequisites
     if run_simulate:
-        scenarios_file = eval_path / "scenarios" / "conversation_scenarios.json"
-        if not scenarios_file.exists():
-            console.print(f"\n  [red]Error:[/] No scenarios file at {scenarios_file}")
-            console.print(f"  [dim]Create your scenarios in eval/scenarios/conversation_scenarios.json[/]")
+        if discovered["scenarios"]:
+            scenarios_file = discovered["scenarios"][0]
+        else:
+            console.print(f"\n  [red]Error:[/] No scenario files found in {eval_path / 'scenarios'}")
+            console.print(f"  [dim]Create your scenarios as .json files in eval/scenarios/[/]")
             sys.exit(1)
 
         session_file = eval_path / "scenarios" / "session_input.json"
@@ -135,12 +140,11 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
     # Validate interact prerequisites
     if run_interact:
         if not questions_file:
-            candidate = eval_path / "eval_data" / "golden_dataset.json"
-            if candidate.exists():
-                questions_file = str(candidate)
+            if discovered["golden_data"]:
+                questions_file = str(discovered["golden_data"][0])
             else:
-                console.print(f"\n  [yellow]Warning:[/] No golden dataset found at eval/eval_data/golden_dataset.json")
-                console.print(f"  [dim]Skipping interact phase. Create the file or use --questions-file to enable it.[/]")
+                console.print(f"\n  [yellow]Warning:[/] No golden dataset found in {eval_path / 'eval_data'}")
+                console.print(f"  [dim]Skipping interact phase. Add .json files to eval/eval_data/ or use --questions-file.[/]")
                 run_interact = False
         elif not Path(questions_file).exists():
             console.print(f"\n  [red]Error:[/] Questions file not found: {questions_file}")
@@ -175,11 +179,13 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
                     run_interact = False
 
     # Metrics file for evaluation
-    metrics_file = eval_path / "metrics" / "metric_definitions.json"
-    if run_evaluate and not metrics_file.exists():
-        console.print(f"\n  [yellow]Warning:[/] No metrics file at {metrics_file}")
-        console.print(f"  [dim]Evaluation will be skipped. Create metric_definitions.json to enable it.[/]")
-        run_evaluate = False
+    if run_evaluate:
+        if discovered["metrics"]:
+            metrics_file = discovered["metrics"][0]
+        else:
+            console.print(f"\n  [yellow]Warning:[/] No metrics files found in {eval_path / 'metrics'}")
+            console.print(f"  [dim]Evaluation will be skipped. Add .json files to eval/metrics/ to enable it.[/]")
+            run_evaluate = False
 
     # Final check after graceful fallbacks
     if not run_simulate and not run_interact:
@@ -262,7 +268,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         from agent_eval.cli.commands.simulate import _count_scenarios
         from agent_eval.core.converters import AdkHistoryConverter, write_jsonl
 
-        n_scenarios = _count_scenarios(eval_path / "scenarios" / "conversation_scenarios.json")
+        n_scenarios = _count_scenarios(scenarios_file)
 
         _phase_header("Simulate",
                       f"Running ADK User Sim with {n_scenarios} scenario{'s' if n_scenarios != 1 else ''}.\n"

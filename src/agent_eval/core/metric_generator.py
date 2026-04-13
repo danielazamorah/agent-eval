@@ -99,18 +99,52 @@ Each metric must follow this exact JSON structure:
 
 ### `applies_to` — which data a metric runs on
 
-Evaluation data comes from two sources with different characteristics:
+The evaluation framework has TWO distinct data sources, and each metric must declare which source(s) it applies to. Getting this wrong means metrics run on incompatible data and produce meaningless scores.
 
-| Value | Runs on | When to use |
+| Value | Data source | Key characteristics |
 |---|---|---|
-| `"all"` (default) | All eval data | Metrics that evaluate any agent response regardless of how it was generated (e.g., safety, general quality, tool usage) |
-| `"scenarios"` | Multi-turn scenario data only (from ADK User Sim) | Metrics that evaluate conversation flow, trajectory, turn-by-turn coherence. This data has NO reference/expected answers — the agent is evaluated on how it handles the conversation. |
-| `"golden_dataset"` | Single-turn golden dataset data only (from interact) | Metrics that compare agent output against expected behavior or reference data. This data HAS reference answers — the agent is evaluated on correctness against ground truth. |
+| `"all"` (default) | Both sources | Use for metrics that evaluate ANY agent response (e.g., tool usage quality, response completeness). |
+| `"scenarios"` | Multi-turn ADK User Sim data only | This data has conversation_history and trajectory but **NO reference/expected answers**. Use for: conversation flow, trajectory accuracy, turn-by-turn coherence, multi-turn context handling. API Predefined multi-turn metrics (e.g., MULTI_TURN_GENERAL_QUALITY) MUST use this. |
+| `"golden_dataset"` | Single-turn golden dataset data only (from interact) | This data **HAS reference_data with expected answers**. Use for: correctness vs ground truth, factual accuracy, expected tool calls. Metrics that use `reference_data` fields in their mapping MUST use this. |
 
-Choose `applies_to` based on what your metric actually evaluates:
-- Does it need `reference_data` (expected answers)? → `"golden_dataset"`
-- Does it evaluate conversation flow or trajectory across turns? → `"scenarios"`
-- Does it evaluate the response itself regardless of context? → `"all"`
+**Decision rules for `applies_to`:**
+- Does the metric use `reference_data.*` fields (expected answers, expected tools)? → `"golden_dataset"` (this data is only available from golden datasets)
+- Does it evaluate multi-turn conversation flow, trajectory, or turn coherence? → `"scenarios"` (only multi-turn data has meaningful conversation_history)
+- Does it evaluate the response quality in a way that works for both? → `"all"`
+
+### Available Managed (Predefined) Metrics
+
+In addition to custom LLM metrics, you can include **managed metrics** — Google's built-in evaluation rubrics that require no custom template. Include them in your output alongside custom metrics when appropriate.
+
+**Format for managed metrics** (no template or dataset_mapping needed):
+```json
+"metric_name": {{
+    "is_managed": true,
+    "managed_metric_name": "METRIC_NAME",
+    "use_gemini_format": true,
+    "applies_to": "all"
+}}
+```
+
+| Managed Metric | applies_to | What it evaluates |
+|---|---|---|
+| `GENERAL_QUALITY` | all | Overall response quality (rubric, 0-1 pass rate) |
+| `TEXT_QUALITY` | all | Writing quality: grammar, clarity, structure (1-5) |
+| `INSTRUCTION_FOLLOWING` | all | Adherence to user instructions (1-5) |
+| `FLUENCY` | all | Language fluency and naturalness (1-5) |
+| `COHERENCE` | all | Logical flow and consistency (1-5) |
+| `GROUNDEDNESS` | all | Whether claims are supported by context (1-5) |
+| `SAFETY` | all | Freedom from harmful content (rubric, 0-1 pass rate) |
+| `VERBOSITY` | all | Response length appropriateness (-2 to 2) |
+| `SUMMARIZATION_QUALITY` | all | Summarization coverage/accuracy (1-5) |
+| `QUESTION_ANSWERING_QUALITY` | all | QA accuracy and completeness (1-5) |
+| `MULTI_TURN_CHAT_QUALITY` | **scenarios** | Multi-turn conversation quality (rubric, 0-1 pass rate) |
+| `MULTI_TURN_SAFETY` | **scenarios** | Safety across multi-turn conversations (rubric, 0-1 pass rate) |
+
+**When to use managed vs custom metrics:**
+- Use **managed metrics** for standard quality dimensions (quality, safety, fluency) — they're well-calibrated and free
+- Use **custom metrics** for agent-specific behaviors (tool usage patterns, domain logic, capability boundaries) — these need tailored rubrics
+- You can mix both in one output — include managed metrics as-is plus custom metrics with full template/mapping
 
 ### ONLY these three placeholder names are allowed:
 
@@ -187,11 +221,12 @@ Note: In the `template` field inside `source_columns`, colons are replaced with 
 
 **Part 1 — Metrics:**
 1. Analyze the agent's tools, instruction/prompt, sub-agents, state usage, and domain
-2. Generate 2-3 custom metrics that evaluate aspects SPECIFIC to this agent (fewer focused metrics are better than many vague ones — each metric costs API calls per eval case)
-3. Each metric should target a distinct quality dimension
-4. Set `applies_to` correctly: use `"golden_dataset"` for metrics that need reference data, `"scenarios"` for metrics that evaluate multi-turn conversation flow, `"all"` for general metrics
-5. Reference the agent's actual tool names, state variables, and capabilities in templates
-6. If existing metrics are provided, improve or complement them — don't duplicate
+2. If existing metrics are provided: **preserve and improve them**. Include every existing metric in your output (improved or as-is). Only remove a metric if you provide a clear reason in the rationale (e.g., "removed X because it duplicates Y" or "removed X because its mapping was broken"). Never silently drop existing metrics.
+3. Generate additional metrics to fill gaps — target 3-5 total metrics (fewer focused metrics are better than many vague ones — each metric costs API calls per eval case)
+4. You can include both **managed metrics** (predefined, no template needed) and **custom LLM metrics** (with template + dataset_mapping). Use managed metrics for standard dimensions (quality, safety, fluency) and custom metrics for agent-specific behaviors.
+5. Each metric should target a distinct quality dimension
+6. Set `applies_to` correctly: use `"golden_dataset"` for metrics that need reference data, `"scenarios"` for metrics that evaluate multi-turn conversation flow, `"all"` for general metrics
+7. Reference the agent's actual tool names, state variables, and capabilities in custom metric templates
 
 **Part 2 — Recommendations:**
 Provide expert recommendations for the developer's evaluation strategy:
@@ -201,12 +236,12 @@ Provide expert recommendations for the developer's evaluation strategy:
 - **Existing file improvements:** If existing scenarios/golden data were provided, suggest what to keep, remove, or modify
 
 **IMPORTANT constraints:**
-- Do NOT generate `general_quality` or `safety` metrics — those are auto-included separately
+- Only generate metrics the user actually needs — do NOT add generic metrics like `safety` or `general_quality` unless the user specifically asks for them or they are already in the existing metrics file
 - Metric names must be `snake_case`
-- Every template MUST end with: `Score: [0-5]\\nExplanation: [Your reasoning]`
+- Every template MUST end with a scoring line using `Score: [X]` format (e.g., `Score: [0-5]` or `Score: [0-1]`) followed by `\\nExplanation: [Your reasoning]` — the evaluation parser relies on this pattern
 - dataset_mapping keys MUST ONLY be `prompt`, `response`, and/or `reference` — the SDK crashes with any other name
 - The template placeholders `{{prompt}}`, `{{response}}`, `{{reference}}` must match the dataset_mapping keys
-- Score range must be 0-5 for all custom metrics
+- Score range should be 0-5 for consistency, but 0-1 (binary pass/fail) or 0-3 (checklist) are valid if they match the metric's evaluation style
 - Only use valid source_columns from the table above
 - Set `applies_to` to `"all"`, `"scenarios"`, or `"golden_dataset"` — see table above for guidance
 
@@ -326,40 +361,45 @@ def _discover_existing_eval_files(agent_dir: Path) -> Dict[str, str]:
     if not eval_dir.exists():
         return existing
 
-    # Existing metric definitions
-    metrics_file = eval_dir / "metrics" / "metric_definitions.json"
-    if metrics_file.exists():
+    # Discover eval files dynamically
+    from agent_eval.core.config import find_eval_files
+    discovered = find_eval_files(eval_dir)
+
+    # Existing metric definitions (use first found)
+    for metrics_file in discovered["metrics"]:
         try:
             existing["metrics"] = metrics_file.read_text()
+            break
         except Exception:
             pass
 
-    # Existing scenarios (show first 3 for context)
-    scenarios_file = eval_dir / "scenarios" / "conversation_scenarios.json"
-    if scenarios_file.exists():
+    # Existing scenarios (show first 3 for context, from all discovered files)
+    all_scenarios = []
+    for scenarios_file in discovered["scenarios"]:
         try:
             content = json.loads(scenarios_file.read_text())
-            scenarios = content.get("scenarios", [])
-            # Truncate to first 3 scenarios to keep prompt manageable
-            preview = {"scenarios": scenarios[:3]}
-            if len(scenarios) > 3:
-                preview["_note"] = f"Showing 3 of {len(scenarios)} scenarios"
-            existing["scenarios"] = json.dumps(preview, indent=2)
+            all_scenarios.extend(content.get("scenarios", []))
         except Exception:
             pass
+    if all_scenarios:
+        preview = {"scenarios": all_scenarios[:3]}
+        if len(all_scenarios) > 3:
+            preview["_note"] = f"Showing 3 of {len(all_scenarios)} scenarios"
+        existing["scenarios"] = json.dumps(preview, indent=2)
 
-    # Existing golden dataset (show first 3 entries)
-    golden_file = eval_dir / "eval_data" / "golden_dataset.json"
-    if golden_file.exists():
+    # Existing golden dataset (show first 3 entries, from all discovered files)
+    all_questions = []
+    for golden_file in discovered["golden_data"]:
         try:
             content = json.loads(golden_file.read_text())
-            questions = content.get("golden_questions", [])
-            preview = {"golden_questions": questions[:3]}
-            if len(questions) > 3:
-                preview["_note"] = f"Showing 3 of {len(questions)} questions"
-            existing["golden_data"] = json.dumps(preview, indent=2)
+            all_questions.extend(content.get("golden_questions", content.get("questions", [])))
         except Exception:
             pass
+    if all_questions:
+        preview = {"golden_questions": all_questions[:3]}
+        if len(all_questions) > 3:
+            preview["_note"] = f"Showing 3 of {len(all_questions)} questions"
+        existing["golden_data"] = json.dumps(preview, indent=2)
 
     # Session input (for agent name context)
     session_file = eval_dir / "scenarios" / "session_input.json"
@@ -428,12 +468,13 @@ def _build_prompt(
     if existing_eval:
         parts = ["## Existing Evaluation Files\n"]
         parts.append(
-            "The agent already has evaluation files. You should:\n"
+            "The agent already has evaluation files. You MUST:\n"
+            "- **Keep** ALL existing metrics in your output (include them as-is or improved)\n"
             "- **Improve** existing metrics that have issues (fix mappings, sharpen rubrics, adjust scores)\n"
-            "- **Keep** existing metrics that are working well (include them as-is in your output)\n"
             "- **Add** new metrics for uncovered dimensions\n"
-            "- **Remove** metrics that are redundant or poorly designed\n"
-            "Your output replaces the existing metrics file, so include ALL metrics you recommend — both improved originals and new ones.\n"
+            "- **Remove** a metric ONLY if you explain why in the `rationale` field (e.g., broken mapping, exact duplicate of another metric)\n"
+            "Your output replaces the existing metrics file, so include ALL metrics you recommend — both preserved originals and new ones. "
+            "Do NOT silently drop metrics.\n"
         )
 
         if "metrics" in existing_eval:
@@ -479,13 +520,10 @@ def _call_gemini(prompt: str, model: str) -> str:
             "Install it with: pip install google-genai"
         )
 
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
+    from agent_eval.core.config import get_project_id, get_location
 
-    # Determine location
-    if model.startswith("gemini-3"):
-        location = "global"
-    else:
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    project = get_project_id()
+    location = get_location(model)
 
     if not project:
         raise MetricGenerationError(
@@ -567,8 +605,11 @@ def _parse_and_validate_metrics(
         if "agents" not in defn:
             defn["agents"] = [agent_name]
 
-        # Ensure metric_type is set
-        defn["metric_type"] = "llm"
+        # Ensure metric_type is set (managed metrics keep their type)
+        if not defn.get("is_managed"):
+            defn["metric_type"] = "llm"
+        else:
+            defn.setdefault("metric_type", "llm")
 
         valid_metrics[name] = defn
 
@@ -584,6 +625,18 @@ def _validate_single_metric(name: str, defn: Dict) -> List[str]:
 
     if not isinstance(defn, dict):
         return [f"'{name}': not a dict"]
+
+    # Managed/predefined metrics (e.g., GENERAL_QUALITY, SAFETY) don't need
+    # template or dataset_mapping — the SDK provides the evaluation logic.
+    if defn.get("is_managed"):
+        if not defn.get("managed_metric_name"):
+            errors.append(f"'{name}': managed metric missing 'managed_metric_name'")
+        applies_to = defn.get("applies_to", "all")
+        if applies_to not in ("all", "scenarios", "golden_dataset"):
+            errors.append(
+                f"'{name}': applies_to must be 'all', 'scenarios', or 'golden_dataset', got '{applies_to}'"
+            )
+        return errors
 
     # Validate applies_to
     applies_to = defn.get("applies_to", "all")
@@ -655,8 +708,12 @@ def _validate_single_metric(name: str, defn: Dict) -> List[str]:
             f"'{name}': template uses {missing_in_mapping} but they're not in dataset_mapping"
         )
 
-    # Check template ends with score pattern
+    # Check template has a score pattern (warning, not fatal — alternative patterns may work)
     if not re.search(r'Score:\s*\[', template):
-        errors.append(f"'{name}': template must contain 'Score: [' pattern")
+        import logging
+        logging.getLogger("agent_eval.metric_generator").warning(
+            "Metric '%s': template does not contain 'Score: [' pattern — "
+            "the evaluation parser may not extract scores reliably.", name
+        )
 
     return errors

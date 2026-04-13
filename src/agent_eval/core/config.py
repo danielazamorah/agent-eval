@@ -1,4 +1,6 @@
-from typing import Optional
+import os
+from pathlib import Path
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,3 +45,71 @@ class EvalConfig(BaseSettings):
 
 # Initialize Shared Config
 CONFIG = EvalConfig()
+
+
+def get_project_id() -> Optional[str]:
+    """Get the GCP project ID from any supported source.
+
+    Checks (in order): GOOGLE_CLOUD_PROJECT env var, PROJECT_ID env var.
+    Calls load_dotenv() first to ensure .env is loaded even when config.py
+    wasn't imported earlier in the call chain.
+    """
+    load_dotenv(override=True)
+    return os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
+
+
+def get_location(model: Optional[str] = None) -> str:
+    """Get the GCP location, with smart defaults for Gemini 3+ models.
+
+    Args:
+        model: Optional model name. Gemini 3+ models require 'global'.
+
+    Returns:
+        Location string (e.g. 'us-central1', 'global').
+    """
+    load_dotenv(override=True)
+    if model and model.startswith("gemini-3"):
+        return "global"
+    return os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+
+def find_eval_files(eval_dir: Path) -> Dict[str, List[Path]]:
+    """Discover all eval files in the eval directory.
+
+    Scans each subdirectory for .json files instead of relying on
+    hardcoded filenames. Maintains convention (standard names) as
+    defaults but discovers all files.
+
+    Args:
+        eval_dir: Path to the eval/ directory.
+
+    Returns:
+        Dict with keys: 'metrics', 'scenarios', 'golden_data', 'session_input'
+        Each value is a list of matching files (sorted by name).
+    """
+    result: Dict[str, List[Path]] = {
+        "metrics": [],
+        "scenarios": [],
+        "golden_data": [],
+        "session_input": [],
+    }
+
+    metrics_dir = eval_dir / "metrics"
+    if metrics_dir.is_dir():
+        result["metrics"] = sorted(metrics_dir.glob("*.json"))
+
+    scenarios_dir = eval_dir / "scenarios"
+    if scenarios_dir.is_dir():
+        result["scenarios"] = sorted(
+            f for f in scenarios_dir.glob("*.json")
+            if f.name not in ("session_input.json", "eval_config.json")
+        )
+        session = scenarios_dir / "session_input.json"
+        if session.exists():
+            result["session_input"] = [session]
+
+    eval_data_dir = eval_dir / "eval_data"
+    if eval_data_dir.is_dir():
+        result["golden_data"] = sorted(eval_data_dir.glob("*.json"))
+
+    return result

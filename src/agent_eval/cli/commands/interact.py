@@ -74,9 +74,10 @@ def _prompt_for_config(agent_dir, app_name, questions_file, base_url, results_di
         # Try auto-detecting from eval dir
         auto_detected = None
         if eval_path:
-            candidate = eval_path / "eval_data" / "golden_dataset.json"
-            if candidate.exists():
-                auto_detected = str(candidate)
+            from agent_eval.core.config import find_eval_files
+            discovered = find_eval_files(eval_path)
+            if discovered["golden_data"]:
+                auto_detected = str(discovered["golden_data"][0])
 
         console.print()
         console.print(Panel(
@@ -282,8 +283,14 @@ def interact(agent_dir, app_name, questions_file, base_url, user_id, results_dir
 
     # Try to find metrics file
     eval_path = _find_eval_dir(agent_path)
-    eval_metrics = eval_path / "metrics" / "metric_definitions.json" if eval_path else None
-    rel_metrics = os.path.relpath(eval_metrics, cwd) if eval_metrics and eval_metrics.exists() else "<path/to/metric_definitions.json>"
+    # Find metrics file for the "next steps" hint
+    eval_metrics = None
+    if eval_path:
+        from agent_eval.core.config import find_eval_files
+        _discovered = find_eval_files(eval_path)
+        if _discovered["metrics"]:
+            eval_metrics = _discovered["metrics"][0]
+    rel_metrics = os.path.relpath(eval_metrics, cwd) if eval_metrics else "<path/to/metric_definitions.json>"
 
     console.print()
     console.print(Panel(
