@@ -27,6 +27,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent_eval.core.adk_optimization_patterns import ADK_OPTIMIZATION_PATTERNS
+from agent_eval.core.metric_discovery import (
+    discover_managed_metrics,
+    extract_adk_eval_knowledge,
+    format_adk_knowledge_for_prompt,
+    format_metrics_for_prompt,
+)
 from agent_eval.core.scaffold import METRIC_TEMPLATES
 from agent_eval.core.utils import discover_agent_context
 
@@ -275,6 +281,460 @@ Provide expert recommendations for the developer's evaluation strategy:
 """
 
 
+# ---------------------------------------------------------------------------
+# Multi-step prompts for focused Gemini calls (reduced hallucination)
+# ---------------------------------------------------------------------------
+
+AGENT_ANALYSIS_PROMPT = """You are a Senior Evaluation Architect analyzing an ADK agent's source code to identify all data available for evaluation.
+
+## Agent Source Code
+
+{agent_source_code}
+
+## Instructions
+
+Read the source code carefully and identify:
+
+1. **tools** — Every tool the agent can use (name, purpose, argument types, return types)
+2. **state_variables** — Session state variables the agent reads/writes. Look for `state["key"]`, `state.get("key")`, or state assignments. These are critical — they bridge agent logic and evaluation. Data saved to state during execution becomes available for evaluation metrics via `extracted_data:state_variables.<key>`.
+3. **sub_agents** — Sub-agents delegated to (name, purpose, when triggered)
+4. **key_behaviors** — Behaviors worth evaluating: capability boundaries (what the agent refuses), error handling, domain-specific logic, multi-step workflows, edge cases
+5. **data_summary** — A concise human-readable summary of what evaluation data is available
+
+**IMPORTANT:** Be factual — only report what is explicitly in the code. Do not invent tools, state variables, or behaviors.
+
+**Respond with ONLY a JSON object:**
+
+{{
+    "tools": [
+        {{"name": "tool_name", "description": "what it does", "args": ["arg1", "arg2"]}}
+    ],
+    "state_variables": {{
+        "variable_name": "description of what it stores and when"
+    }},
+    "sub_agents": [
+        {{"name": "agent_name", "purpose": "what it handles"}}
+    ],
+    "key_behaviors": [
+        "description of a behavior worth evaluating"
+    ],
+    "data_summary": "Human-readable summary of available evaluation data."
+}}
+"""
+
+METRIC_DEFINITIONS_PROMPT = """You are a Senior Evaluation Architect generating custom LLM-as-judge metrics for an ADK agent.
+
+{user_priorities_section}
+
+---
+
+## Agent Analysis (from source code inspection)
+
+{agent_analysis_json}
+
+## Selected Managed Metrics (already chosen by the user — include as-is)
+
+The user has selected these managed metrics. Include them in your output EXACTLY as shown below — do not modify, remove, or re-generate them:
+
+{selected_managed_json}
+
+---
+
+{existing_metrics_section}
+
+---
+
+## Metric Format Reference
+
+**CRITICAL SDK CONSTRAINT:** The Vertex AI Evaluation SDK ONLY accepts three column names in dataset_mapping: `prompt`, `response`, and `reference`. Using ANY other column name will crash the SDK. You MUST combine all data into these three columns.
+
+Each custom metric must follow this exact JSON structure:
+
+```json
+{{
+    "metric_name_snake_case": {{
+        "metric_type": "llm",
+        "applies_to": "all",
+        "score_range": {{
+            "min": 0,
+            "max": 5,
+            "description": "0=Completely wrong, 5=Perfect"
+        }},
+        "dataset_mapping": {{
+            "prompt": {{"source_column": "user_inputs"}},
+            "response": {{"source_column": "final_response"}},
+            "reference": {{"source_column": "trace_summary"}}
+        }},
+        "template": "Evaluate...\\n\\n**User Request:** {{prompt}}\\n**Response:** {{response}}\\n**Context:** {{reference}}\\n\\nScore: [0-5]\\nExplanation: [Your reasoning]"
+    }}
+}}
+```
+
+### `applies_to` — which data a metric runs on
+
+| Value | Data source | Key characteristics |
+|---|---|---|
+| `"all"` (default) | Both sources | Use for metrics that evaluate ANY agent response. |
+| `"scenarios"` | Multi-turn ADK User Sim data only | Has conversation_history, trajectory. **NO reference/expected answers.** |
+| `"golden_dataset"` | Single-turn golden dataset only | **HAS reference_data with expected answers.** |
+
+### ONLY these three placeholder names are allowed:
+
+| Placeholder | Typical mapping | Usage |
+|---|---|---|
+| `prompt` | User input — usually `user_inputs` | The user's request or question |
+| `response` | Agent output — usually `final_response` or `trace_summary` | What the agent did or said |
+| `reference` | Context/evidence — tool data, declarations, state, etc. | Supporting data for evaluation |
+
+### Combining multiple data sources into `reference`:
+
+```json
+"reference": {{
+    "template": "Available Tools: {{extracted_data_tool_declarations}}\\n\\nTool Calls: {{extracted_data_tool_interactions}}",
+    "source_columns": ["extracted_data:tool_declarations", "extracted_data:tool_interactions"]
+}}
+```
+
+Note: In the `template` field inside `source_columns`, colons are replaced with underscores.
+
+### Valid `source_column` values:
+
+| source_column | Description |
+|---|---|
+| `user_inputs` | User messages (JSON list of strings) |
+| `final_response` | Agent's final text response to the user |
+| `trace_summary` | Execution trajectory summary (tool calls + results) |
+| `extracted_data:tool_interactions` | Tool calls with input arguments and output results |
+| `extracted_data:tool_declarations` | Available tools and their descriptions |
+| `extracted_data:state_variables` | Session state variables (dict of all state) |
+| `extracted_data:conversation_history` | Full multi-turn conversation |
+| `extracted_data:system_instruction` | Agent's system prompt / instruction |
+| `extracted_data:sub_agent_trace` | Agent's step-by-step reasoning trace |
+| `extracted_data:<state_var_name>` | Any agent-specific state variable |
+
+### Example metrics (for format reference only):
+
+{example_metrics}
+
+---
+
+## Available Managed Metrics Reference
+
+{managed_metrics_reference}
+
+---
+
+{adk_knowledge_section}
+
+---
+
+## Instructions
+
+1. Generate 2-4 CUSTOM LLM-as-judge metrics tailored to this specific agent
+2. If existing custom metrics are provided: **preserve and improve them** — never silently drop metrics
+3. Each custom metric should target a distinct quality dimension relevant to this agent
+4. Set `applies_to` correctly: `"golden_dataset"` for metrics needing reference data, `"scenarios"` for multi-turn flow metrics, `"all"` for general metrics
+5. Reference the agent's actual tool names, state variables, and capabilities
+6. **Do NOT generate generic metrics** (safety, fluency, coherence) — the user has already selected managed metrics for those
+7. Every template MUST end with `Score: [X]` format followed by `\\nExplanation: [Your reasoning]`
+8. dataset_mapping keys MUST ONLY be `prompt`, `response`, and/or `reference`
+9. Include the user-selected managed metrics EXACTLY as shown in the "Selected Managed Metrics" section
+
+**Respond with ONLY a JSON object** (no markdown fences):
+
+{{
+    "metrics": {{
+        ... include selected managed metrics as-is ...
+        ... include new/improved custom metrics ...
+    }},
+    "rationale": "Brief explanation of why these custom metrics were chosen."
+}}
+"""
+
+EVAL_DATA_PROMPT = """You are a Senior Evaluation Architect generating test data for evaluating an ADK agent.
+
+## Agent Source Code
+
+{agent_source_code}
+
+## Agent Analysis
+
+{agent_analysis_json}
+
+## Metric Definitions (what will be evaluated)
+
+{metric_definitions_json}
+
+---
+
+{existing_data_section}
+
+---
+
+## Instructions
+
+Generate evaluation test data for this agent:
+
+### 1. Conversation Scenarios (for ADK User Sim multi-turn evaluation)
+
+Generate 3-5 scenarios. Each scenario simulates a multi-turn conversation:
+- `starting_prompt`: The first message the simulated user sends to the agent
+- `conversation_plan`: Instructions for how the simulated user should behave in subsequent turns
+
+Good scenarios test:
+- Happy paths with different tools/workflows
+- Edge cases and error handling
+- Multi-step workflows requiring multiple tools
+- Boundary testing (requests the agent should refuse or clarify)
+- Ambiguous requests that test understanding
+
+### 2. Golden Data (for single-turn regression testing)
+
+Generate 3-5 golden test entries. Each entry is a single-turn query:
+- `user_inputs`: List of queries (usually just one)
+- `agents_evaluated`: List of agent names to evaluate
+- `reference_data`: Expected behavior including `expected_behavior` description
+
+Good golden data covers:
+- Typical queries the agent handles
+- Edge cases and out-of-scope requests
+- Queries that require specific tools
+- Queries where the expected response can be verified
+
+{existing_data_instructions}
+
+**Respond with ONLY a JSON object** (no markdown fences):
+
+{{
+    "scenarios": [
+        {{
+            "description": "What this scenario tests",
+            "starting_prompt": "The first user message",
+            "conversation_plan": "How the simulated user should behave"
+        }}
+    ],
+    "golden_data": [
+        {{
+            "description": "What this test case covers",
+            "user_inputs": ["The test query"],
+            "agents_evaluated": ["{agent_name}"],
+            "reference_data": {{
+                "expected_behavior": "What the agent should do"
+            }}
+        }}
+    ],
+    "strategy": "Overall evaluation strategy advice for this agent."
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Multi-step generation functions
+# ---------------------------------------------------------------------------
+
+def analyze_agent_data(
+    agent_dir: Path,
+    agent_name: str,
+    model: str = "gemini-3.1-pro-preview",
+) -> Dict[str, Any]:
+    """Gemini Call 1: Analyze agent source code to identify evaluation data.
+
+    This is a factual extraction task — low hallucination risk. The model
+    reads agent source code and identifies tools, state variables, sub-agents,
+    and key behaviors worth evaluating.
+
+    Returns:
+        Dict with keys: tools, state_variables, sub_agents, key_behaviors, data_summary
+    """
+    agent_context = discover_agent_context(agent_dir, quiet=True)
+    if not agent_context:
+        raise MetricGenerationError(
+            f"No agent source code found in {agent_dir}. "
+            "Make sure the directory contains agent.py."
+        )
+
+    source_parts = _format_source_code(agent_context)
+    prompt = AGENT_ANALYSIS_PROMPT.format(agent_source_code=source_parts)
+
+    raw = _call_gemini(prompt, model)
+    parsed = _extract_json(raw)
+    if not parsed:
+        raise MetricGenerationError("Could not parse agent analysis from Gemini response.")
+
+    # Validate expected keys
+    for key in ("tools", "state_variables", "key_behaviors"):
+        if key not in parsed:
+            parsed[key] = [] if key != "state_variables" else {}
+
+    return parsed
+
+
+def generate_metric_definitions(
+    agent_dir: Path,
+    agent_name: str,
+    agent_analysis: Dict[str, Any],
+    selected_managed: Dict[str, Dict],
+    user_priorities: str = "",
+    existing_metrics: Optional[Dict[str, Any]] = None,
+    model: str = "gemini-3.1-pro-preview",
+) -> Tuple[Dict[str, Any], str]:
+    """Gemini Call 2: Generate metric_definitions.json content.
+
+    Takes the agent analysis from Call 1, user-selected managed metrics,
+    and produces the final metrics dict with both managed entries (as-is)
+    and custom LLM-as-judge metrics.
+
+    Returns:
+        Tuple of (metrics_dict, rationale_string)
+    """
+    # Format selected managed metrics as JSON for the prompt
+    selected_json = json.dumps(selected_managed, indent=2)
+
+    # User priorities section
+    if user_priorities:
+        user_priorities_section = (
+            "**DEVELOPER PRIORITIES:**\n"
+            "The developer considers these aspects important to evaluate:\n"
+            f"> {user_priorities}\n\n"
+            "Prioritize custom metrics that address these concerns."
+        )
+    else:
+        user_priorities_section = ""
+
+    # Existing metrics section
+    existing_metrics_section = ""
+    if existing_metrics:
+        # Filter to just custom (non-managed) metrics for the prompt
+        custom_existing = {
+            k: v for k, v in existing_metrics.items()
+            if isinstance(v, dict) and not v.get("is_managed")
+        }
+        if custom_existing:
+            existing_metrics_section = (
+                "## Existing Custom Metrics (preserve and improve)\n\n"
+                "The agent already has these custom metrics. Include them in your output "
+                "(improved or as-is). Only remove a metric with a clear reason in the rationale.\n\n"
+                f"```json\n{json.dumps(custom_existing, indent=2)}\n```"
+            )
+
+    # Format example metrics
+    example_trajectory = json.dumps(METRIC_TEMPLATES["trajectory_accuracy"], indent=2)
+    example_tool_use = json.dumps(METRIC_TEMPLATES["tool_use_quality"], indent=2)
+    example_metrics = (
+        f"**trajectory_accuracy:**\n```json\n{example_trajectory}\n```\n\n"
+        f"**tool_use_quality:**\n```json\n{example_tool_use}\n```"
+    )
+
+    # Get managed metrics reference and ADK knowledge
+    managed_ref = format_metrics_for_prompt()
+    adk_knowledge = format_adk_knowledge_for_prompt()
+
+    prompt = METRIC_DEFINITIONS_PROMPT.format(
+        user_priorities_section=user_priorities_section,
+        agent_analysis_json=json.dumps(agent_analysis, indent=2),
+        selected_managed_json=selected_json,
+        existing_metrics_section=existing_metrics_section,
+        example_metrics=example_metrics,
+        managed_metrics_reference=managed_ref,
+        adk_knowledge_section=adk_knowledge,
+    )
+
+    raw = _call_gemini(prompt, model)
+    metrics, warnings = _parse_and_validate_metrics(raw, agent_name)
+
+    if not metrics:
+        raise MetricGenerationError(
+            "Gemini generated metrics but none passed validation."
+        )
+
+    # Extract rationale
+    rationale = ""
+    try:
+        parsed = _extract_json(raw)
+        if parsed:
+            rationale = parsed.get("rationale", "")
+    except Exception:
+        pass
+
+    if warnings:
+        rationale += "\n\nWarnings:\n" + "\n".join(f"  - {w}" for w in warnings)
+
+    return metrics, rationale
+
+
+def generate_eval_data(
+    agent_dir: Path,
+    agent_name: str,
+    agent_analysis: Dict[str, Any],
+    metric_definitions: Dict[str, Any],
+    existing_scenarios: Optional[List] = None,
+    existing_golden: Optional[List] = None,
+    model: str = "gemini-3.1-pro-preview",
+) -> Dict[str, Any]:
+    """Gemini Call 3: Generate scenarios and golden data.
+
+    Uses the agent analysis and final metric definitions to generate
+    targeted test data.
+
+    Returns:
+        Dict with keys: scenarios, golden_data, strategy
+    """
+    agent_context = discover_agent_context(agent_dir, quiet=True)
+    source_parts = _format_source_code(agent_context) if agent_context else "No source code available."
+
+    # Existing data section
+    existing_data_section = ""
+    existing_data_instructions = ""
+    parts = []
+    if existing_scenarios:
+        preview = existing_scenarios[:3]
+        parts.append(f"**Existing scenarios (preview):**\n```json\n{json.dumps(preview, indent=2)}\n```")
+    if existing_golden:
+        preview = existing_golden[:3]
+        parts.append(f"**Existing golden data (preview):**\n```json\n{json.dumps(preview, indent=2)}\n```")
+    if parts:
+        existing_data_section = (
+            "## Existing Test Data\n\n"
+            "The agent already has test data. Preserve and extend — don't replace.\n\n"
+            + "\n\n".join(parts)
+        )
+        existing_data_instructions = (
+            "**For existing data:** Preserve what's there. Add NEW entries that "
+            "cover gaps. If an existing entry has issues, include an improved version."
+        )
+
+    prompt = EVAL_DATA_PROMPT.format(
+        agent_source_code=source_parts,
+        agent_analysis_json=json.dumps(agent_analysis, indent=2),
+        metric_definitions_json=json.dumps(metric_definitions, indent=2),
+        existing_data_section=existing_data_section,
+        existing_data_instructions=existing_data_instructions,
+        agent_name=agent_name,
+    )
+
+    raw = _call_gemini(prompt, model)
+    parsed = _extract_json(raw)
+    if not parsed:
+        raise MetricGenerationError("Could not parse eval data from Gemini response.")
+
+    return {
+        "scenarios": parsed.get("scenarios", []),
+        "golden_data": parsed.get("golden_data", []),
+        "strategy": parsed.get("strategy", ""),
+    }
+
+
+def _format_source_code(agent_context: Dict[str, str]) -> str:
+    """Format agent source code files for inclusion in prompts."""
+    source_parts = []
+    for filepath, content in agent_context.items():
+        if filepath.endswith(".py"):
+            source_parts.append(f"**File: `{filepath}`**\n```python\n{content}\n```")
+        elif "GEMINI.md" in filepath:
+            source_parts.append(f"**{filepath}**\n```markdown\n{content[:5000]}\n```")
+    return "\n\n".join(source_parts) if source_parts else "No source code available."
+
+
 def generate_metrics_with_gemini(
     agent_dir: Path,
     agent_name: str,
@@ -437,15 +897,7 @@ def _build_prompt(
     existing_eval: Optional[Dict[str, str]] = None,
 ) -> str:
     """Build the Gemini prompt with agent code, existing files, and constraints."""
-    # Format agent source code
-    source_parts = []
-    for filepath, content in agent_context.items():
-        if filepath.endswith(".py"):
-            source_parts.append(f"**File: `{filepath}`**\n```python\n{content}\n```")
-        elif "GEMINI.md" in filepath:
-            source_parts.append(f"**{filepath}**\n```markdown\n{content[:5000]}\n```")
-
-    agent_source = "\n\n".join(source_parts) if source_parts else "No source code available."
+    agent_source = _format_source_code(agent_context)
 
     # Format example metrics
     example_trajectory = json.dumps(METRIC_TEMPLATES["trajectory_accuracy"], indent=2)

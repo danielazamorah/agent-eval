@@ -52,11 +52,13 @@ def _find_eval_dir(agent_dir: Path) -> Path | None:
               help="Developer focus for analysis: metric names to highlight (e.g., 'latency, cache').")
 @click.option("--skip-gemini", is_flag=True,
               help="Skip AI-powered analysis in the analyze phase.")
+@click.option("--dashboard/--no-dashboard", "run_dashboard", default=None,
+              help="Launch interactive dashboard after pipeline (default: prompt if gradio installed).")
 @click.option("--debug", is_flag=True,
               help="Show detailed logs from all phases (ADK, Vertex AI SDK, etc.).")
 def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         run_evaluate, app_name, questions_file, num_questions, skip_traces,
-        run_analyze, focus, skip_gemini, debug):
+        run_analyze, focus, skip_gemini, run_dashboard, debug):
     """Run the full evaluation pipeline: simulate, interact, evaluate, and analyze.
 
     \b
@@ -412,6 +414,53 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         console.print(f"  --results-dir {rel_run} \\")
         console.print(f"  --agent-dir {rel_agent}")
         console.print()
+
+    # ── Phase 5: Dashboard (optional) ──────────────────────────────────────
+
+    if run_evaluate and run_dashboard is not False:
+        _offer_dashboard(results_dir, run_dashboard)
+
+
+def _offer_dashboard(results_dir: Path, run_dashboard: bool | None) -> None:
+    """Offer to launch the interactive dashboard after the pipeline completes."""
+    try:
+        import gradio  # noqa: F401
+    except ImportError:
+        if run_dashboard is True:
+            # User explicitly asked for --dashboard but gradio is missing
+            console.print()
+            console.print("  [yellow]Dashboard requires optional dependencies.[/]")
+            console.print("  Install them with:  [cyan]pip install agent-eval\\[dashboard][/]")
+            console.print()
+        else:
+            # Not installed and not explicitly requested — just show a tip
+            console.print("  [dim]Tip: Install dashboard extras for interactive visualization:[/]")
+            console.print("    [cyan]pip install agent-eval\\[dashboard][/]")
+            console.print()
+        return
+
+    # Gradio is available — decide whether to launch
+    if run_dashboard is True:
+        should_launch = True
+    elif run_dashboard is False:
+        return
+    else:
+        # run_dashboard is None — prompt the user
+        from rich.prompt import Confirm
+        console.print()
+        should_launch = Confirm.ask(
+            "  Launch the interactive dashboard to compare all runs?",
+            default=False,
+        )
+
+    if should_launch:
+        console.print()
+        console.print(Rule("  Phase 5: Dashboard  ", style="bold cyan"))
+        console.print("  [dim]Starting interactive dashboard with all evaluation runs.[/]")
+        console.print()
+
+        from agent_eval.dashboard.app import launch
+        launch(str(results_dir), port=7860, share=False)
 
 
 # ── Phase implementations ─────────────────────────────────────────────────

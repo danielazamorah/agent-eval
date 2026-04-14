@@ -1,6 +1,10 @@
 """agent-eval init — scaffold the eval/ folder structure for a new agent project."""
 
+from __future__ import annotations
+
+import json
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 from rich.console import Console
@@ -191,8 +195,8 @@ def _prompt_metrics_choice(agent_dir: Path, agent_name: str) -> tuple[list[str],
     if choice == 2:
         return _prompt_starter_metrics(), None, None
 
-    # AI generation path
-    return _prompt_ai_metrics(agent_dir, agent_name)
+    # AI generation path — multi-step pipeline
+    return _prompt_ai_metrics_multistep(agent_dir, agent_name)
 
 
 def _prompt_starter_metrics() -> list[str]:
@@ -225,13 +229,207 @@ def _prompt_starter_metrics() -> list[str]:
     return selected
 
 
-def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dict | None, dict | None]:
-    """Generate metrics with AI, show results, and get user confirmation.
+def _prompt_managed_metrics_selection(
+    managed_metrics: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """Display all available managed metrics and let the user select by number.
+
+    Returns a dict of selected metric entries ready for metric_definitions.json.
+    """
+    # Separate by type for display
+    api_metrics = {
+        k: v for k, v in managed_metrics.items()
+        if v.get("resolution") == "api_predefined"
+    }
+    gcs_metrics = {
+        k: v for k, v in managed_metrics.items()
+        if v.get("resolution") == "gcs_yaml"
+    }
+
+    # Build ordered list for selection
+    all_ordered: list[tuple[str, Dict]] = []
+    all_ordered.extend(sorted(api_metrics.items()))
+    all_ordered.extend(sorted(gcs_metrics.items()))
+
+    # Defaults: general_quality and safety
+    defaults = {"general_quality", "safety"}
+    selected_indices = {
+        i for i, (k, _) in enumerate(all_ordered) if k in defaults
+    }
+
+    # Build table
+    def _draw_managed_table() -> None:
+        table = Table(
+            title="Available Managed Metrics",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+        table.add_column("#", style="dim", width=4, justify="right")
+        table.add_column("", width=3)  # checkbox
+        table.add_column("Metric", style="bold cyan", min_width=30)
+        table.add_column("Score", min_width=14)
+        table.add_column("Type", style="dim", min_width=12)
+        table.add_column("Description", ratio=2)
+
+        for i, (key, info) in enumerate(all_ordered):
+            marker = "[green]x[/]" if i in selected_indices else " "
+            sr = info.get("score_range", {})
+            score_type = sr.get("type", "unknown")
+            score_str = f"{sr.get('min', '?')}-{sr.get('max', '?')}"
+            applies = info.get("applies_to", "all")
+            resolution = "server" if info.get("resolution") == "api_predefined" else "client"
+            desc = info.get("description", "")[:50]
+
+            if applies != "all":
+                desc += f" [{applies}]"
+
+            table.add_row(
+                str(i + 1), f"[{marker}]",
+                info["managed_metric_name"], f"{score_str} ({score_type})",
+                resolution, desc,
+            )
+
+        console.print(table)
+        console.print()
+        console.print("  [dim]Rubric (0-1) metrics are recommended for most use cases.[/]")
+        console.print("  [dim]Multi-turn metrics require scenarios (simulation) data.[/]")
+        console.print("  [dim]Server = API Predefined (auto-evaluated). Client = GCS YAML template.[/]")
+
+    _draw_managed_table()
+
+    console.print()
+    console.print("  [dim]Enter numbers to toggle (comma-separated), or press Enter to continue.[/]")
+
+    while True:
+        raw = Prompt.ask("  Toggle", default="")
+        if raw.strip() == "":
+            break
+        for part in raw.split(","):
+            try:
+                idx = int(part.strip()) - 1
+                if 0 <= idx < len(all_ordered):
+                    if idx in selected_indices:
+                        selected_indices.discard(idx)
+                    else:
+                        selected_indices.add(idx)
+            except ValueError:
+                console.print("  [red]Enter numbers or press Enter to continue.[/]")
+                continue
+        console.print()
+        _draw_managed_table()
+        console.print()
+
+    # Build selected metrics dict
+    from agent_eval.core.metric_discovery import get_metric_definition_entry
+    selected: Dict[str, Dict] = {}
+    for i in sorted(selected_indices):
+        key, info = all_ordered[i]
+        entry = get_metric_definition_entry(key, managed_metrics)
+        if entry:
+            selected[key] = entry
+
+    return selected
+
+
+def _display_agent_analysis(analysis: Dict[str, Any]) -> None:
+    """Display the agent analysis results in a Rich table."""
+    table = Table(
+        title="Data Available for Evaluation",
+        border_style="cyan",
+        padding=(0, 2),
+    )
+    table.add_column("Source", style="bold cyan", min_width=30)
+    table.add_column("Description", ratio=2)
+
+    # Always-available data
+    table.add_row("user_inputs", "User messages (always available)")
+    table.add_row("final_response", "Agent's final text response")
+    table.add_row("trace_summary", "Execution trajectory summary")
+
+    # Tools
+    tools = analysis.get("tools", [])
+    if tools:
+        tool_names = ", ".join(t.get("name", "?") for t in tools[:5])
+        table.add_row("tool_interactions", f"{len(tools)} tools: {tool_names}")
+
+    # State variables
+    state_vars = analysis.get("state_variables", {})
+    for var_name, description in state_vars.items():
+        table.add_row(f"state: {var_name}", str(description)[:60])
+
+    # Sub-agents
+    sub_agents = analysis.get("sub_agents", [])
+    if sub_agents:
+        agent_names = ", ".join(a.get("name", "?") for a in sub_agents[:5])
+        table.add_row("sub_agent_trace", f"{len(sub_agents)} sub-agents: {agent_names}")
+
+    # Conversation history
+    table.add_row("conversation_history", "Full multi-turn conversation (if simulation)")
+
+    console.print(table)
+    console.print()
+    console.print("  [dim]State variables are available via extracted_data:<name>[/]")
+    console.print("  [dim]Creating state variables in your agent makes them[/]")
+    console.print("  [dim]available for evaluation metrics automatically.[/]")
+
+    # Key behaviors
+    behaviors = analysis.get("key_behaviors", [])
+    if behaviors:
+        console.print()
+        console.print("  [bold]Key behaviors to evaluate:[/]")
+        for b in behaviors[:5]:
+            console.print(f"    [dim]-[/] {b}")
+
+
+def _prompt_ai_metrics_multistep(
+    agent_dir: Path, agent_name: str,
+) -> tuple[list[str], dict | None, dict | None]:
+    """Multi-step AI metric generation pipeline.
+
+    Step 3a: Discover managed metrics + ADK knowledge
+    Step 3b: User selects managed metrics
+    Step 3c: Gemini Call 1 — Analyze agent source code
+    Step 3d: Gemini Call 2 — Generate custom metric definitions
+    Step 3e: Gemini Call 3 — Generate scenarios + golden data
+    Step 3f: Display & confirm
 
     Returns (starter_keys_for_managed, custom_definitions_or_None, recommendations_or_None).
-    On failure or rejection, falls back to starter metrics.
     """
-    # Ask what matters to them
+    # ── Step 3a: Discover evaluation resources ─────────────────────────────
+    console.print()
+    with console.status(
+        "[bold blue]Validating latest evaluation resources...[/]", spinner="dots"
+    ):
+        from agent_eval.core.metric_discovery import discover_managed_metrics
+        managed_metrics = discover_managed_metrics()
+
+    console.print(
+        f"  [green]Found {len(managed_metrics)} managed metrics[/] "
+        f"from the Vertex AI GenAI Evaluation SDK."
+    )
+
+    # ── Step 3b: User selects managed metrics ──────────────────────────────
+    console.print()
+    console.print(Panel(
+        "[bold]Select Managed Metrics[/]\n\n"
+        "These are Google's built-in evaluation rubrics — no custom template needed.\n"
+        "Toggle metrics on/off by entering their numbers.",
+        border_style="blue",
+        padding=(1, 2),
+    ))
+    console.print()
+
+    selected_managed = _prompt_managed_metrics_selection(managed_metrics)
+
+    if selected_managed:
+        names = ", ".join(
+            info["managed_metric_name"] for info in selected_managed.values()
+        )
+        console.print(f"\n  [green]Selected:[/] {names}")
+    else:
+        console.print("\n  [dim]No managed metrics selected.[/]")
+
+    # ── Ask for user priorities ────────────────────────────────────────────
     console.print()
     console.print(Panel(
         "[bold]What matters most?[/]\n\n"
@@ -242,105 +440,101 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
         border_style="cyan",
         padding=(1, 2),
     ))
-
     console.print()
     user_priorities = Prompt.ask("  Evaluation priorities", default="")
 
-    # Check for existing eval files and let the user choose which to include
-    eval_dir = agent_dir / "eval"
-    exclude_context: set[str] = set()
+    # ── Load existing eval files ───────────────────────────────────────────
+    existing_metrics = _load_existing_metrics(agent_dir)
+    existing_scenarios, existing_golden = _load_existing_eval_data(agent_dir)
 
-    found_files: list[tuple[str, str, str]] = []  # (key, label, detail)
-    if (eval_dir / "metrics" / "metric_definitions.json").exists():
-        found_files.append(("metrics", "Metric definitions", "eval/metrics/metric_definitions.json"))
-    if (eval_dir / "scenarios" / "conversation_scenarios.json").exists():
-        found_files.append(("scenarios", "Scenarios", "eval/scenarios/conversation_scenarios.json"))
-    if (eval_dir / "eval_data" / "golden_dataset.json").exists():
-        found_files.append(("golden_data", "Golden dataset", "eval/eval_data/golden_dataset.json"))
-
-    # Only use the latest results folder
-    results_dir = eval_dir / "results"
-    latest_analysis: Path | None = None
-    if results_dir.exists():
-        run_folders = sorted(
-            [d for d in results_dir.iterdir() if d.is_dir() and (d / "gemini_analysis.md").exists()],
-            key=lambda d: d.stat().st_mtime,
-            reverse=True,
-        )
-        if run_folders:
-            latest_analysis = run_folders[0] / "gemini_analysis.md"
-            rel_path = latest_analysis.relative_to(agent_dir)
-            found_files.append(("analysis", "Previous analysis (latest run)", str(rel_path)))
-
-    if found_files:
-        console.print()
-        console.print("  [bold]Existing eval files found.[/] Gemini can use these as context")
-        console.print("  [dim]to build on your current setup instead of starting from scratch.[/]")
-        console.print()
-
-        for i, (key, label, detail) in enumerate(found_files, 1):
-            console.print(f"    [bold]{i}.[/] [cyan]{label}[/]  [dim]→ {detail}[/]")
-
-        console.print()
-        console.print("  [dim]Enter numbers to exclude from context (comma-separated),[/]")
-        console.print("  [dim]or press Enter to include all.[/]")
-        console.print()
-        raw = Prompt.ask("  Exclude", default="")
-
-        if raw.strip():
-            for part in raw.split(","):
-                try:
-                    idx = int(part.strip()) - 1
-                    if 0 <= idx < len(found_files):
-                        key = found_files[idx][0]
-                        exclude_context.add(key)
-                        console.print(f"    [dim]Excluding: {found_files[idx][1]}[/]")
-                except ValueError:
-                    pass
-
-        included = [f[1] for f in found_files if f[0] not in exclude_context]
-        if included:
-            console.print(f"\n  [dim]Using as context: {', '.join(included)}[/]")
-        else:
-            console.print(f"\n  [dim]Generating from agent source code only.[/]")
-
-    # Show spinner while generating
+    # ── Step 3c: Gemini Call 1 — Analyze agent source code ─────────────────
     console.print()
-    with console.status("[bold blue]Analyzing agent source code with Gemini...[/]", spinner="dots"):
+    agent_analysis: Dict[str, Any] = {}
+    with console.status(
+        "[bold blue]Identifying evaluation data available in your agent...[/]",
+        spinner="dots",
+    ):
         try:
-            from agent_eval.core.metric_generator import generate_metrics_with_gemini
-            metrics, rationale, recommendations = generate_metrics_with_gemini(
+            from agent_eval.core.metric_generator import analyze_agent_data
+            agent_analysis = analyze_agent_data(agent_dir, agent_name)
+        except Exception as e:
+            console.print(f"  [yellow]Agent analysis failed:[/] {e}")
+            console.print("  [dim]Continuing with default data assumptions.[/]")
+            agent_analysis = {"tools": [], "state_variables": {}, "key_behaviors": []}
+
+    if agent_analysis.get("tools") or agent_analysis.get("state_variables"):
+        console.print()
+        _display_agent_analysis(agent_analysis)
+
+    # ── Step 3d: Gemini Call 2 — Generate custom metrics ───────────────────
+    console.print()
+    custom_metrics: Dict[str, Any] = {}
+    rationale = ""
+    with console.status(
+        "[bold blue]Generating custom metric definitions...[/]", spinner="dots"
+    ):
+        try:
+            from agent_eval.core.metric_generator import generate_metric_definitions
+            custom_metrics, rationale = generate_metric_definitions(
                 agent_dir=agent_dir,
                 agent_name=agent_name,
+                agent_analysis=agent_analysis,
+                selected_managed=selected_managed,
                 user_priorities=user_priorities,
-                exclude_context=exclude_context if exclude_context else None,
+                existing_metrics=existing_metrics,
             )
         except Exception as e:
-            console.print(f"\n  [yellow]AI generation failed:[/] {e}")
+            console.print(f"\n  [yellow]Metric generation failed:[/] {e}")
             console.print("  [dim]Falling back to starter metrics.[/]\n")
             return _prompt_starter_metrics(), None, None
 
     # Display generated metrics
     console.print()
-    _display_generated_metrics(metrics, rationale)
+    _display_generated_metrics(custom_metrics, rationale)
 
-    # Display recommendations
+    # ── Step 3e: Gemini Call 3 — Generate scenarios + golden data ──────────
+    console.print()
+    recommendations: Dict[str, Any] = {}
+    with console.status(
+        "[bold blue]Generating test scenarios and golden data...[/]", spinner="dots"
+    ):
+        try:
+            from agent_eval.core.metric_generator import generate_eval_data
+            eval_data = generate_eval_data(
+                agent_dir=agent_dir,
+                agent_name=agent_name,
+                agent_analysis=agent_analysis,
+                metric_definitions=custom_metrics,
+                existing_scenarios=existing_scenarios,
+                existing_golden=existing_golden,
+            )
+            recommendations = eval_data
+        except Exception as e:
+            console.print(f"  [yellow]Test data generation failed:[/] {e}")
+            console.print("  [dim]You can add scenarios and golden data manually later.[/]")
+
     if recommendations:
         _display_recommendations(recommendations)
 
-    # Ask what to do next — loop allows feedback + regeneration
+    # ── Step 3f: Confirm ───────────────────────────────────────────────────
     while True:
         console.print()
         has_existing = (agent_dir / "eval").exists()
         if has_existing:
-            console.print("  [dim]Existing eval files will be backed up before updating.[/]")
-        else:
-            console.print("  [dim]These metrics, scenarios, and test queries will be written to your eval/ folder.[/]")
+            console.print(
+                "  [dim]Existing eval files will be backed up before updating.[/]"
+            )
 
         console.print()
-        console.print("    [bold]1.[/] [green]Accept[/] — create the eval files with these metrics and recommendations")
-        console.print("    [bold]2.[/] [cyan]Refine[/] — provide feedback and regenerate")
-        console.print("    [bold]3.[/] [yellow]Skip[/]   — use starter metrics instead")
+        console.print(
+            "    [bold]1.[/] [green]Accept[/] — create eval files with these metrics and test data"
+        )
+        console.print(
+            "    [bold]2.[/] [cyan]Refine[/] — provide feedback and regenerate metrics"
+        )
+        console.print(
+            "    [bold]3.[/] [yellow]Skip[/]   — use starter metrics instead"
+        )
 
         console.print()
         action = IntPrompt.ask("  Select", default=1)
@@ -349,15 +543,15 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
             action = IntPrompt.ask("  Select", default=1)
 
         if action == 1:
-            # Always include general_quality and safety as managed metrics
-            starter_keys = ["general_quality", "safety"]
-            return starter_keys, metrics, recommendations
+            # Return managed metric keys + custom metrics
+            starter_keys = list(selected_managed.keys())
+            return starter_keys, custom_metrics, recommendations
 
         if action == 3:
             console.print("  [dim]Switching to starter metrics.[/]\n")
             return _prompt_starter_metrics(), None, None
 
-        # action == 2: Refine — get feedback and regenerate
+        # action == 2: Refine — regenerate metrics (Call 2 only, not analysis)
         console.print()
         console.print(Panel(
             "[bold]What should change?[/]\n\n"
@@ -374,54 +568,115 @@ def _prompt_ai_metrics(agent_dir: Path, agent_name: str) -> tuple[list[str], dic
         if not feedback.strip():
             continue
 
-        # Combine original priorities with feedback
         combined_priorities = user_priorities
         if combined_priorities:
-            combined_priorities += f"\n\nADDITIONAL FEEDBACK (the user reviewed the previous generation and wants these changes): {feedback}"
+            combined_priorities += (
+                f"\n\nADDITIONAL FEEDBACK: {feedback}"
+            )
         else:
             combined_priorities = f"FEEDBACK on previous generation: {feedback}"
 
         console.print()
-        with console.status("[bold blue]Regenerating metrics with your feedback...[/]", spinner="dots"):
+        with console.status(
+            "[bold blue]Regenerating metrics with your feedback...[/]",
+            spinner="dots",
+        ):
             try:
-                from agent_eval.core.metric_generator import generate_metrics_with_gemini
-                metrics, rationale, recommendations = generate_metrics_with_gemini(
+                from agent_eval.core.metric_generator import generate_metric_definitions
+                custom_metrics, rationale = generate_metric_definitions(
                     agent_dir=agent_dir,
                     agent_name=agent_name,
+                    agent_analysis=agent_analysis,
+                    selected_managed=selected_managed,
                     user_priorities=combined_priorities,
-                    exclude_context=exclude_context if exclude_context else None,
+                    existing_metrics=existing_metrics,
                 )
             except Exception as e:
                 console.print(f"\n  [yellow]Regeneration failed:[/] {e}")
                 console.print("  [dim]Showing previous results.[/]")
                 continue
 
-        # Update priorities for next potential loop
         user_priorities = combined_priorities
-
-        # Show new results
         console.print()
-        _display_generated_metrics(metrics, rationale)
+        _display_generated_metrics(custom_metrics, rationale)
         if recommendations:
             _display_recommendations(recommendations)
+
+
+def _load_existing_metrics(agent_dir: Path) -> Optional[Dict[str, Any]]:
+    """Load existing metric definitions if present."""
+    eval_dir = agent_dir / "eval"
+    if not eval_dir.exists():
+        return None
+
+    from agent_eval.core.config import find_eval_files
+    discovered = find_eval_files(eval_dir)
+    for metrics_file in discovered["metrics"]:
+        try:
+            data = json.loads(metrics_file.read_text())
+            return data.get("metrics", {})
+        except Exception:
+            pass
+    return None
+
+
+def _load_existing_eval_data(
+    agent_dir: Path,
+) -> tuple[Optional[list], Optional[list]]:
+    """Load existing scenarios and golden data if present."""
+    eval_dir = agent_dir / "eval"
+    if not eval_dir.exists():
+        return None, None
+
+    from agent_eval.core.config import find_eval_files
+    discovered = find_eval_files(eval_dir)
+
+    scenarios = None
+    all_scenarios: list = []
+    for f in discovered["scenarios"]:
+        try:
+            content = json.loads(f.read_text())
+            all_scenarios.extend(content.get("scenarios", []))
+        except Exception:
+            pass
+    if all_scenarios:
+        scenarios = all_scenarios
+
+    golden = None
+    all_questions: list = []
+    for f in discovered["golden_data"]:
+        try:
+            content = json.loads(f.read_text())
+            all_questions.extend(
+                content.get("golden_questions", content.get("questions", []))
+            )
+        except Exception:
+            pass
+    if all_questions:
+        golden = all_questions
+
+    return scenarios, golden
 
 
 def _display_generated_metrics(metrics: dict, rationale: str) -> None:
     """Display AI-generated metrics in a Rich table."""
     table = Table(
-        title="AI-Generated Metrics",
+        title="Evaluation Metrics",
         border_style="cyan",
         padding=(0, 2),
     )
     table.add_column("Metric", style="bold cyan")
+    table.add_column("Type", style="dim", width=10)
     table.add_column("Description")
     table.add_column("Runs On", style="dim", justify="center")
 
     applies_labels = {"all": "all data", "scenarios": "scenarios", "golden_dataset": "golden data"}
     for name, defn in metrics.items():
-        desc = defn.get("score_range", {}).get("description", "")
+        is_managed = defn.get("is_managed", False)
+        metric_type = "managed" if is_managed else "custom"
+        desc = defn.get("description", "") if is_managed else defn.get("score_range", {}).get("description", "")
         applies = applies_labels.get(defn.get("applies_to", "all"), "all data")
-        table.add_row(name, desc, applies)
+        table.add_row(name, metric_type, desc[:60], applies)
 
     console.print(table)
 
@@ -433,9 +688,6 @@ def _display_generated_metrics(metrics: dict, rationale: str) -> None:
             border_style="dim",
             padding=(1, 2),
         ))
-
-    console.print()
-    console.print("  [dim]+ general_quality and safety are always included automatically.[/]")
 
 
 def _display_recommendations(recommendations: dict) -> None:
@@ -672,13 +924,34 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
             console.print()
             with console.status("[bold blue]Generating tailored metrics with Gemini...[/]", spinner="dots"):
                 try:
-                    from agent_eval.core.metric_generator import generate_metrics_with_gemini
-                    custom_metrics, rationale, recommendations = generate_metrics_with_gemini(
+                    from agent_eval.core.metric_discovery import discover_managed_metrics, get_metric_definition_entry
+                    from agent_eval.core.metric_generator import analyze_agent_data, generate_metric_definitions, generate_eval_data
+
+                    # Auto-select general_quality + safety as managed metrics
+                    managed = discover_managed_metrics()
+                    selected_managed = {}
+                    for key in ("general_quality", "safety"):
+                        entry = get_metric_definition_entry(key, managed)
+                        if entry:
+                            selected_managed[key] = entry
+
+                    # Run the 3-step pipeline
+                    agent_analysis = analyze_agent_data(agent_dir, agent_name)
+                    custom_metrics, rationale = generate_metric_definitions(
                         agent_dir=agent_dir,
                         agent_name=agent_name,
+                        agent_analysis=agent_analysis,
+                        selected_managed=selected_managed,
                     )
-                    metrics = ["general_quality", "safety"]
-                    console.print(f"  [green]Generated {len(custom_metrics)} custom metrics[/]")
+                    eval_data = generate_eval_data(
+                        agent_dir=agent_dir,
+                        agent_name=agent_name,
+                        agent_analysis=agent_analysis,
+                        metric_definitions=custom_metrics,
+                    )
+                    recommendations = eval_data
+                    metrics = list(selected_managed.keys())
+                    console.print(f"  [green]Generated {len(custom_metrics)} metrics[/]")
                 except Exception as e:
                     console.print(f"  [yellow]AI generation failed:[/] {e}")
                     console.print("  [dim]Using default starter metrics.[/]")

@@ -15,11 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 from google.cloud import aiplatform
 from vertexai import Client, types
-from vertexai.preview.evaluation import PointwiseMetric
 
 from agent_eval.core.config import CONFIG, get_project_id
 from agent_eval.core.deterministic_metrics import DETERMINISTIC_METRICS, evaluate_deterministic_metrics
 from agent_eval.core.data_mapper import map_dataset_columns, robust_json_loads
+from agent_eval.core.metric_discovery import is_api_predefined as _is_api_predefined_discovery
+from agent_eval.core.metric_discovery import _GCS_PLACEHOLDERS
 
 # Setup Logger — root logger at CRITICAL silences all third-party noise by default.
 # Our own logger (agent_eval) is explicitly set to INFO so our messages show.
@@ -46,6 +47,11 @@ _NOISY_LOGGERS = [
 ]
 for _name in _NOISY_LOGGERS:
     logging.getLogger(_name).setLevel(logging.CRITICAL)
+
+
+def _is_api_predefined(managed_metric_name: str) -> bool:
+    """Delegate to metric_discovery.is_api_predefined()."""
+    return _is_api_predefined_discovery(managed_metric_name)
 
 
 def configure_logging(debug: bool = False) -> None:
@@ -579,18 +585,35 @@ class Evaluator:
                 else:
                     agent_df_filtered = agent_df
 
-                # For API Predefined metrics, check if we should use raw GEMINI format
                 is_managed = info.get("is_managed", False)
-                use_gemini_format = info.get("use_gemini_format", False)
 
                 # Use filtered original_df to match the applies_to filter
                 original_df_filtered = original_df.loc[agent_df_filtered.index] if applies_to != "all" else original_df
 
-                if is_managed and use_gemini_format:
-                    # Use raw data with request/response - SDK will auto-detect GEMINI schema
-                    # This allows proper parsing of conversation_history from request.contents
-                    eval_dataset = original_df_filtered[["request", "response"]].copy()
-                    logger.info(f"Using GEMINI format for API Predefined metric: {metric_name}")
+                if is_managed:
+                    m_name = info.get("managed_metric_name", "").upper()
+                    if _is_api_predefined(m_name):
+                        # API Predefined: server-side evaluation with raw request/response
+                        eval_dataset = original_df_filtered[["request", "response"]].copy()
+                        logger.info(f"Using GEMINI format for API Predefined metric: {metric_name}")
+                    else:
+                        # GCS YAML: client-side LLM-as-judge, needs prompt/response columns
+                        # Auto-build dataset_mapping from known GCS template placeholders
+                        mapping = dict(info.get("dataset_mapping", {}))
+                        placeholders = _GCS_PLACEHOLDERS.get(m_name, [])
+                        if "history" in placeholders and "history" not in mapping:
+                            mapping["history"] = {
+                                "source_column": "extracted_data:conversation_history",
+                            }
+                        eval_dataset = map_dataset_columns(
+                            agent_df_filtered,
+                            original_df_filtered,
+                            mapping,
+                            metric_name,
+                            CONFIG.METRIC_TOOL_USE_QUALITY,
+                            is_managed_metric=True,
+                        )
+                        logger.info(f"Using standard column mapping for GCS metric: {metric_name}")
                 else:
                     eval_dataset = map_dataset_columns(
                         agent_df_filtered,
@@ -598,7 +621,7 @@ class Evaluator:
                         info.get("dataset_mapping", {}),
                         metric_name,
                         CONFIG.METRIC_TOOL_USE_QUALITY,
-                        is_managed_metric=is_managed,
+                        is_managed_metric=False,
                     )
 
                 if eval_dataset.empty or len(eval_dataset.columns) == 0:
@@ -613,7 +636,7 @@ class Evaluator:
                     if metric_obj is None:
                         logger.warning(
                             "Managed metric '%s' not found as RubricMetric.%s — "
-                            "falling back to PointwiseMetric with template. "
+                            "falling back to LLMMetric with template. "
                             "Check that managed_metric_name is a valid SDK metric.",
                             metric_name, m_name,
                         )
@@ -621,8 +644,8 @@ class Evaluator:
                         if not template:
                             skipped_metrics.append({"metric": metric_name, "reason": f"unknown managed metric '{m_name}' and no fallback template"})
                             continue
-                        metric_obj = PointwiseMetric(
-                            metric=metric_name, metric_prompt_template=template
+                        metric_obj = types.LLMMetric(
+                            name=metric_name, prompt_template=template,
                         )
                 else:
                     # Use template directly for custom LLM metrics
