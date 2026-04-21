@@ -17,8 +17,8 @@ The Gen AI SDK eval docs cover three things (boxes in the image above):
 ```mermaid
 flowchart TD
     setup["<b>1 · agent-eval setup</b> · <i>once per shell</i><br/>──────────<br/>walks gcloud auth + ADC<br/>picks your project + location<br/>enables the Vertex AI API<br/>binds the autorater IAM role so Vertex can grade your traces<br/><i>(this is the only command that touches gcloud)</i>"]
-    init["<b>2 · agent-eval init</b> · <i>once per agent</i><br/>──────────<br/>quick readiness check (sends you back to <b>setup</b> if anything's missing)<br/>detects how to reach your agent — <b>Path A</b> (deployed Agent Engine) and/or <b>Path B</b> (local ADK source / any ADK FastAPI URL)<br/>picks metrics — 20+ managed (the docs' catalog) + AI-drafted custom<br/>generates <code>tests/eval/dataset.jsonl</code> with the canonical SDK columns"]
-    run["<b>3 · agent-eval run</b> · <i>every iteration</i><br/>──────────<br/><b>collect traces</b> — Path A: Vertex calls your deployed agent · Path B: <code>simulate</code> or <code>interact</code><br/><b>score</b> — two-step <code>run_inference → evaluate</code> (or one <code>create_evaluation_run</code> on Path A)<br/><b>analyze</b> — Gemini diagnoses what changed vs your last run, updates <code>OPTIMIZATION_LOG.md</code><br/>optional: <code>dashboard</code> for side-by-side run comparison"]
+    init["<b>2 · agent-eval init</b> · <i>once per agent</i><br/>──────────<br/>quick readiness check (sends you back to <b>setup</b> if anything's missing)<br/>auto-detects how to reach your agent — a deployed Agent Engine, local ADK source, an ADK FastAPI URL, or any combination<br/>picks metrics — 20+ managed (the docs' catalog) + AI-drafted custom<br/>generates <code>tests/eval/dataset.jsonl</code> with the canonical SDK columns"]
+    run["<b>3 · agent-eval run</b> · <i>every iteration</i><br/>──────────<br/><b>collect traces</b> — Vertex calls your deployed agent (one managed call) and/or <code>simulate</code> + <code>interact</code> drive the local one<br/><b>score</b> — two-step <code>run_inference → evaluate</code> (or one <code>create_evaluation_run</code> when going through Agent Engine)<br/><b>analyze</b> — Gemini diagnoses what changed vs your last run, updates <code>OPTIMIZATION_LOG.md</code><br/>optional: <code>dashboard</code> for side-by-side run comparison"]
 
     setup --> init --> run
     run -->|tweak your agent, re-run| run
@@ -28,9 +28,9 @@ flowchart TD
     style run fill:#ffe1f5
 ```
 
-Each phase inside `run` is also exposed as a standalone command (`simulate`, `interact`, `evaluate`, `analyze`, `dashboard`) for when you want finer control. The CLI teaches as you go — `--help` and the in-flow prompts carry the technical detail.
+Each phase inside `run` is also exposed as a standalone command (`simulate`, `interact`, `evaluate`, `agent-engine`, `analyze`, `dashboard`) for when you want finer control. The CLI teaches as you go — `--help` and the in-flow prompts carry the technical detail.
 
-> **Path A vs Path B at `run`-time.** Path A is one managed call (`create_evaluation_run` — Vertex runs your deployed agent, scores it, uploads results to GCS). Path B is the docs' two-step (`run_inference` → `evaluate`) plus our trace capture layer, so latency, cache hits, tool stats, and token counts come along for free.
+> ⚠️ **Use Vertex AI, not `GOOGLE_API_KEY`** — eval metrics will be empty otherwise. `agent-eval setup` configures this for you.
 
 ---
 
@@ -41,6 +41,40 @@ You need three things installed locally:
 - **Python 3.10–3.12** — 3.13+ isn't supported by some ADK deps yet.
 - **[`uv`](https://docs.astral.sh/uv/)** — package manager. Also gives you `uvx`, a one-shot runner we use below for `agent-starter-pack`.
 - **[`gcloud`](https://cloud.google.com/sdk/docs/install)** — for Google Cloud auth and to enable Vertex AI APIs.
+
+You also need an ADK agent. If you don't have one yet, [Agent Starter Pack](https://googlecloudplatform.github.io/agent-starter-pack/) (ASP) is the fastest way from zero — expand the box below for the snippet. Pick the deploy target that matches how you want to evaluate; you can also pick more than one over time and `init` will detect every option that applies.
+
+<details>
+<summary><b>Bootstrap an ADK agent with Agent Starter Pack</b></summary>
+
+```bash
+uvx agent-starter-pack create my-agent \
+    -a adk \
+    -d <DEPLOY_TARGET> \
+    --cicd-runner google_cloud_build \
+    --region us-central1 \
+    --auto-approve
+
+cd my-agent
+gcloud config set project <YOUR_PROJECT_ID>
+make install
+make backend     # only needed for `agent_engine` / `cloud_run` — provisions + deploys
+# make playground  # optional: kick the tires in ADK's local UI
+```
+
+| Flag | Why this value |
+|---|---|
+| `-a adk` | ADK Python agent — the framework `agent-eval` evaluates |
+| `-d none` | Local-only — fastest path to start iterating; no deploy step |
+| `-d cloud_run` | Cloud Run FastAPI deployment — same local pipeline as `-d none`, plus an HTTP endpoint you can hit |
+| `-d agent_engine` | Managed Vertex AI Agent Engine — additionally unlocks the streamlined `create_evaluation_run` pass (single-turn, no FastAPI server to run) |
+| `--cicd-runner google_cloud_build` | Cloud Build needs no external accounts (vs GitHub Actions) — easiest to bootstrap |
+| `--region us-central1` | Cheap + most-supported Vertex AI region |
+| `--auto-approve` | Skip the wizard prompts |
+
+> **Not sure which `-d` to pick?** Start with `-d none` or `-d cloud_run` — `agent-eval` runs the full local pipeline against either, and you can deploy to Agent Engine later (`agent-eval` will pick it up automatically and add the streamlined pass on top).
+
+</details>
 
 ### Install `agent-eval`
 
@@ -63,8 +97,6 @@ agent-eval setup
 ```
 
 Six idempotent steps. Re-run it whenever you switch projects, hit a fresh shell, or your gcloud token expires — already-done work is detected and skipped. From here on, every other `agent-eval` command assumes setup has been run.
-
-> ⚠️ **Use Vertex AI, not `GOOGLE_API_KEY`** — eval metrics will be empty otherwise. `agent-eval setup` configures this for you.
 
 <details>
 <summary><b>Prefer to run the gcloud commands yourself?</b></summary>
@@ -95,44 +127,32 @@ gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
 
 ---
 
-## Path A — You have an agent deployed to Agent Engine
-
-This is the **streamlined path**. Vertex AI calls your deployed agent for you, runs inference, scores against your metrics, and uploads results to GCS — all in a single managed call (`client.evals.create_evaluation_run`).
-
-> **Single-turn only.** `create_evaluation_run` accepts `prompt` + `session_inputs` rows; it doesn't replay multi-turn conversations and Vertex doesn't ship a built-in user simulator. **Want multi-turn UserSim too?** Run [Path B](#path-b--local-adk-agent-or-any-other-deployment-method) in parallel against the same agent — `agent-eval`'s local UserSim imports your `agent.py` directly (no FastAPI server needed), so any `make backend` user already has both paths available. `agent-eval init` will detect both and offer a **Both** option.
-
-> **Don't have one yet?** [Agent Starter Pack](https://googlecloudplatform.github.io/agent-starter-pack/) (ASP) is the fastest way from zero to a deployed ADK agent. The flags below are pre-picked to show how few decisions Agent Engine actually needs — `-d agent_engine` does the heavy lifting and `--cicd-runner google_cloud_build` is the easiest CI/CD to bootstrap (no GitHub setup):
->
-> ```bash
-> uvx agent-starter-pack create my-agent \
->     -a adk \
->     -d agent_engine \
->     --cicd-runner google_cloud_build \
->     --region us-central1 \
->     --auto-approve
->
-> cd my-agent
-> gcloud config set project <YOUR_PROJECT_ID>
-> make install
-> make backend   # provisions + deploys to Agent Engine — takes a few minutes
-> ```
->
-> | Flag | Why this value |
-> |---|---|
-> | `-a adk` | ADK Python agent — the framework `agent-eval` evaluates |
-> | `-d agent_engine` | Deploy target: managed Vertex AI Agent Engine (this unlocks Path A) — also handles session storage internally, so no `--session-type` needed |
-> | `--cicd-runner google_cloud_build` | Cloud Build needs no external accounts (vs GitHub Actions) — easiest to bootstrap |
-> | `--region us-central1` | Cheap + most-supported Vertex AI region |
-> | `--auto-approve` | Skip the wizard prompts |
->
-> Don't want to use Agent Engine, or already have an agent (deployed elsewhere or running locally)? **Skip to [Path B](#path-b--local-adk-agent-or-any-other-deployment-method) below** — `agent-eval` works there too, just with a different inference path under the hood.
+## Init + run
 
 ```bash
-agent-eval init           # auto-discovers your agent + Reasoning Engine resource
-agent-eval agent-engine   # one managed call: inference + scoring + GCS upload
+agent-eval init   # auto-detects your agent + scaffolds dataset/metrics
+agent-eval run    # collect traces → score → analyze
 ```
 
-`agent-engine` auto-creates the destination bucket on first run, then polls the run every 10 seconds and prints state transitions until it terminates:
+`init` walks the agent directory and announces what's available. **The local pipeline is always the default** — that's where you iterate, test changes before deploying, and run the full multi-turn loop. If you've also deployed to Agent Engine, the streamlined single-turn pass becomes available *on top* — they compose, they don't compete. There's no chooser; `init` just scaffolds for whatever it finds:
+
+| What `init` finds | What it unlocks |
+|---|---|
+| **Local ADK source** *(or any ADK FastAPI URL)* — the default | `agent-eval run` — the local iteration loop: multi-turn `simulate` (UserSim) + single-turn `interact` (DIY) + scoring + analysis. Imports `agent.py` directly, so you don't need a server running. Captures full traces, so latency, cache hits, tool stats, and token counts come along for free. **This is what you use to test changes before deploying.** |
+| **Deployed Agent Engine** *(in addition)* | `agent-eval agent-engine` — one managed call (`create_evaluation_run`): Vertex runs your deployed agent, scores it, uploads to GCS. **Single-turn only** — `create_evaluation_run` doesn't replay multi-turn conversations and Vertex doesn't ship a built-in user simulator. Adds on top of the local pipeline; doesn't replace it. |
+| **Both** *(typical once you've shipped)* | Keep iterating locally with `agent-eval run`. Occasionally re-run `agent-eval agent-engine` to confirm the deployed agent agrees. Use `agent-eval dashboard` to compare them side-by-side. |
+
+`init` then picks metrics (20+ managed from the docs catalog + AI-drafted custom ones tailored to your agent) and writes `tests/eval/dataset.jsonl` with the canonical SDK columns.
+
+### Iterating with `run`
+
+`run` is a thin wrapper over `simulate` → `interact` → `evaluate` → `analyze`. Each is a standalone command if you want finer control (e.g. re-score an existing trace without re-collecting). The output ends with a Gemini analysis that diagnoses what changed since your last run and updates `OPTIMIZATION_LOG.md`.
+
+> If you point `agent-eval run` at a Cloud Run deployment, ADK's debug traces aren't always persisted there — `agent-eval` falls back to state-derived metrics only and tells you so.
+
+### Iterating with `agent-engine`
+
+`agent-engine` auto-creates the destination GCS bucket on first run, then polls every 10 seconds and prints state transitions until the run terminates:
 
 ```text
 > Using bucket gs://my-project-agent-eval
@@ -151,37 +171,9 @@ Pass `--no-wait` for fire-and-forget (useful in CI when you only need the resour
 
 ---
 
-## Path B — Local ADK agent (or any other deployment method)
-
-Useful when you're iterating locally, deploying to Cloud Run, or running ADK behind any FastAPI endpoint. `agent-eval` drives ADK's REST endpoints (`/run`, `/debug/trace/...`) directly and captures full traces.
-
-> **Don't have one yet?** Same scaffolder, swap the deployment target for Cloud Run (or `none` if you're staying purely local). `--cicd-runner google_cloud_build` keeps the bootstrap as light as Path A:
->
-> ```bash
-> uvx agent-starter-pack create my-agent \
->     -a adk \                              # ADK Python agent
->     -d cloud_run \                        # deploy target: Cloud Run (or use `-d none` for local-only)
->     --cicd-runner google_cloud_build \    # Cloud Build CI/CD
->     --region us-central1 \
->     --auto-approve
->
-> cd my-agent
-> make install
-> make playground   # optional: kick the tires in ADK's local UI
-> ```
-
-```bash
-agent-eval init   # auto-discovers agent.py via rglob
-agent-eval run    # interacts with your agent (UserSim + DIY), scores, analyzes
-```
-
-> Heads-up: if you later run Path B against a Cloud Run deployment, ADK's debug traces aren't always persisted there — `agent-eval` falls back to state-derived metrics only and tells you so.
-
----
-
 ## Deeper docs
 
-→ [`docs/reference.md`](docs/reference.md) — the four metric families, the dataset row schema, both execution paths in detail (A and B), custom metric patterns, the docs-sidebar mapping, ASP integration, and the BYOD roadmap.
+→ [`docs/reference.md`](docs/reference.md) — the four metric families, the dataset row schema, both execution surfaces in detail (deployed Agent Engine and local), custom metric patterns, the docs-sidebar mapping, ASP integration, and the BYOD roadmap.
 
 ## License
 

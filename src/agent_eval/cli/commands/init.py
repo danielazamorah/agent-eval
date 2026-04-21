@@ -235,13 +235,12 @@ def _verify_environment(auto_approve: bool = False) -> None:
 def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     """Detect and explain how we'll reach the user's agent.
 
-    The output reads like a senior engineer walking you through the choice:
-    first the two paths (so any answer has context), then a short scan,
-    then the finding, then *what it means* for the eval. Path A/B labels
-    appear only as parentheticals so the descriptive name lands first.
+    The narrative leads with the *local* pipeline (always available, the
+    typical starting point) and frames a deployed Agent Engine as a
+    streamlined single-turn pass that *adds on top* — they compose, never
+    replace each other.
 
-    Two paths only — A (deployed Agent Engine) and B (local source OR any
-    ADK FastAPI URL). BYOD is roadmap-only (see docs/reference.md).
+    BYOD is roadmap-only (see docs/reference.md).
     """
     from agent_eval.core.path_detector import (
         PathDetection,
@@ -271,13 +270,17 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     )
     console.print()
     console.print(
-        "  [dim]There are two ways to do this, and[/] [bold]they're not exclusive[/][dim] — if both apply[/]"
+        "  [dim]The[/] [bold]local pipeline[/] [dim]is the default — it imports your[/] [cyan]agent.py[/] "
+        "[dim]directly so you can[/]"
     )
     console.print(
-        "  [dim]to your project (e.g. you have a deployed Agent Engine[/] [bold]and[/] [dim]local source[/]"
+        "  [dim]iterate on changes without deploying. If we[/] [bold]also[/] [dim]find an Agent Engine deployment[/]"
     )
     console.print(
-        "  [dim]on disk), you can pick[/] [bold]Both[/] [dim]in a moment and use them together.[/]"
+        "  [dim]for the same agent, we[/] [bold]additionally[/] [dim]wire up Vertex's streamlined single-turn pass —[/]"
+    )
+    console.print(
+        "  [dim]the two[/] [bold]compose[/][dim], they don't replace each other.[/]"
     )
     console.print()
     console.print(
@@ -297,22 +300,22 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     console.print(
         "  [cyan]https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-dataset[/]"
     )
-    _continue("Next: the two ways agent-eval can collect that data →", console=console)
+    _continue("Next: how agent-eval reaches your agent →", console=console)
     console.print()
     console.print(
         "  [dim]── Two ways agent-eval can collect that interaction data ──[/]"
     )
     console.print()
     console.print(
-        "    [bold cyan]Path A[/]  [bold]Deployed to Agent Engine[/]                  "
-        "[dim]— Vertex calls your agent for us (streamlined, single-turn).[/]"
-    )
-    console.print(
-        "    [bold cyan]Path B[/]  [bold]Local ADK source (or any ADK FastAPI URL)[/]  "
-        "[dim]— ADK UserSim multi-turn + interact single-turn, full traces.[/]"
+        "    [bold cyan]Local pipeline[/]      [bold]Local ADK source (or any ADK FastAPI URL)[/]  "
+        "[dim]— UserSim multi-turn + interact single-turn, full traces.[/]"
     )
     console.print(
         "             [dim italic]UserSim docs:[/] [cyan]https://adk.dev/evaluate/user-sim/[/]"
+    )
+    console.print(
+        "    [bold cyan]Streamlined pass[/]    [bold]Deployed to Agent Engine[/]                  "
+        "[dim]— Vertex calls your agent for us (managed, single-turn). Adds on top.[/]"
     )
     console.print()
 
@@ -330,7 +333,7 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     if ae_detection is not None:
         console.print(
             "  [green]>[/] [bold]Found a deployed Agent Engine.[/]  "
-            "[bold cyan](Path A)[/]"
+            "[dim](streamlined pass available)[/]"
         )
         console.print(f"    [dim]How we know:[/]  {ae_detection.evidence}")
         if ae_detection.agent_engine_resource:
@@ -339,9 +342,9 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
             )
         console.print()
         _pause()
-        console.print("  [bold]What this means for your eval:[/]")
+        console.print("  [bold]What this adds to your eval:[/]")
         console.print(
-            "    [dim]>[/] We send your dataset to Vertex's [cyan]create_evaluation_run()[/]."
+            "    [dim]>[/] [cyan]agent-eval agent-engine[/] sends your dataset to Vertex's [cyan]create_evaluation_run()[/]."
         )
         console.print(
             "    [dim]>[/] Vertex calls your deployed agent, scores the responses,"
@@ -356,11 +359,12 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
             "[bold]single-turn only[/] — no multi-turn replay,"
         )
         console.print(
-            "    no built-in user simulator. We'll see next if Path B can pick up the slack ↓"
+            "    no built-in user simulator. We'll see next whether the local pipeline picks up the slack ↓"
         )
     else:
         console.print(
-            "  [yellow]·[/] [bold]No Agent Engine deployment found here.[/]"
+            "  [yellow]·[/] [bold]No Agent Engine deployment found here.[/] "
+            "[dim](that's fine — local pipeline still works)[/]"
         )
         console.print(
             "    [dim italic]No[/] [cyan]deployment_metadata.json[/] [dim italic]with[/] "
@@ -390,11 +394,12 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
         extra = f" (+{local_count - 1} more)" if local_count > 1 else ""
 
         if ae_detection is not None:
-            # Supplementary to Path A — already covered the "what does Path B do" detail
-            # in the standalone-Path-B branch below; here we just connect the two paths.
+            # Both surfaces detected — connect them: the local pipeline runs
+            # against this agent.py, and the streamlined pass runs against the
+            # already-detected deployment.
             console.print(
                 "  [green]+[/] [bold]Local source for the same agent is also here.[/]  "
-                "[bold cyan](Path B is available too)[/]"
+                "[dim](local pipeline available too — both compose)[/]"
             )
             console.print(f"    [dim]How we know:[/]  agent.py at {rel}{extra}")
             console.print()
@@ -406,12 +411,12 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
                 "    [dim]>[/] (no FastAPI server needed) — so [bold]multi-turn coverage is on the table[/]"
             )
             console.print(
-                "    [dim]>[/] alongside Path A's managed single-turn runs."
+                "    [dim]>[/] alongside the streamlined single-turn pass."
             )
         else:
             console.print(
                 "  [green]>[/] [bold]Found a local ADK agent.[/]  "
-                "[bold cyan](Path B)[/]"
+                "[dim](local pipeline ready)[/]"
             )
             console.print(f"    [dim]How we know:[/]  agent.py at {rel}{extra}")
             console.print()
@@ -447,11 +452,11 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
         if ae_detection is not None:
             console.print(
                 "  [yellow]·[/] [bold]No local agent.py found nearby.[/]  "
-                "[dim](Path A only for this run.)[/]"
+                "[dim](streamlined Agent Engine pass only — point[/] [cyan]--target-dir[/] [dim]at agent.py to also enable UserSim)[/]"
             )
         else:
             console.print(
-                "  [yellow]>[/] [bold]Couldn't auto-detect Path A or Path B here.[/]"
+                "  [yellow]>[/] [bold]Couldn't auto-detect a local agent or a deployment here.[/]"
             )
             console.print()
             _pause()
@@ -494,57 +499,73 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     return detection
 
 
-def _prompt_path_choice(detection) -> set[str]:  # noqa: ANN001
-    """Translate a PathDetection into the set of paths the user wants to scaffold.
+def _derive_chosen_paths(detection) -> set[str]:  # noqa: ANN001
+    """Derive which evaluation surfaces to scaffold from what was detected.
 
-    - Single path detected → return that path automatically (no prompt).
-    - Both A and B available → prompt for A only / B only / Both.
-    - Unknown → return ``set()``; caller scaffolds the no-detect fallback.
+    Local source and a deployed Agent Engine *compose* — UserSim imports
+    ``agent.py`` directly and works fine alongside the managed pass — so
+    there's no chooser. Every detected surface is included automatically.
 
-    The returned set is a subset of ``{"A", "B"}``. Unknown is conveyed by an
-    empty set. There is no Path C — BYOD is roadmap-only.
+    Returns a subset of ``{"A", "B"}``:
+    - local source detected → ``"B"`` (local pipeline)
+    - Agent Engine deployment detected → ``"A"`` (streamlined single-turn pass)
+    - both detected → both
+    - neither → ``set()`` (caller defaults to local-only — the typical
+      "I'm iterating before deploying" starting point)
     """
     if detection.path == "unknown":
         return set()
 
-    if not detection.has_both():
-        return {detection.path}
+    chosen: set[str] = set()
+    if detection.local_agents:
+        chosen.add("B")
+    if detection.agent_engine_resource is not None:
+        chosen.add("A")
+    if not chosen:
+        # Belt-and-braces — `path` was set but neither marker fields were.
+        chosen.add(detection.path)
+    return chosen
+
+
+def _prompt_path_choice(detection) -> set[str]:  # noqa: ANN001
+    """Announce what we'll scaffold based on detection — no chooser.
+
+    The local pipeline (``simulate`` + ``interact`` + ``evaluate`` + ``analyze``)
+    is the default: it works against any local ``agent.py`` and is what most
+    people use while iterating. A detected Agent Engine deployment *adds* the
+    streamlined ``create_evaluation_run`` pass on top — never replaces local.
+    """
+    chosen = _derive_chosen_paths(detection)
 
     console.print()
-    console.print(Rule(style="dim"))
-    console.print()
-    console.print("  [bold]Which path(s) would you like to scaffold?[/]")
-    console.print(
-        "  [dim]A and B aren't exclusive — most[/] [cyan]make backend[/] [dim]users have both,[/]"
-    )
-    console.print(
-        "  [dim]since the deployed Agent Engine is built FROM the local source.[/]"
-    )
-    console.print()
-    options = [
-        ("A", "Path A only", "Managed scoring on the deployed Agent Engine — single-turn dataset.jsonl rows."),
-        ("B", "Path B only", "Local UserSim / DIY — multi-turn supported, full local trace fidelity."),
-        ("AB", "Both (recommended when available)",
-         "Scaffold dataset.jsonl AND scenarios/golden — run them in parallel and compare."),
-    ]
-    for i, (_, label, desc) in enumerate(options, 1):
-        console.print(f"    [bold]{i}.[/] [cyan]{label}[/]")
-        console.print(f"       [dim]{desc}[/]")
-        if i < len(options):
-            console.print()
+    if chosen == {"A", "B"}:
+        console.print(
+            "  [green]>[/] Scaffolding the [bold]local pipeline[/] [dim]+[/] "
+            "the [bold]Agent Engine streamlined pass[/]."
+        )
+        console.print(
+            "    [dim]They compose — keep iterating locally, re-run the streamlined pass to confirm against the deployed agent.[/]"
+        )
+    elif chosen == {"B"}:
+        console.print(
+            "  [green]>[/] Scaffolding the [bold]local pipeline[/] only."
+        )
+        console.print(
+            "    [dim]No deployment detected — that's the typical starting point. Deploy with[/] "
+            "[cyan]make backend[/] [dim](or any agent_engine target) to also unlock the streamlined pass.[/]"
+        )
+    elif chosen == {"A"}:
+        console.print(
+            "  [yellow]·[/] Scaffolding the [bold]Agent Engine streamlined pass[/] only."
+        )
+        console.print(
+            "    [dim]No local[/] [cyan]agent.py[/] [dim]found nearby — point us at it with[/] "
+            "[cyan]--target-dir <path>[/] [dim]to also enable the local UserSim pipeline.[/]"
+        )
+    # chosen == set() → caller falls back to local-only and prints its own
+    # message; no announcement here.
 
-    console.print()
-    choice = IntPrompt.ask("  Select", default=3)
-    while choice < 1 or choice > len(options):
-        console.print(f"  [red]Please enter a number between 1 and {len(options)}[/]")
-        choice = IntPrompt.ask("  Select", default=3)
-
-    code = options[choice - 1][0]
-    if code == "A":
-        return {"A"}
-    if code == "B":
-        return {"B"}
-    return {"A", "B"}
+    return chosen
 
 
 # ── Step 2: Agent Selection ─────────────────────────────────────────────────
@@ -601,26 +622,27 @@ def _prompt_agent_name_manual() -> tuple[str, Path]:
     return target.name, target
 
 
-# ── Step 3 sub-prompt: Interaction Mode (Path B only) ──────────────────────
+# ── Step 3 sub-prompt: Interaction Mode (local pipeline only) ──────────────
 
 
 def _prompt_interaction_mode(chosen_paths: set[str] | None = None) -> str:
     """Prompt for interaction mode (user-sim / diy / both).
 
-    When ``chosen_paths == {"A"}`` the prompt is skipped — Path A scaffolds
-    only ``tests/eval/dataset.jsonl``, no scenarios. Returns ``"dataset-only"``
+    When ``chosen_paths == {"A"}`` the prompt is skipped — the streamlined
+    Agent Engine pass scaffolds only ``tests/eval/dataset.jsonl``, no
+    scenarios (there's no local agent to drive). Returns ``"dataset-only"``
     in that case so downstream code can branch on it.
     """
     if chosen_paths == {"A"}:
         console.print()
         console.print(
-            "  [dim]Path A scaffolds[/] [cyan]tests/eval/dataset.jsonl[/] "
-            "[dim]only — no scenarios needed.[/]"
+            "  [dim]Streamlined Agent Engine pass scaffolds[/] [cyan]tests/eval/dataset.jsonl[/] "
+            "[dim]only — no scenarios needed (no local agent to drive).[/]"
         )
         return "dataset-only"
 
     console.print()
-    console.print("  [bold]Choose interaction mode[/] [dim](sub-step of Step 3 — applies to Path B only)[/]")
+    console.print("  [bold]Choose interaction mode[/] [dim](sub-step of Step 3 — how the local pipeline drives your agent)[/]")
     console.print("  [dim]How will you generate traces for evaluation?[/]")
     console.print("  [dim]This determines which starter files are created.[/]")
     console.print()
@@ -1759,9 +1781,9 @@ def _display_summary(
     has_ai = custom_metrics is not None
 
     if "B" in chosen_paths:
-        console.print(f"  Creating Path B eval files in [cyan]{eval_dir}/[/]")
+        console.print(f"  Creating local pipeline files in [cyan]{eval_dir}/[/]")
     if "A" in chosen_paths:
-        console.print(f"  Creating Path A eval files in [cyan]{unified_dir}/[/]")
+        console.print(f"  Creating Agent Engine pass files in [cyan]{unified_dir}/[/]")
     if is_existing and has_ai:
         console.print("  [dim]Existing files will be backed up to .backup/ before updating.[/]")
     elif is_existing:
@@ -1774,7 +1796,7 @@ def _display_summary(
     table.add_column("File", style="cyan", ratio=2)
     table.add_column("Purpose", ratio=3)
 
-    # ── Path A unified layout ─────────────────────────────────────────────
+    # ── Agent Engine pass: unified SDK-aligned layout ────────────────────
     if "A" in chosen_paths:
         if existing_dataset:
             table.add_row("[yellow]kept[/]", "[dim]tests/eval/dataset.jsonl[/]", "[dim]Existing unified dataset for Agent Engine (unchanged)[/]")
@@ -1789,7 +1811,7 @@ def _display_summary(
                 label = "[green]new[/]" if not has_ai else "[green]new[/]"
                 table.add_row(label, "tests/eval/metrics/metric_definitions.json", "LLM-as-judge scoring rubrics")
 
-    # ── Path B legacy layout (still used for ADK UserSim) ─────────────────
+    # ── Local pipeline: ADK-runtime layout (used by simulate/UserSim) ────
     if "B" in chosen_paths:
         if has_ai:
             if existing_metrics:
@@ -1852,7 +1874,7 @@ def _display_next_steps(
     lines.append(f"   [cyan]{metrics_path}[/]")
     step += 1
     if "A" in chosen_paths:
-        lines.append(f"[bold]{step}.[/] Review your Path A dataset:")
+        lines.append(f"[bold]{step}.[/] Review your Agent Engine dataset:")
         lines.append(f"   [cyan]{unified_path}/dataset.jsonl[/]")
         step += 1
     if "B" in chosen_paths and mode in ("user-sim", "both"):
@@ -1866,26 +1888,39 @@ def _display_next_steps(
 
     lines.append("")
     if chosen_paths == {"A"}:
-        lines.append(f"[bold]{step}.[/] Run the streamlined Agent Engine evaluation:")
+        # No local source — only the streamlined pass is available.
+        lines.append(f"[bold]{step}.[/] Run the streamlined Agent Engine pass:")
         lines.append(f"   [dim]$[/] agent-eval agent-engine")
         lines.append("")
         lines.append("   [dim]Vertex calls your deployed agent, scores responses against your metrics,[/]")
         lines.append("   [dim]and uploads results to GCS — one managed call.[/]")
+        lines.append("")
+        lines.append("   [dim]To also enable the local pipeline (multi-turn UserSim + full traces), put[/]")
+        lines.append("   [dim]your agent.py somewhere we can find it and re-run[/] [cyan]agent-eval init[/][dim].[/]")
     elif chosen_paths == {"B"}:
-        lines.append(f"[bold]{step}.[/] Run the full evaluation pipeline:")
+        # The default, common case — iterating locally before deploying.
+        lines.append(f"[bold]{step}.[/] Run the local pipeline:")
         lines.append(f"   [dim]$[/] agent-eval run --agent-dir {agent_dir}")
         lines.append("")
-        lines.append("   [dim]Runs the four phases sequentially: collect traces[/]")
-        lines.append("   [dim](UserSim or DIY) → evaluate → analyze, with progress tracking.[/]")
+        lines.append("   [dim]Four phases in sequence — collect traces (UserSim + DIY) → evaluate → analyze.[/]")
+        lines.append("   [dim]This is the iteration loop. Tweak your agent, re-run, compare.[/]")
+        lines.append("")
+        lines.append("   [dim]Once you deploy to Agent Engine ([/][cyan]make backend[/][dim]), re-run[/] "
+                     "[cyan]agent-eval init[/] [dim]and we'll[/]")
+        lines.append("   [dim]wire up the streamlined single-turn pass too.[/]")
     else:
-        lines.append(f"[bold]{step}.[/] Run [bold]Path A[/] (managed scoring on the deployed agent):")
+        # Both surfaces detected — lead with the local iteration loop.
+        lines.append(f"[bold]{step}.[/] Run the local pipeline (the iteration loop):")
+        lines.append(f"   [dim]$[/] agent-eval run --agent-dir {agent_dir}")
+        lines.append("")
+        lines.append("   [dim]Four phases — collect traces (UserSim + DIY) → evaluate → analyze.[/]")
+        lines.append("   [dim]Use this for every change you make.[/]")
+        lines.append("")
+        lines.append(f"[bold]{step + 1}.[/] Run the streamlined Agent Engine pass (confirm against the deployed agent):")
         lines.append(f"   [dim]$[/] agent-eval agent-engine")
         lines.append("")
-        lines.append(f"[bold]{step + 1}.[/] Run [bold]Path B[/] (local UserSim/DIY with full traces):")
-        lines.append(f"   [dim]$[/] agent-eval run --agent-dir {agent_dir}")
-        lines.append("")
-        lines.append("   [dim]Both target the same agent — Path A is single-turn managed,[/]")
-        lines.append("   [dim]Path B captures full local traces with multi-turn UserSim. Compare results.[/]")
+        lines.append("   [dim]Single-turn managed scoring against the live deployment — slower iteration but[/]")
+        lines.append("   [dim]the truth check. Compare both with[/] [cyan]agent-eval dashboard[/][dim].[/]")
 
     if has_ai and (eval_path / ".backup").exists():
         lines.append("")
@@ -2098,7 +2133,7 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
     custom_metrics = None
     recommendations = None
     agent_analysis = None
-    chosen_paths: set[str] = {"A", "B"}  # default: scaffold both; overridden in interactive flow
+    chosen_paths: set[str] = set()  # derived from detection below (interactive + auto)
 
     if auto_approve:
         if target_dir:
@@ -2115,6 +2150,18 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
                 agent_dir = Path(agent_name)
 
         mode = mode or "both"
+
+        # Silent path detection so -y derives the same way as the interactive
+        # flow — if the user has only local source we don't pointlessly
+        # scaffold Agent Engine bits, and vice versa.
+        from agent_eval.core.path_detector import detect_execution_path
+        detect_root = agent_dir if agent_dir.exists() else Path(".")
+        chosen_paths = _derive_chosen_paths(detect_execution_path(detect_root))
+        if not chosen_paths:
+            # No agent.py and no deployment found — default to local-only
+            # (the typical "I'm starting fresh, going to wire up agent.py
+            # next" case). Scaffolds tests/eval/dataset.jsonl + eval/ stubs.
+            chosen_paths = {"B"}
 
         if ai_metrics:
             console.print()
@@ -2196,10 +2243,12 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
         mode = mode or _prompt_interaction_mode(chosen_paths)
         metrics, custom_metrics, recommendations, agent_analysis = _prompt_metrics_choice(agent_dir, agent_name)
 
-    # No-detect fallback: scaffold everything so the user has both shapes to
-    # choose from once they wire up their agent.
+    # No-detect fallback: default to the local pipeline. It's the typical
+    # starting point — you don't need a deployment to start iterating, and
+    # scaffolding the streamlined Agent Engine pass when no deployment exists
+    # would just write stubs the user never runs.
     if not chosen_paths:
-        chosen_paths = {"A", "B"}
+        chosen_paths = {"B"}
 
     console.print()
     _display_summary(agent_dir, agent_name, mode, metrics, custom_metrics, chosen_paths)
@@ -2219,8 +2268,9 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
         )
 
     if "A" in chosen_paths or not chosen_paths:
-        # Path A reads from tests/eval/metrics/ first; write it whenever A
-        # is selected so agent-engine doesn't fall back to legacy eval/metrics/.
+        # The agent-engine command reads from tests/eval/metrics/ first;
+        # write it whenever the Agent Engine pass is selected so it doesn't
+        # fall back to the legacy eval/metrics/ layout.
         from agent_eval.core.scaffold import scaffold_dataset_jsonl, scaffold_metrics_only
         scaffold_metrics_only(
             target_dir=agent_dir,

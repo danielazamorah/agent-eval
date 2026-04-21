@@ -76,11 +76,11 @@ For installation and getting started, see the [README](../README.md).
 
 **1. Hardcoded reference requirements.** Earlier versions of `agent-eval` carried a hand-maintained set of "metrics that need a reference field." Every time Google added a new managed metric, our list went stale. The refactor replaces that with `metric_families.classify()` — which introspects the SDK directly via `ComputationMetricHandler.SUPPORTED_COMPUTATION_METRICS`, `TranslationMetricHandler.SUPPORTED_TRANSLATION_METRICS`, and `_evals_constant.SUPPORTED_PREDEFINED_METRICS`. New metrics land in the right family automatically.
 
-**2. The CLI didn't mirror the docs.** Users had to learn two mental models — Google's docs and our flow. The CLI now mirrors the [Vertex AI eval docs sidebar](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation/) one-for-one: *Define metrics* (init Step 3, family-grouped picker) → *Prepare dataset* (init Step 4 / `import`) → *Run evaluation* (`simulate` / `interact` → `evaluate`) → *View results* (`analyze` + `dashboard`) → *Evaluate agents* (`agent-engine` for the streamlined Path A).
+**2. The CLI didn't mirror the docs.** Users had to learn two mental models — Google's docs and our flow. The CLI now mirrors the [Vertex AI eval docs sidebar](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation/) one-for-one: *Define metrics* (init Step 3, family-grouped picker) → *Prepare dataset* (init Step 4 / `import`) → *Run evaluation* (`simulate` / `interact` → `evaluate`) → *View results* (`analyze` + `dashboard`) → *Evaluate agents* (`agent-engine` for the streamlined Agent Engine pass).
 
-**3. Two folders, two data shapes, no clear story for Agent Engine.** The old layout had `app/eval/` (ours) sitting next to `tests/eval/evalsets/` (ADK's), with separate `scenarios/*.json` and `golden_dataset.json` files using different shapes, and unclear handling for Agent Engine deployments. The refactor consolidates everything into one folder (`tests/eval/`), one row shape (`dataset.jsonl`), and two named execution paths (A — Agent Engine; B — Local ADK source / any ADK FastAPI URL) — see [The two execution paths](#the-two-execution-paths). BYOD lives as a roadmap note, not a third path.
+**3. Two folders, two data shapes, no clear story for Agent Engine.** The old layout had `app/eval/` (ours) sitting next to `tests/eval/evalsets/` (ADK's), with separate `scenarios/*.json` and `golden_dataset.json` files using different shapes, and unclear handling for Agent Engine deployments. The refactor consolidates everything into one folder (`tests/eval/`), one row shape (`dataset.jsonl`), and a clear default: the **local pipeline** is always available; if you've also deployed to **Agent Engine**, the streamlined single-turn pass adds on top — they compose, they don't compete. See [Two evaluation surfaces](#two-evaluation-surfaces). BYOD lives as a roadmap note, not a third surface.
 
-**Doc strategy:** the [README](../README.md) is the e2e walk-through — it covers the two paths (Agent Engine + local ADK) end-to-end, including ASP scaffolding for users who don't have an agent yet. The CLI itself carries the in-flow technical detail (`--help`, questionary prompts, Rich panels). This document is the deep reference for when you want to know *why* something works the way it does, plus the catalog of every CLI command, metric, and data shape.
+**Doc strategy:** the [README](../README.md) is the e2e walk-through — it covers the local iteration loop end-to-end and shows how an Agent Engine deployment unlocks the streamlined pass on top, including ASP scaffolding for users who don't have an agent yet. The CLI itself carries the in-flow technical detail (`--help`, questionary prompts, Rich panels). This document is the deep reference for when you want to know *why* something works the way it does, plus the catalog of every CLI command, metric, and data shape.
 
 ---
 
@@ -94,9 +94,9 @@ Each section under *"Perform evaluation using the GenAI Client in Vertex AI SDK"
 | [Define your evaluation metrics](https://cloud.google.com/vertex-ai/generative-ai/docs/models/determine-eval) | `init` Step 3 — managed metrics grouped by family (adaptive / static / computation / translation), with `GENERAL_QUALITY` pre-checked per the docs' recommendation. |
 | ↳ [Details for managed rubric-based metrics](https://cloud.google.com/vertex-ai/generative-ai/docs/models/rubric-metric-details) | `metric_families.classify()` introspects the SDK's `_evals_constant.SUPPORTED_PREDEFINED_METRICS`, so the picker stays in sync with the managed `RubricMetric.*` entries automatically. |
 | [Prepare your evaluation dataset](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-dataset) | `init` Step 4 generates a unified `tests/eval/dataset.jsonl` using the canonical SDK columns (`prompt`, `response`, `reference`, `conversation_history`, `session_inputs`, `intermediate_events`) + free-form `expected_*` extras. `agent-eval import --from <evalset>` flattens existing ADK evalsets into the same file. |
-| [Run an evaluation](https://cloud.google.com/vertex-ai/generative-ai/docs/models/run-evaluation) | `agent-eval simulate` (multi-turn via ADK UserSim) or `agent-eval interact` (single-turn via ADK FastAPI) capture responses + traces, then `agent-eval evaluate` scores them with `client.evals.evaluate()`. |
+| [Run an evaluation](https://cloud.google.com/vertex-ai/generative-ai/docs/models/run-evaluation) | The **local pipeline** — `agent-eval simulate` (multi-turn via ADK UserSim) or `agent-eval interact` (single-turn via ADK FastAPI) capture responses + traces, then `agent-eval evaluate` scores them with `client.evals.evaluate()`. |
 | [View and interpret evaluation results](https://cloud.google.com/vertex-ai/generative-ai/docs/models/view-evaluation) | `agent-eval analyze` produces a Gemini diagnosis + cumulative `OPTIMIZATION_LOG.md`; `agent-eval dashboard` opens an interactive comparison view. |
-| [Evaluate agents](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-agents-client) | `agent-eval agent-engine` is the streamlined Path A — calls `client.evals.run_inference()` + `client.evals.create_evaluation_run()` against a deployed Reasoning Engine. For local ADK agents stick with the `evaluate` flow above. |
+| [Evaluate agents](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-agents-client) | `agent-eval agent-engine` is the **streamlined Agent Engine pass** — calls `client.evals.run_inference()` + `client.evals.create_evaluation_run()` against a deployed Reasoning Engine. Adds a managed single-turn pass on top of the local pipeline whenever a deployment is detected. |
 
 ---
 
@@ -121,20 +121,31 @@ Every Vertex AI managed metric belongs to one of four families. Knowing the fami
 
 The Vertex AI docs recommend starting with `GENERAL_QUALITY` only and opting into more metrics as you learn what your agent needs. The CLI follows that recommendation: only `GENERAL_QUALITY` is pre-checked.
 
-### The two execution paths
+### Two evaluation surfaces
 
-| Path | When it applies | Trace fidelity | Multi-turn UserSim | Auto-detected via |
+`agent-eval` exposes two evaluation surfaces that **compose** — they're not alternatives. The local pipeline is the default and runs against any local `agent.py`. A deployed Agent Engine *adds* the streamlined single-turn managed pass on top, without changing how local works.
+
+> **Why local is the default.** You don't need a deployment to evaluate. The most common case is iterating on an agent before shipping it: change a prompt or a tool, re-run the local pipeline, look at the deltas. Once you deploy, the streamlined pass becomes available as the "confirm against the live deployment" check — but it doesn't replace the local loop, which stays the iteration surface forever.
+
+| Surface | When it's available | What runs the agent | Multi-turn? | Trace fidelity |
 |---|---|---|---|---|
-| **A — Agent Engine** (streamlined) | Agent is deployed to a Reasoning Engine (typically via Agent Starter Pack `make backend`) | Full (managed) | **No** — `create_evaluation_run` is single-turn; Vertex doesn't ship a user simulator | `AGENT_ENGINE_RESOURCE_NAME` env var, or `deployment/agent_engine_metadata.json` from ASP |
-| **B — Local ADK source / any ADK FastAPI URL** | You have local agent source, OR you can point at any ADK FastAPI endpoint (local dev, Cloud Run, remote host) | Varies — see sub-modes below | **Yes** — local UserSim imports `agent.py` directly (no FastAPI server needed) | An `agent.py` reachable from `cwd` via `rglob` |
+| **Local pipeline** (default, always on) | Whenever a local `agent.py` is on disk, OR you can point at any ADK FastAPI URL | `agent-eval simulate` (UserSim, in-process import — no FastAPI server needed) + `agent-eval interact` (DIY, REST against any ADK URL) | **Yes** — UserSim drives multi-turn dialogues | Full when local-dev or Agent Engine; degraded on Cloud Run (state-derived metrics only) |
+| **Streamlined Agent Engine pass** (additive) | Agent is deployed to a Reasoning Engine (typically via Agent Starter Pack `make backend`) | `agent-eval agent-engine` → `client.evals.create_evaluation_run()` — Vertex calls the deployed agent for you | **No** — `create_evaluation_run` is single-turn; Vertex doesn't ship a user simulator | Full (managed by Vertex) |
 
-> **A and B aren't mutually exclusive.** Almost every `make backend` user has both — the deployed Agent Engine artifact AND the local source it was built from. `agent-eval init` detects both and offers a **Both** option that scaffolds `tests/eval/dataset.jsonl` (for Path A) alongside `scenarios/` + `eval_data/` (for Path B). Run them in parallel against the same agent for the most coverage: Path A gives you Vertex's managed dashboard URL, Path B gives you full local trace fidelity and multi-turn UserSim coverage.
+**Auto-detection.** `agent-eval init` runs `path_detector.detect_execution_path()` early and announces what it found:
 
-> **Non-ADK agent? (BYOD)** There's no third path in the UI. The schema unification means you can hand-write a converter against the row shape in [Dataset row schema](#dataset-row-schema), drop the JSONL into `tests/eval/dataset.jsonl`, and run `agent-eval evaluate` like normal. A streamlined `agent-eval ingest-traces` command is on the [roadmap](#byod-bring-your-own-data--agent-eval-ingest-traces).
+| Detected | Scaffolded |
+|---|---|
+| Local `agent.py` only | Local pipeline files (`eval/scenarios/`, `eval/eval_data/`, `tests/eval/dataset.jsonl`) |
+| Agent Engine deployment + local `agent.py` (the typical `make backend` case) | **Both** — local pipeline AND `tests/eval/metrics/` for the streamlined pass |
+| Agent Engine deployment only (rare — no source on disk) | Streamlined pass files only (`tests/eval/dataset.jsonl`, `tests/eval/metrics/`) |
+| Neither | Local pipeline files (the typical "I'm starting fresh" case — wire up `agent.py` next, then re-run init) |
 
-`agent-eval init` runs `path_detector.detect_execution_path()` early and announces what it found, so the rest of the flow has shared vocabulary.
+Detection signals: `AGENT_ENGINE_RESOURCE_NAME` env var or `deployment/agent_engine_metadata.json` (from ASP) for the deployment; an `agent.py` reachable from `cwd` via `rglob` for local source.
 
-**Path B has three sub-modes**, all hitting the same ADK FastAPI routes:
+> **Non-ADK agent? (BYOD)** There's no third surface in the UI. The schema unification means you can hand-write a converter against the row shape in [Dataset row schema](#dataset-row-schema), drop the JSONL into `tests/eval/dataset.jsonl`, and run `agent-eval evaluate` like normal. A streamlined `agent-eval ingest-traces` command is on the [roadmap](#byod-bring-your-own-data--agent-eval-ingest-traces).
+
+**The local pipeline has three sub-modes**, all hitting the same ADK FastAPI routes:
 
 | Sub-mode | Started by | Trace persistence |
 |---|---|---|
@@ -144,20 +155,20 @@ The Vertex AI docs recommend starting with `GENERAL_QUALITY` only and opting int
 
 If you pick the DIY interaction mode in `init`, the CLI surfaces the Cloud Run trace caveat upfront so you're not surprised when latency metrics come back empty.
 
-### Inference strategy per path
+### Which SDK call drives which command
 
 The Vertex AI eval docs describe a clean two-step pattern: `client.evals.run_inference()` to generate responses, then `client.evals.evaluate()` to score them. That pattern fits perfectly when you're evaluating a raw model or an Agent Engine deployment — but it doesn't fit a *local ADK agent*, which lives behind ADK's FastAPI server, not behind Vertex's inference API.
 
-So `agent-eval` only uses `client.evals.run_inference()` on Path A. The other paths reach the agent through ADK-native channels and converge at `client.evals.evaluate()` for scoring. This table is the truth of which call drives which command:
+So the **local pipeline** reaches the agent through ADK-native channels and converges at `client.evals.evaluate()` for scoring. The **streamlined Agent Engine pass** uses Vertex's one-call `create_evaluation_run`, which subsumes inference + scoring + GCS upload. This table is the truth of which call drives which command:
 
-| Command | How it gets the agent's responses | How it scores them |
-|---|---|---|
-| `agent-eval agent-engine` (**Path A**) | `client.evals.run_inference(agent=<resource>, src=df)` — Vertex calls your deployed Reasoning Engine for you. | `client.evals.create_evaluation_run(...)` — inference + scoring + GCS upload, one call. |
-| `agent-eval simulate` (**Path B**, multi-turn) | ADK's [User Simulation](https://google.github.io/adk-docs/evaluate/user-sim/) drives a simulated user against your local agent. ADK writes traces to `.adk/eval_history/`; we convert them to JSONL. | `client.evals.evaluate(dataset, metrics)` |
-| `agent-eval interact` (**Path B**, single-turn) | Our REST client (`agent_client.py`) hits ADK's FastAPI endpoints directly: `/run`, `/apps/.../sessions/...`, `/debug/trace/session/{id}`. We capture the full trace ourselves. | `client.evals.evaluate(dataset, metrics)` |
-| `agent-eval evaluate` | (Reads existing JSONL from `simulate` / `interact`.) | `client.evals.evaluate(dataset, metrics)` |
+| Command | Surface | How it gets the agent's responses | How it scores them |
+|---|---|---|---|
+| `agent-eval simulate` | Local pipeline | ADK's [User Simulation](https://google.github.io/adk-docs/evaluate/user-sim/) drives a simulated user against your imported `agent.py`. ADK writes traces to `.adk/eval_history/`; we convert them to JSONL. | `client.evals.evaluate(dataset, metrics)` |
+| `agent-eval interact` | Local pipeline | Our REST client (`agent_client.py`) hits ADK's FastAPI endpoints directly: `/run`, `/apps/.../sessions/...`, `/debug/trace/session/{id}`. We capture the full trace ourselves. | `client.evals.evaluate(dataset, metrics)` |
+| `agent-eval evaluate` | Local pipeline | (Reads existing JSONL from `simulate` / `interact`.) | `client.evals.evaluate(dataset, metrics)` |
+| `agent-eval agent-engine` | Streamlined Agent Engine pass | `client.evals.run_inference(agent=<resource>, src=df)` — Vertex calls your deployed Reasoning Engine for you. | `client.evals.create_evaluation_run(...)` — inference + scoring + GCS upload, one call. |
 
-**Why not `run_inference()` for Path B?**
+**Why doesn't the local pipeline use `run_inference()`?**
 
 `client.evals.run_inference()` is built for two cases (per the [Run an evaluation](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/run-evaluation) docs): a `model=` string for direct LLM calls, or an `agent=<reasoning-engine-resource>` for Agent Engine deployments. Local ADK agents fit neither — they're a FastAPI process you started locally or in Cloud Run. Reaching them through `run_inference` would require a managed bridge that doesn't exist.
 
@@ -166,7 +177,7 @@ ADK provides better-fitting tools for the local case:
 - **UserSim** is the docs-aligned way to drive *multi-turn* agent dialogues with realistic, LLM-played user behavior. It's strictly more capable than passing a flat list of prompts to `run_inference()`.
 - **The ADK FastAPI debug endpoints** (`/debug/trace/session/{id}`) give us full execution traces — latency per step, intermediate events, tool calls, session state — which `run_inference()` doesn't surface for non-Agent-Engine deployments.
 
-The end result: every path produces the same `dataset.jsonl` row shape, and every path scores through `client.evals.evaluate()`. The only difference is *how the response and trace columns get populated*. Path A delegates that to Vertex; Path B delegates to ADK; both meet at the evaluation step.
+The end result: both surfaces produce the same `dataset.jsonl` row shape, and both score through Vertex's eval client. The only difference is *how the response and trace columns get populated*. The streamlined pass delegates inference to Vertex; the local pipeline delegates inference to ADK; both meet at the same scoring layer.
 
 ### Dataset row schema
 
@@ -188,7 +199,7 @@ The unified dataset lives at `tests/eval/dataset.jsonl`. Every row is a JSON obj
 - **Canonical SDK columns** (`prompt`, `response`, `reference`, `intermediate_events`, `session_inputs`, `conversation_history`, `context`) — used by managed metrics. Names are fixed.
 - **Free-form `expected_*` columns** — used by custom `LLMMetric` templates via `{expected_X}` placeholders. The SDK auto-resolves them via `getattr(eval_case, var_name)` (verified at `_evals_metric_handlers.py:547-551`), so any top-level row field is automatically available to custom metric templates.
 
-`response` and `intermediate_events` are added at runtime by `run_inference` (Path A) or `simulate` / `interact` (Path B). Optional fields per row enable mixed datasets — some rows multi-turn, some single-turn, some with reference, some without. Per-row capability detection (`dataset_io.detect_capabilities`) determines metric eligibility at evaluation time.
+`response` and `intermediate_events` are added at runtime — by `run_inference` (when going through the streamlined Agent Engine pass) or by `simulate` / `interact` (in the local pipeline). Optional fields per row enable mixed datasets — some rows multi-turn, some single-turn, some with reference, some without. Per-row capability detection (`dataset_io.detect_capabilities`) determines metric eligibility at evaluation time.
 
 **Sources of dataset rows:**
 
@@ -242,7 +253,7 @@ The Vertex AI docs describe five custom metric patterns. `metric_factory.py` exp
 | `managed` | `RubricMetric.<NAME>` | Pin a managed metric exactly as-is. |
 | `parametrized_managed` | `RubricMetric.<NAME>(metric_spec_parameters=…)` | Add custom guidelines or rubric groups to a managed metric. |
 | `custom_llm_judge` | `LLMMetric(prompt_template=MetricPromptBuilder(…))` | Hand-written LLM judge with instruction + criteria + rating scores. |
-| `python_function` | `Metric(custom_function=…)` | In-process deterministic check (Python). **Not compatible with Path A** — `metric_factory.to_evaluation_run_metric()` rejects this kind for Agent Engine runs. |
+| `python_function` | `Metric(custom_function=…)` | In-process deterministic check (Python). **Not compatible with the streamlined Agent Engine pass** — `metric_factory.to_evaluation_run_metric()` rejects this kind for `create_evaluation_run` calls; use it via the local pipeline instead. |
 | `remote_code` | `Metric(remote_custom_function=…)` | Sandboxed code execution metric. |
 
 Schema example:
@@ -268,7 +279,7 @@ Schema example:
 }
 ```
 
-`metric_factory.build_all()` reads this file and instantiates the right SDK type. Path A automatically wraps each metric via `to_evaluation_run_metric()` so it can be passed to `client.evals.create_evaluation_run()`.
+`metric_factory.build_all()` reads this file and instantiates the right SDK type. The streamlined Agent Engine pass automatically wraps each metric via `to_evaluation_run_metric()` so it can be passed to `client.evals.create_evaluation_run()`.
 
 ---
 
@@ -437,9 +448,10 @@ uv run agent-eval init -y --ai-metrics
 ```mermaid
 flowchart TD
     A[Banner] --> B[Step 0: Verify env<br/>project, region, ADC, API]
-    B --> C{auto-approve<br/>-y?}
-    C -->|yes| D[Auto-pick first agent<br/>+ default mode 'both']
-    C -->|no| E[Step 1: Pick mode<br/>user-sim / diy / both]
+    B --> DT[Detect evaluation surfaces<br/>local agent.py + AGENT_ENGINE_RESOURCE_NAME<br/>announce what's available — no chooser]
+    DT --> C{auto-approve<br/>-y?}
+    C -->|yes| D[Auto-pick first agent<br/>+ default mode 'both'<br/>+ derive surfaces from detection]
+    C -->|no| E[Step 1: Pick mode<br/>user-sim / diy / both<br/>local pipeline only]
     E --> F[Step 2: Discover agents<br/>rglob agent.py]
     F --> G[Pick agent module]
     D --> H{ai-metrics<br/>flag?}
@@ -644,7 +656,7 @@ See [Run Comparison](#run-comparison) for details on how comparison works.
 
 ### agent-engine
 
-Streamlined Path A runner for agents deployed to **Agent Engine** (Reasoning Engines). Wraps `client.evals.create_evaluation_run()` — Vertex handles inference, scoring, and GCS upload in one managed call.
+The **streamlined Agent Engine pass** — for agents deployed to a Reasoning Engine. Wraps `client.evals.create_evaluation_run()` so Vertex handles inference, scoring, and GCS upload in one managed call. This is additive to the local pipeline; you don't choose between them.
 
 ```bash
 agent-eval agent-engine [OPTIONS]
@@ -669,7 +681,7 @@ agent-eval agent-engine [OPTIONS]
 - You want managed inference — no local FastAPI server required, no traces to capture yourself.
 - You want a single `dashboard_url` to share with stakeholders.
 
-**Custom LLM metrics on Path A.** Both managed rubrics (`is_managed: true` + `managed_metric_name: "GENERAL_QUALITY"`) and AI-generated custom metrics (`template` + `score_range`) are translated into Vertex SDK objects automatically: managed names map to `vt.RubricMetric.<NAME>`, custom judges build a `vt.LLMMetric` via `metric_factory.custom_llm_judge` (the `template` becomes the criterion body, `score_range.min`/`max` becomes the rating scale) and are wrapped with `metric_factory.to_evaluation_run_metric`. Python in-process metrics (`kind: python_function`) are still skipped with a warning, since `create_evaluation_run` cannot execute local Python.
+**Custom LLM metrics on the streamlined Agent Engine pass.** Both managed rubrics (`is_managed: true` + `managed_metric_name: "GENERAL_QUALITY"`) and AI-generated custom metrics (`template` + `score_range`) are translated into Vertex SDK objects automatically: managed names map to `vt.RubricMetric.<NAME>`, custom judges build a `vt.LLMMetric` via `metric_factory.custom_llm_judge` (the `template` becomes the criterion body, `score_range.min`/`max` becomes the rating scale) and are wrapped with `metric_factory.to_evaluation_run_metric`. Python in-process metrics (`kind: python_function`) are still skipped with a warning, since `create_evaluation_run` cannot execute local Python.
 
 **SDK pattern.** `agent-engine` follows the [evaluation-agents-client docs pattern](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-agents-client) verbatim: the `Client` is constructed with `http_options=HttpOptions(api_version="v1beta1")`, the local agent is imported (default `app.agent:root_agent`, override with `--agent-module`), and an `AgentInfo` is attached to `create_evaluation_run`. Without `agent_info` the deployed agent's events come back without `content.parts` and the SDK fails the run with "Failed to parse agent run response []" — the local-agent enrichment is what makes the deployed run actually score. If `AgentInfo.load_from_agent` fails because an ADK tool takes a `tool_context: ToolContext` parameter (a known ADK ↔ google-genai schema bug), the command falls back to a manual `AgentInfo(...)` build with empty `tool_declarations`. The agent's name, instruction, and description still flow through.
 
@@ -872,7 +884,7 @@ Your own scoring rubrics, defined in `metric_definitions.json`. These use `metri
 
 ## Creating Custom Metrics
 
-> **Two schemas live side by side today.** This section documents the **trace-driven schema** (`metric_type`, `dataset_mapping`, `requires_reference` / `requires_multi_turn`, `template`) used by `agent-eval evaluate` against the JSONL produced by `simulate` / `interact`. The **unified schema** (`kind: managed | parametrized_managed | custom_llm_judge | python_function | remote_code`) is used by `agent-eval agent-engine` (Path A) — see [Custom metric patterns](#custom-metric-patterns) above. Both schemas read the same `tests/eval/metrics/metric_definitions.json` file; `metric_factory.py` discriminates on the `kind` field, while the trace-driven evaluator path keys off `metric_type`.
+> **Two schemas live side by side today.** This section documents the **trace-driven schema** (`metric_type`, `dataset_mapping`, `requires_reference` / `requires_multi_turn`, `template`) used by `agent-eval evaluate` against the JSONL produced by `simulate` / `interact`. The **unified schema** (`kind: managed | parametrized_managed | custom_llm_judge | python_function | remote_code`) is used by `agent-eval agent-engine` (the streamlined Agent Engine pass) — see [Custom metric patterns](#custom-metric-patterns) above. Both schemas read the same `tests/eval/metrics/metric_definitions.json` file; `metric_factory.py` discriminates on the `kind` field, while the trace-driven evaluator path keys off `metric_type`.
 
 ### Basic Structure
 
@@ -1065,7 +1077,7 @@ Generates multi-turn conversations from scenario definitions. An LLM simulates r
 
 **When to use:** Multi-turn conversational agents, rapid prototyping (no golden dataset needed), exploring agent behavior across many scenarios.
 
-> These files live under `eval/scenarios/` rather than `tests/eval/` because ADK's runtime (`adk eval`) expects them at fixed paths next to `agent.py`. The unified `tests/eval/dataset.jsonl` is the right home for Path A and DIY rows; UserSim scenarios stay where ADK reads them.
+> These files live under `eval/scenarios/` rather than `tests/eval/` because ADK's runtime (`adk eval`) expects them at fixed paths next to `agent.py`. The unified `tests/eval/dataset.jsonl` is the right home for the streamlined Agent Engine pass and DIY rows; UserSim scenarios stay where ADK reads them.
 
 **Files needed:**
 
@@ -1480,7 +1492,7 @@ This section is a developer signpost — features sketched in the SDK-aligned pl
 
 **Status:** designed, not yet implemented (Step 10 of the SDK-aligned refactor).
 
-**The problem this solves.** Today's CLI assumes you have either an ADK agent (Path B) or an Agent Engine deployment (Path A). But plenty of agents in the wild aren't ADK-based — LangGraph, custom LLM pipelines, in-house frameworks. They typically emit OpenTelemetry traces. We want those agents to be evaluable too, without forcing a rewrite.
+**The problem this solves.** Today's CLI assumes either a local ADK agent (the local pipeline) or an Agent Engine deployment (the streamlined pass) — and ideally both. But plenty of agents in the wild aren't ADK-based — LangGraph, custom LLM pipelines, in-house frameworks. They typically emit OpenTelemetry traces. We want those agents to be evaluable too, without forcing a rewrite.
 
 **The proposed flow:**
 
@@ -1488,7 +1500,7 @@ This section is a developer signpost — features sketched in the SDK-aligned pl
 2. CLI inspects the first 3 traces, calls Gemini with: *"Here's a sample trace. Generate a Python conversion script that produces rows matching this JSON schema: `{prompt, response, conversation_history, intermediate_events, session_inputs}`."*
 3. CLI writes the draft to `tests/eval/byod_converter.py` for the user to review and tweak.
 4. User runs `python tests/eval/byod_converter.py ./my-traces/ tests/eval/dataset.jsonl` to produce rows compatible with the rest of the pipeline.
-5. From there, evaluation works exactly like Path B — the dataset is just `dataset.jsonl`, the metrics live in `metric_definitions.json`, and the SDK doesn't care where the rows came from.
+5. From there, evaluation works exactly like the local pipeline — the dataset is just `dataset.jsonl`, the metrics live in `metric_definitions.json`, and the SDK doesn't care where the rows came from.
 
 **Why it's deferred.** The dataset schema unification (`dataset_io.py`, the canonical SDK columns + free-form `expected_*` extras, the `getattr`-based custom metric resolution) is the *enabler* — once that's in place, BYOD is mechanical. But designing the converter prompt well requires real OTel trace samples. Building it speculatively risks producing a converter that handles toy examples and breaks on the messy traces people actually have. We'd rather wait for the first user with a non-ADK agent and design `ingest-traces` against their data.
 
@@ -1497,7 +1509,7 @@ This section is a developer signpost — features sketched in the SDK-aligned pl
 ### Other deferred items from the plan
 
 - **5-option custom-metrics flow in `init`** — `metric_factory.py` already supports all five `kind` values (`managed`, `parametrized_managed`, `custom_llm_judge`, `python_function`, `remote_code`). The init flow currently exposes only the Gemini-drafted `custom_llm_judge` path because the questionary forms for the other four would add ~200 lines of UI for capability that power users can already access by hand-editing `metric_definitions.json`. If you want that UI surfaced interactively, file an issue.
-- **Folder collapse for Path B** — the unified `tests/eval/` layout shipped for Path A (Agent Engine — `dataset.jsonl` + `metrics/metric_definitions.json` + `results/`). Path B's local UserSim still reads `eval/scenarios/conversation_scenarios.json` and `eval/scenarios/session_input.json` directly because ADK's runtime expects those filenames at those paths. Once ADK exposes a hook for an alternative scenarios source, Path B will collapse into `tests/eval/` too.
+- **Folder collapse for UserSim files** — the unified `tests/eval/` layout shipped for the streamlined Agent Engine pass (`dataset.jsonl` + `metrics/metric_definitions.json` + `results/`). The local pipeline's UserSim still reads `eval/scenarios/conversation_scenarios.json` and `eval/scenarios/session_input.json` directly because ADK's runtime expects those filenames at those paths. Once ADK exposes a hook for an alternative scenarios source, those will collapse into `tests/eval/` too.
 
 ### SDK features `agent-eval` doesn't surface yet
 

@@ -24,7 +24,10 @@
 
 ## Typical Project Structure
 
-When a user runs `agent-eval init`, it scaffolds eval artifacts under `tests/eval/` (Path A — Agent Engine) and/or `eval/` (Path B — local ADK source, ADK-runtime files):
+When a user runs `agent-eval init`, it auto-detects which evaluation surfaces are available and scaffolds for each:
+
+- `tests/eval/` — unified SDK-aligned layout (dataset + metrics + results). Always written.
+- `eval/` — ADK-runtime files (UserSim scenarios + DIY golden dataset). Written when local `agent.py` is found, since these paths are what ADK's runtime expects.
 
 ```
 my-agent/
@@ -32,11 +35,11 @@ my-agent/
 │   ├── agent.py
 │   ├── tools/
 │   └── ...
-├── tests/eval/                                # Path A — unified SDK-aligned layout
+├── tests/eval/                                # Unified SDK-aligned layout
 │   ├── dataset.jsonl                          # Unified rows (prompt / reference / conversation_history / session_inputs / expected_*)
 │   ├── metrics/metric_definitions.json        # LLM-as-judge metric rubrics
 │   └── results/                               # Evaluation outputs (eval_summary.json, gemini_analysis.md, ...)
-├── eval/                                      # Path B — kept for local ADK runtime (UserSim + DIY)
+├── eval/                                      # ADK-runtime files (local pipeline only)
 │   ├── scenarios/                             # ADK User Sim scenarios + session input
 │   ├── eval_data/golden_dataset.json          # DIY test queries
 │   └── metrics/metric_definitions.json        # Same rubrics, read by `evaluate` if tests/eval/metrics/ is absent
@@ -60,7 +63,7 @@ my-agent/
 | `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
 | `uv run agent-eval interact` | Run queries against a live agent endpoint (single-turn) |
 | `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics (supports multiple `--interaction-file`) |
-| `uv run agent-eval agent-engine` | Path A — streamlined `create_evaluation_run()` against a deployed Agent Engine |
+| `uv run agent-eval agent-engine` | Streamlined `create_evaluation_run()` against a deployed Agent Engine (single-turn, additive when deployed) |
 | `uv run agent-eval analyze` | Generate AI-powered analysis reports |
 | `uv run agent-eval convert` | Convert ADK traces to evaluation format (used by simulate) |
 | `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
@@ -87,7 +90,7 @@ my-agent/
 
 ### Creating Custom Metrics
 
-Metrics live in `tests/eval/metrics/metric_definitions.json` (Path A) or `eval/metrics/metric_definitions.json` (Path B / legacy fallback). Users can create them in two ways:
+Metrics live in `tests/eval/metrics/metric_definitions.json` (preferred) or `eval/metrics/metric_definitions.json` (legacy fallback for the local pipeline). Users can create them in two ways:
 
 1. **AI generation** (recommended): Run `agent-eval init` and choose "Generate with AI" in Step 3. Select managed metrics (Google's built-in rubrics), then optionally generate custom metrics with Gemini. Custom metrics complement managed ones — they're tailored to the agent's specific behaviors. Re-running `init` preserves existing metrics and pre-checks previous selections. If eval files already exist, they are backed up to `tests/eval/.backup/` (or `eval/.backup/`) before updating.
 
@@ -184,8 +187,9 @@ Instructions:
 2. **Clear eval_history** before each ADK User Sim run — `simulate` does this automatically; if running manually: `rm -rf <agent_module>/.adk/eval_history/*`
 3. **Location is auto-configured** — Gemini 3+ models use `global` automatically via `get_location()` in config.py. Override with `--location` if needed
 4. **`app_name` must match the folder name** containing `agent.py`, not the agent's display name
-5. **Path A custom LLM metrics translate automatically** — `agent-engine` builds `vt.LLMMetric` from any metric with `template` + `score_range` via `metric_factory.custom_llm_judge` and wraps it for `create_evaluation_run` via `metric_factory.to_evaluation_run_metric`. Don't reintroduce the "skipped, custom LLM metrics aren't supported" warning.
+5. **Custom LLM metrics translate automatically when running through `agent-engine` (Agent Engine surface)** — `agent-engine` builds `vt.LLMMetric` from any metric with `template` + `score_range` via `metric_factory.custom_llm_judge` and wraps it for `create_evaluation_run` via `metric_factory.to_evaluation_run_metric`. Don't reintroduce the "skipped, custom LLM metrics aren't supported" warning.
 6. **`AGENT_EVAL_NO_PAUSES=1` covers both `_continue` pauses and the `simulate` Run ID prompt.** Any new interactive `Prompt.ask` / `questionary.*` call must guard on `_pauses_disabled()` (or accept a non-interactive default) so CI runs don't deadlock.
 7. **`agent-engine` auto-creates the destination GCS bucket** in `--location` if it doesn't exist (uses `google.cloud.storage.Client.create_bucket`). Don't duplicate that logic elsewhere — and don't remove it; first runs depend on it.
 8. **`agent-engine` follows the docs' `evaluation-agents-client` pattern** — `Client(..., http_options=HttpOptions(api_version="v1beta1"))`, builds an `AgentInfo` from a locally-imported `root_agent` (default `app.agent:root_agent`, override via `--agent-module`), and passes it to `create_evaluation_run`. `_build_agent_info` falls back to manual construction with empty `tool_declarations` when `AgentInfo.load_from_agent` trips on ADK's `tool_context` (a known SDK ↔ ADK schema bug). Don't replace this with the original "submit-only + parse-error" flow — without `agent_info` the run lands in `FAILED` with empty event lists.
 9. **SDK pin: `google-cloud-aiplatform[evaluation,agent-engines]>=1.132.0,<1.140.0`.** Versions ≥1.140 changed the `AgentInfo` schema (drops `agent_resource_name`, requires `agents`/`root_agent_id` map) AND tightened `AgentData` validation in `run_inference` to reject ADK's rich event fields. Bumping past this needs the `agent_engine.py` helpers to be re-tested.
+10. **Local pipeline is the default; Agent Engine is purely additive.** `init` auto-detects what's available — local `agent.py` enables the local pipeline (`simulate` + `interact` + `evaluate` + `analyze`); a deployed Agent Engine adds the streamlined `agent-engine` pass on top. They compose, they don't compete. UserSim works against any locally-imported `agent.py` regardless of deployment status. Never reintroduce a "Path A vs Path B" chooser — it's a phantom choice.
