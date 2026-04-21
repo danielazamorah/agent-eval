@@ -153,7 +153,108 @@ def _is_service_account(account: str) -> bool:
     return account.endswith(".gserviceaccount.com") or account.startswith("gce-sa@")
 
 
-def _check_api_enabled(project: str, api: str) -> Optional[bool]:
+# Sentinel returned by gcloud helpers to tell the caller *why* a check failed,
+# so the caller can either prompt the user to re-auth or surface the real error.
+class _GcloudFailure:
+    __slots__ = ("kind", "message")
+
+    def __init__(self, kind: str, message: str = "") -> None:
+        # kind: "missing" | "reauth" | "permission" | "timeout" | "other"
+        self.kind = kind
+        self.message = message
+
+
+_REAUTH_PATTERNS = (
+    "reauthentication failed",
+    "reauthentication required",
+    "there was a problem refreshing your current auth tokens",
+    "credentials are no longer valid",
+    "invalid_grant",
+    "your credentials are invalid",
+)
+
+
+def _classify_stderr(err: str) -> str:
+    """Decide whether a gcloud stderr blob is reauth, permission, or generic."""
+    lower = (err or "").lower()
+    if any(p in lower for p in _REAUTH_PATTERNS):
+        return "reauth"
+    if "permission_denied" in lower or "does not have permission" in lower:
+        return "permission"
+    return "other"
+
+
+def _token_valid() -> bool:
+    """True if `gcloud auth print-access-token` succeeds.
+
+    Cheaper than any API call and produces an unambiguous reauth error when
+    the cached refresh token has expired.
+    """
+    try:
+        result = subprocess.run(
+            ["gcloud", "auth", "print-access-token"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _ensure_session(account: str, *, auto_approve: bool) -> None:
+    """Catch expired-token state right after Step 1 and offer to re-auth.
+
+    Step 1 only looks at `gcloud config get-value account` (a local read);
+    it doesn't notice that the cached OAuth refresh token has expired. The
+    next API call (Step 4) was the one that surfaced the failure — and only
+    as a misleading "gcloud not available" skip. We pre-flight here so the
+    user gets prompted *before* the per-step work fans out.
+    """
+    if not account or _token_valid():
+        return
+
+    _warn("Your gcloud session has expired (cached token can't refresh).")
+    _hint("Every API check below would fail until you re-auth.")
+
+    if auto_approve:
+        _hint("Run:  gcloud auth login --update-adc")
+        return
+
+    if not questionary.confirm(
+        "  Run `gcloud auth login --update-adc` now?", default=True,
+    ).ask():
+        return
+
+    while True:
+        try:
+            subprocess.run(["gcloud", "auth", "login", "--update-adc"], check=True)
+            if _token_valid():
+                _ok("Session refreshed.")
+                return
+            _warn("Login completed but token check still fails.")
+        except subprocess.CalledProcessError as e:
+            _warn("gcloud auth login failed.")
+            err = (e.stderr or b"").decode().strip() if e.stderr else ""
+            if err:
+                _hint(err.splitlines()[-1][:300])
+        except FileNotFoundError:
+            _warn("gcloud not on PATH — install the SDK before continuing.")
+            return
+
+        choice = _after_failure("gcloud auth login")
+        if choice == "retry":
+            continue
+        if choice == "exit":
+            _abort_setup()
+        return  # skip
+
+
+def _check_api_enabled(project: str, api: str):
+    """Return True/False if known, otherwise a `_GcloudFailure` describing why.
+
+    Distinguishing "gcloud isn't on PATH" from "gcloud ran but the call
+    failed" matters: the first means abort the step, the second usually
+    means re-auth or grant a permission.
+    """
     try:
         result = subprocess.run(
             ["gcloud", "services", "list", "--enabled",
@@ -161,11 +262,16 @@ def _check_api_enabled(project: str, api: str) -> Optional[bool]:
              f"--filter=config.name:{api}"],
             capture_output=True, text=True, timeout=15,
         )
-        if result.returncode != 0:
-            return None
+    except FileNotFoundError:
+        return _GcloudFailure("missing")
+    except subprocess.TimeoutExpired:
+        return _GcloudFailure("timeout")
+
+    if result.returncode == 0:
         return api in result.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
+
+    err = (result.stderr or "").strip()
+    return _GcloudFailure(_classify_stderr(err), err)
 
 
 def _enable_api(project: str, api: str) -> Tuple[bool, str]:
@@ -454,24 +560,43 @@ def _step_5_autorater_iam(project: str, auto_approve: bool) -> None:
         "(Once per project — re-running is a no-op.)",
     )
 
-    # First we need the project number
+    # First we need the project number. Distinguish "gcloud missing" vs.
+    # "gcloud ran but errored" so the user knows whether to install the SDK,
+    # re-auth, or grant a permission.
+    project_number = ""
+    failure_reason = ""
     try:
         result = subprocess.run(
             ["gcloud", "projects", "describe", project, "--format=value(projectNumber)"],
             capture_output=True, text=True, timeout=10,
         )
-        project_number = (result.stdout or "").strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        project_number = ""
+        if result.returncode == 0:
+            project_number = (result.stdout or "").strip()
+        else:
+            err = (result.stderr or "").strip()
+            kind = _classify_stderr(err)
+            failure_reason = (
+                "gcloud session expired" if kind == "reauth"
+                else "permission denied" if kind == "permission"
+                else (err.splitlines()[-1][:200] if err else "unknown gcloud error")
+            )
+    except FileNotFoundError:
+        failure_reason = "gcloud not on PATH"
+    except subprocess.TimeoutExpired:
+        failure_reason = "gcloud timed out"
 
     console.print()
     if not project_number:
-        _warn("Could not look up the project number.")
-        _hint(f"Run manually:")
-        _hint(f"  PN=$(gcloud projects describe {project} --format='value(projectNumber)')")
-        _hint(f"  gcloud projects add-iam-policy-binding {project} \\")
-        _hint( "    --member=\"serviceAccount:service-$PN@gcp-sa-aiplatform.iam.gserviceaccount.com\" \\")
-        _hint( "    --role=\"roles/aiplatform.serviceAgent\"")
+        _warn(f"Could not look up the project number ({failure_reason}).")
+        if "session expired" in failure_reason:
+            _hint("Run:  gcloud auth login --update-adc")
+            _hint("Then re-run `agent-eval setup`.")
+        else:
+            _hint(f"Run manually:")
+            _hint(f"  PN=$(gcloud projects describe {project} --format='value(projectNumber)')")
+            _hint(f"  gcloud projects add-iam-policy-binding {project} \\")
+            _hint( "    --member=\"serviceAccount:service-$PN@gcp-sa-aiplatform.iam.gserviceaccount.com\" \\")
+            _hint( "    --role=\"roles/aiplatform.serviceAgent\"")
         return
 
     member = f"serviceAccount:service-{project_number}@gcp-sa-aiplatform.iam.gserviceaccount.com"
@@ -554,8 +679,35 @@ def _enable_apis(
         console.print(f"    [dim]{purpose}[/]")
 
         already = _check_api_enabled(project, api)
-        if already is None:
-            console.print("    [dim]skip[/]   gcloud not available — can't check.")
+        if isinstance(already, _GcloudFailure):
+            if already.kind == "missing":
+                console.print("    [dim]skip[/]   gcloud not on PATH — can't check.")
+                continue
+            if already.kind == "timeout":
+                _warn("    gcloud check timed out — skipping.")
+                continue
+            if already.kind == "reauth":
+                _warn("    gcloud session expired — can't check API state.")
+                _hint("    Run:  gcloud auth login --update-adc")
+                _hint("    Then re-run `agent-eval setup`.")
+                if not auto_approve and questionary.confirm(
+                    "    Run `gcloud auth login --update-adc` now?", default=True,
+                ).ask():
+                    try:
+                        subprocess.run(["gcloud", "auth", "login", "--update-adc"], check=True)
+                        already = _check_api_enabled(project, api)
+                    except subprocess.CalledProcessError:
+                        _warn("    Login failed — skipping the rest of this step.")
+                        return
+                    except FileNotFoundError:
+                        return
+                else:
+                    continue
+            else:
+                _warn(f"    gcloud check failed: {already.message.splitlines()[-1][:300] if already.message else 'unknown error'}")
+                continue
+        if isinstance(already, _GcloudFailure):
+            # Re-auth attempt above could still leave us in a failure state.
             continue
         if already:
             _ok("    already enabled")
@@ -666,6 +818,11 @@ def setup(asp: bool, auto_approve: bool) -> None:
 
     # 1. Active account
     account = _step_1_account(auto_approve=auto_approve)
+
+    # 1b. Pre-flight: if the cached refresh token has expired, every later
+    # subprocess call fails non-interactively with "Reauthentication failed".
+    # Prompt now so steps 4/5 don't silently degrade to "skip".
+    _ensure_session(account, auto_approve=auto_approve)
 
     # 2. Application Default Credentials (validated against the active account
     #    from step 1 — file existence alone is not enough, see _step_2_adc).
