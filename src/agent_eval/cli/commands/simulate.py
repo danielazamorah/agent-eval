@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
-from agent_eval.cli._pacing import _continue
+from agent_eval.cli._pacing import _continue, _pauses_disabled
 
 console = Console()
 
@@ -404,22 +404,25 @@ def simulate(agent_dir, eval_dir, run_id, debug):
     # ── Run ID ─────────────────────────────────────────────────────────────
 
     if not run_id:
-        from rich.prompt import Prompt
-        console.print()
-        console.print(Panel(
-            "[bold]Give this run a name[/] so you can easily find it later.\n\n"
-            "Examples: [cyan]baseline[/], [cyan]v2-tool-hardening[/], [cyan]cache-optimization[/]\n\n"
-            "[dim]Results will be saved to eval/results/<run-id>/.\n"
-            "Press Enter to use an auto-generated timestamp instead.[/]",
-            title="[bold]Run ID[/]",
-            border_style="blue",
-            padding=(1, 2),
-        ))
         default_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_id = Prompt.ask(
-            "  Run ID",
-            default=default_ts,
-        ).strip()
+        if _pauses_disabled():
+            run_id = default_ts
+        else:
+            from rich.prompt import Prompt
+            console.print()
+            console.print(Panel(
+                "[bold]Give this run a name[/] so you can easily find it later.\n\n"
+                "Examples: [cyan]baseline[/], [cyan]v2-tool-hardening[/], [cyan]cache-optimization[/]\n\n"
+                "[dim]Results will be saved to eval/results/<run-id>/.\n"
+                "Press Enter to use an auto-generated timestamp instead.[/]",
+                title="[bold]Run ID[/]",
+                border_style="blue",
+                padding=(1, 2),
+            ))
+            run_id = Prompt.ask(
+                "  Run ID",
+                default=default_ts,
+            ).strip()
         # Sanitize: replace spaces with hyphens, remove problematic chars
         run_id = run_id.replace(" ", "-")
 

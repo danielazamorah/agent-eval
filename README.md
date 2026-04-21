@@ -128,9 +128,26 @@ This is the **streamlined path**. Vertex AI calls your deployed agent for you, r
 > Don't want to use Agent Engine, or already have an agent (deployed elsewhere or running locally)? **Skip to [Path B](#path-b--local-adk-agent-or-any-other-deployment-method) below** — `agent-eval` works there too, just with a different inference path under the hood.
 
 ```bash
-agent-eval init   # auto-discovers your agent + Reasoning Engine resource
-agent-eval run
+agent-eval init           # auto-discovers your agent + Reasoning Engine resource
+agent-eval agent-engine   # one managed call: inference + scoring + GCS upload
 ```
+
+`agent-engine` auto-creates the destination bucket on first run, then polls the run every 10 seconds and prints state transitions until it terminates:
+
+```text
+> Using bucket gs://my-project-agent-eval
+> Evaluation run submitted.
+  Run:      projects/.../evaluationRuns/8203...
+  Waiting for evaluation to finish (timeout 900s)...
+  state = INFERENCE
+  state = RUNNING
+  state = SUCCEEDED
+> Run SUCCEEDED.
+  View results: https://console.cloud.google.com/vertex-ai/evaluations/...
+  GCS:      gs://my-project-agent-eval/agent-eval/20260421-073914
+```
+
+Pass `--no-wait` for fire-and-forget (useful in CI when you only need the resource name + dashboard URL), or `--timeout <seconds>` if your dataset is huge.
 
 ---
 

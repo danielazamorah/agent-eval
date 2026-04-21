@@ -184,3 +184,6 @@ Instructions:
 2. **Clear eval_history** before each ADK User Sim run — `simulate` does this automatically; if running manually: `rm -rf <agent_module>/.adk/eval_history/*`
 3. **Location is auto-configured** — Gemini 3+ models use `global` automatically via `get_location()` in config.py. Override with `--location` if needed
 4. **`app_name` must match the folder name** containing `agent.py`, not the agent's display name
+5. **Path A custom LLM metrics translate automatically** — `agent-engine` builds `vt.LLMMetric` from any metric with `template` + `score_range` via `metric_factory.custom_llm_judge` and wraps it for `create_evaluation_run` via `metric_factory.to_evaluation_run_metric`. Don't reintroduce the "skipped, custom LLM metrics aren't supported" warning.
+6. **`AGENT_EVAL_NO_PAUSES=1` covers both `_continue` pauses and the `simulate` Run ID prompt.** Any new interactive `Prompt.ask` / `questionary.*` call must guard on `_pauses_disabled()` (or accept a non-interactive default) so CI runs don't deadlock.
+7. **`agent-engine` auto-creates the destination GCS bucket** in `--location` if it doesn't exist (uses `google.cloud.storage.Client.create_bucket`). Don't duplicate that logic elsewhere — and don't remove it; first runs depend on it.

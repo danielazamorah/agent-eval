@@ -2217,19 +2217,17 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
             custom_metric_definitions=custom_metrics,
             ai_recommendations=recommendations,
         )
-    else:
-        # Path A only: still write the metric definitions so `agent-engine`
-        # has something to score against.
-        from agent_eval.core.scaffold import scaffold_metrics_only
+
+    if "A" in chosen_paths or not chosen_paths:
+        # Path A reads from tests/eval/metrics/ first; write it whenever A
+        # is selected so agent-engine doesn't fall back to legacy eval/metrics/.
+        from agent_eval.core.scaffold import scaffold_dataset_jsonl, scaffold_metrics_only
         scaffold_metrics_only(
             target_dir=agent_dir,
             agent_name=agent_name,
             metrics=metrics,
             custom_metric_definitions=custom_metrics,
         )
-
-    if "A" in chosen_paths or not chosen_paths:
-        from agent_eval.core.scaffold import scaffold_dataset_jsonl
         scaffold_dataset_jsonl(
             target_dir=agent_dir,
             agent_name=agent_name,

@@ -537,6 +537,8 @@ uv run agent-eval simulate --agent-dir path/to/agent_module
 
 > ADK runs its own built-in LLM scoring during `adk eval`. The `simulate` command defaults to an empty `eval_config.json` (`{"criteria": {}}`) to skip this — `agent-eval` handles all scoring via the `evaluate` command instead.
 
+**CI / scripted runs.** Set `AGENT_EVAL_NO_PAUSES=1` to skip the interactive Run ID prompt (and every other `_continue` pause). The command falls back to a timestamp like `20260421_073914`, so you can pipe `simulate → evaluate → analyze` end-to-end without any keystrokes.
+
 ---
 
 ### interact
@@ -651,11 +653,13 @@ agent-eval agent-engine [OPTIONS]
 | Option | Default | Description |
 |---|---|---|
 | `--dataset` | `tests/eval/dataset.jsonl` | Unified dataset JSONL with `prompt` / `session_inputs` rows. |
-| `--metrics` | `tests/eval/metrics/metric_definitions.json` | Metric definitions (unified `kind` schema — see [Custom metric patterns](#custom-metric-patterns)). |
+| `--metrics` | `tests/eval/metrics/metric_definitions.json` | Metric definitions (managed rubrics + custom LLM judges via `template` + `score_range`). Falls back to `eval/metrics/metric_definitions.json` for legacy projects. |
 | `--resource-name` | env `AGENT_ENGINE_RESOURCE_NAME` or auto-detection | Agent Engine resource (`projects/.../reasoningEngines/...`). |
-| `--dest` | `gs://<project>-agent-eval/<timestamp>/` | GCS destination for results. |
+| `--dest` | `gs://<project>-agent-eval/<timestamp>` | GCS destination for results. Override the bucket with env `AGENT_EVAL_DEST_BUCKET`. The bucket is **auto-created** in `--location` on first run if it doesn't exist. |
 | `--project` | env `GOOGLE_CLOUD_PROJECT` | GCP project ID. |
-| `--location` | env `GOOGLE_CLOUD_LOCATION` or `us-central1` | GCP location. |
+| `--location` | env `GOOGLE_CLOUD_LOCATION` or `us-central1` | GCP location (also used for the dest bucket). |
+| `--timeout` | `900` | Seconds to wait for the run to finish before giving up. The command polls `client.evals.get_evaluation_run(name=...)` every 10s and prints state transitions (`PENDING → INFERENCE → RUNNING → SUCCEEDED`). |
+| `--no-wait` | _off_ | Submit the run and exit immediately. Prints the resource name + dashboard URL. Use this in CI when you don't want to block. |
 | `--debug` | _off_ | Show full SDK logs (otherwise suppressed). |
 
 **When to use this instead of `evaluate`:**
@@ -664,7 +668,9 @@ agent-eval agent-engine [OPTIONS]
 - You want managed inference — no local FastAPI server required, no traces to capture yourself.
 - You want a single `dashboard_url` to share with stakeholders.
 
-The dataset only needs `prompt` (and optionally `session_inputs`) — `reference` is not required, since the managed adaptive rubrics judge quality without it. Python in-process metrics (`kind: python_function`) are skipped with a warning, since `create_evaluation_run` cannot execute local Python.
+**Custom LLM metrics on Path A.** Both managed rubrics (`is_managed: true` + `managed_metric_name: "GENERAL_QUALITY"`) and AI-generated custom metrics (`template` + `score_range`) are translated into Vertex SDK objects automatically: managed names map to `vt.RubricMetric.<NAME>`, custom judges build a `vt.LLMMetric` via `metric_factory.custom_llm_judge` (the `template` becomes the criterion body, `score_range.min`/`max` becomes the rating scale) and are wrapped with `metric_factory.to_evaluation_run_metric`. Python in-process metrics (`kind: python_function`) are still skipped with a warning, since `create_evaluation_run` cannot execute local Python.
+
+The dataset only needs `prompt` (and optionally `session_inputs`) — `reference` is not required for managed rubrics, but custom judges that declare `requires_reference: true` will only score rows that have a reference column.
 
 ---
 
