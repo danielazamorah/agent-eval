@@ -880,6 +880,11 @@ def _prompt_managed_metrics_selection(
     # "We recommend starting with GENERAL_QUALITY as the default."
     # Everything else is opt-in via the checkbox below.
     defaults = preselected if preselected is not None else {"general_quality"}
+    # Track whether `defaults` came from an existing metric_definitions.json
+    # so the picker's helper text can honestly say "loaded from your file"
+    # vs "the Vertex AI docs' recommended starting point". Without this, the
+    # message lies whenever a re-run finds non-default selections.
+    _from_existing_file = preselected is not None and bool(preselected)
 
     # Group by metric family (adaptive/static/computation/translation) per the
     # plan §3.4. Family classification comes from SDK introspection — adding a
@@ -951,6 +956,11 @@ def _prompt_managed_metrics_selection(
     def _family_subtitle(key: str) -> str:
         return family_subtitle.get(key, "[new family from SDK — not yet curated]")
 
+    # Iteration counter the catalog reads to vary the "Pre-checked" wording
+    # between the first render and re-opens. Dict-wrapped so the closure can
+    # mutate it without `nonlocal` gymnastics.
+    _picker_iteration = {"count": 0}
+
     # Catalog rendering lives in a closure so we can re-render it if the user
     # picks the "↩ Reopen the catalog" sentinel from the picker.
     def _render_catalog() -> None:
@@ -1018,10 +1028,30 @@ def _prompt_managed_metrics_selection(
             "[bold]space[/] [dim]toggles ·[/] [bold]↑/↓[/] [dim]navigates ·[/] "
             "[bold]enter[/] [dim]confirms[/]"
         )
-        console.print(
-            "  [dim]Pre-checked for you:[/] [bold green]GENERAL_QUALITY[/] "
-            "[dim]— the Vertex AI docs' recommended starting point.[/]"
+        # Reflect what's actually pre-checked, and where it came from. Reading
+        # `defaults` (mutated on reopen) keeps this honest across loop iterations.
+        _checked_names = sorted(
+            managed_metrics[k]["managed_metric_name"]
+            for k in defaults
+            if k in managed_metrics
         )
+        _names_text = ", ".join(_checked_names) if _checked_names else "nothing"
+        if _from_existing_file and not _picker_iteration["count"]:
+            console.print(
+                f"  [dim]Pre-checked from your existing[/] "
+                f"[cyan]metric_definitions.json[/][dim]:[/] "
+                f"[bold green]{_names_text}[/] [dim]— uncheck any you no longer want.[/]"
+            )
+        elif _picker_iteration["count"]:
+            console.print(
+                f"  [dim]Pre-checked:[/] [bold green]{_names_text}[/] "
+                f"[dim]— your selections so far (preserved across reopens).[/]"
+            )
+        else:
+            console.print(
+                f"  [dim]Pre-checked for you:[/] [bold green]{_names_text}[/] "
+                "[dim]— the Vertex AI docs' recommended starting point.[/]"
+            )
         console.print(
             "  [dim]Forgot what something does? Tick[/] [bold]↩ Reopen the catalog[/] "
             "[dim](first option) and confirm — selections are kept.[/]"
@@ -1049,6 +1079,7 @@ def _prompt_managed_metrics_selection(
     # truncation, no width math — terminal width is irrelevant.
     while True:
         _render_catalog()
+        _picker_iteration["count"] += 1
 
         choices: list = [
             questionary.Choice(
