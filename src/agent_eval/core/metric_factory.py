@@ -248,10 +248,17 @@ def to_evaluation_run_metric(metric: Any):
 
     # LLMMetric -> llm_based_metric_spec
     if isinstance(metric, vt.LLMMetric):
+        # The spec class moved between SDK versions: older releases exposed
+        # it as ``vertexai._genai.types.LLMBasedMetricSpec``; current
+        # releases re-export ``google.genai.types.LLMBasedMetricSpec``.
+        try:
+            spec_cls = vt.LLMBasedMetricSpec
+        except AttributeError:
+            from google.genai.types import LLMBasedMetricSpec as spec_cls
         return vt.EvaluationRunMetric(
             metric=metric.name,
             metric_config=vt.UnifiedMetric(
-                llm_based_metric_spec=vt.LLMBasedMetricSpec(
+                llm_based_metric_spec=spec_cls(
                     metric_prompt_template=metric.prompt_template,
                 ),
             ),

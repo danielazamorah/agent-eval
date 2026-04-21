@@ -660,6 +660,7 @@ agent-eval agent-engine [OPTIONS]
 | `--location` | env `GOOGLE_CLOUD_LOCATION` or `us-central1` | GCP location (also used for the dest bucket). |
 | `--timeout` | `900` | Seconds to wait for the run to finish before giving up. The command polls `client.evals.get_evaluation_run(name=...)` every 10s and prints state transitions (`PENDING → INFERENCE → RUNNING → SUCCEEDED`). |
 | `--no-wait` | _off_ | Submit the run and exit immediately. Prints the resource name + dashboard URL. Use this in CI when you don't want to block. |
+| `--agent-module` | auto-detects `pkg.agent:root_agent` from local `agent.py` | Local agent import path used to build `AgentInfo` for the run. Override with `pkg.module:attr` for non-ASP layouts. |
 | `--debug` | _off_ | Show full SDK logs (otherwise suppressed). |
 
 **When to use this instead of `evaluate`:**
@@ -669,6 +670,10 @@ agent-eval agent-engine [OPTIONS]
 - You want a single `dashboard_url` to share with stakeholders.
 
 **Custom LLM metrics on Path A.** Both managed rubrics (`is_managed: true` + `managed_metric_name: "GENERAL_QUALITY"`) and AI-generated custom metrics (`template` + `score_range`) are translated into Vertex SDK objects automatically: managed names map to `vt.RubricMetric.<NAME>`, custom judges build a `vt.LLMMetric` via `metric_factory.custom_llm_judge` (the `template` becomes the criterion body, `score_range.min`/`max` becomes the rating scale) and are wrapped with `metric_factory.to_evaluation_run_metric`. Python in-process metrics (`kind: python_function`) are still skipped with a warning, since `create_evaluation_run` cannot execute local Python.
+
+**SDK pattern.** `agent-engine` follows the [evaluation-agents-client docs pattern](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-agents-client) verbatim: the `Client` is constructed with `http_options=HttpOptions(api_version="v1beta1")`, the local agent is imported (default `app.agent:root_agent`, override with `--agent-module`), and an `AgentInfo` is attached to `create_evaluation_run`. Without `agent_info` the deployed agent's events come back without `content.parts` and the SDK fails the run with "Failed to parse agent run response []" — the local-agent enrichment is what makes the deployed run actually score. If `AgentInfo.load_from_agent` fails because an ADK tool takes a `tool_context: ToolContext` parameter (a known ADK ↔ google-genai schema bug), the command falls back to a manual `AgentInfo(...)` build with empty `tool_declarations`. The agent's name, instruction, and description still flow through.
+
+> **SDK pin.** `pyproject.toml` constrains `google-cloud-aiplatform[evaluation,agent-engines]>=1.132.0,<1.140.0`. Versions ≥1.140 changed the `AgentInfo` schema (drops `agent_resource_name`, requires an `agents`/`root_agent_id` map) and tightened `AgentData` validation in `run_inference` to reject ADK's rich event fields. Bumping past this will need `_build_agent_info` rewritten for the new schema.
 
 The dataset only needs `prompt` (and optionally `session_inputs`) — `reference` is not required for managed rubrics, but custom judges that declare `requires_reference: true` will only score rows that have a reference column.
 

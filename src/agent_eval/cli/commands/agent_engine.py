@@ -216,6 +216,126 @@ def _bucket_name_from_uri(uri: str) -> Optional[str]:
     return rest.split("/", 1)[0] or None
 
 
+def _load_local_agent(agent_module: Optional[str], cwd: Path) -> Optional[Any]:
+    """Import the local ADK agent so we can build ``AgentInfo`` for the run.
+
+    The Vertex SDK's ``create_evaluation_run`` doesn't *require* an
+    ``agent_info``, but without it the managed inference path returns events
+    that the SDK can't parse (the "Failed to parse agent run response []"
+    error). Loading the local ``LLMAgent`` and passing
+    ``AgentInfo.load_from_agent`` makes the run succeed end-to-end.
+
+    ``agent_module`` is in ``"package.module:attribute"`` form (default
+    ``"app.agent:root_agent"`` matches Agent Starter Pack). When None, we
+    auto-detect via ``path_detector``: find ``agent.py``, treat its parent
+    folder as the module package, add the grandparent to ``sys.path``.
+
+    Returns ``None`` (with a warning) if loading fails — the run still goes
+    through, just without the inline tool/instruction enrichment.
+    """
+    import importlib
+    import sys
+
+    spec = agent_module
+    extra_sys_path: Optional[Path] = None
+
+    if spec is None:
+        from agent_eval.core.path_detector import detect_execution_path
+        detection = detect_execution_path(cwd)
+        if not detection.local_agents:
+            console.print(
+                "  [yellow]![/] No local agent.py found — submitting without "
+                "agent_info. Use [cyan]--agent-module pkg.module:root_agent[/] "
+                "if your agent lives outside auto-detection."
+            )
+            return None
+        agent_py = detection.local_agents[0]
+        package_dir = agent_py.parent          # e.g. .../my-agent/app
+        extra_sys_path = package_dir.parent    # e.g. .../my-agent
+        spec = f"{package_dir.name}.{agent_py.stem}:root_agent"
+
+    if ":" in spec:
+        module_path, attr = spec.split(":", 1)
+    else:
+        module_path, attr = spec, "root_agent"
+
+    if extra_sys_path is not None and str(extra_sys_path) not in sys.path:
+        sys.path.insert(0, str(extra_sys_path))
+
+    try:
+        module = importlib.import_module(module_path)
+        agent = getattr(module, attr)
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            f"  [yellow]![/] Could not import [cyan]{spec}[/]: {exc}. "
+            f"Submitting without agent_info — run may fail to parse events."
+        )
+        return None
+
+    console.print(f"  [dim]Local agent:[/] [cyan]{spec}[/]")
+    return agent
+
+
+def _build_agent_info(vt_evals: Any, agent: Any, resource_name: str) -> Optional[Any]:
+    """Build an ``AgentInfo`` for ``create_evaluation_run``.
+
+    The SDK's ``AgentInfo.load_from_agent`` walks ``agent.tools`` and converts
+    each callable to a JSON schema, which fails for any ADK tool that takes
+    ``tool_context: ToolContext`` (a non-JSON-serializable ADK injection).
+    We try the SDK helper first for full fidelity, then fall back to a
+    manual ``AgentInfo()`` construction with empty ``tool_declarations`` so
+    Vertex still has the agent's instruction + name to attach to the run.
+
+    Also handles the schema rename across SDK versions: older releases use
+    ``agent_resource_name`` + ``instruction`` + ``tool_declarations``, while
+    newer releases use ``agents`` + ``root_agent_id``.
+    """
+    AgentInfo = vt_evals.AgentInfo
+
+    def _try_load() -> Optional[Any]:
+        try:
+            return AgentInfo.load_from_agent(agent, agent_resource_name=resource_name)
+        except TypeError:
+            try:
+                return AgentInfo.load_from_agent(agent)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    info = _try_load()
+    if info is not None:
+        return info
+
+    fields = set(AgentInfo.model_fields.keys())
+    name = getattr(agent, "name", None) or "root_agent"
+    common = {"name": name}
+    if "agent_resource_name" in fields:
+        common["agent_resource_name"] = resource_name
+    if "instruction" in fields:
+        common["instruction"] = getattr(agent, "instruction", None) or ""
+    if "description" in fields:
+        common["description"] = getattr(agent, "description", None) or ""
+    if "tool_declarations" in fields:
+        common["tool_declarations"] = []
+    if "root_agent_id" in fields:
+        common["root_agent_id"] = name
+
+    try:
+        info = AgentInfo(**common)
+        console.print(
+            "  [dim]Built AgentInfo manually (skipped tool schema — "
+            "ADK ToolContext isn't JSON-schema-serializable).[/]"
+        )
+        return info
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            f"  [yellow]![/] Could not construct AgentInfo: {exc}. "
+            f"Submitting without agent_info."
+        )
+        return None
+
+
 def _ensure_bucket_exists(uri: str, project: str, location: str) -> None:
     """Create the destination bucket if it doesn't already exist.
 
@@ -320,6 +440,15 @@ def _ensure_bucket_exists(uri: str, project: str, location: str) -> None:
     help="Submit the run and exit immediately. Print the resource name + dashboard URL.",
 )
 @click.option(
+    "--agent-module",
+    default=None,
+    help=(
+        "Local agent import path in 'package.module:attribute' form "
+        "(default: auto-detect via agent.py, attribute 'root_agent'). "
+        "Required by the SDK's v1beta1 inference path to build AgentInfo."
+    ),
+)
+@click.option(
     "--debug",
     is_flag=True,
     help="Show full SDK logs (otherwise suppressed for clean output).",
@@ -333,6 +462,7 @@ def agent_engine(
     location: Optional[str],
     timeout: int,
     no_wait: bool,
+    agent_module: Optional[str],
     debug: bool,
 ) -> None:
     """Run a streamlined evaluation against an Agent Engine deployment.
@@ -374,8 +504,10 @@ def agent_engine(
     # Lazy imports — keep CLI startup snappy.
     try:
         import pandas as pd
+        from google.genai.types import HttpOptions
         from vertexai import Client
         from vertexai._genai import types as vt
+        from vertexai._genai.types import evals as vt_evals
     except ImportError as exc:
         console.print(f"  [red]Missing dependency:[/] {exc}")
         raise click.Abort()
@@ -405,7 +537,18 @@ def agent_engine(
 
     _ensure_bucket_exists(destination, project, location)
 
-    client = Client(project=project, location=location)
+    # The docs' evaluation-agents-client pattern requires v1beta1 — the
+    # default API version returns events without `content.parts`, which the
+    # SDK then filters away to an empty list and reports as
+    # "Failed to parse agent run response []".
+    client = Client(
+        project=project,
+        location=location,
+        http_options=HttpOptions(api_version="v1beta1"),
+    )
+
+    local_agent = _load_local_agent(agent_module, Path.cwd())
+    agent_info = _build_agent_info(vt_evals, local_agent, resolved) if local_agent else None
 
     console.print()
     console.print("  [bold]Running inference...[/]")
@@ -421,12 +564,23 @@ def agent_engine(
     inference_df = _sanitize_inference_responses(inference_df)
 
     console.print("  [bold]Submitting evaluation run...[/]")
+    create_kwargs: Dict[str, Any] = {
+        "dataset": inference_df,
+        "metrics": run_metrics,
+        "dest": destination,
+    }
+    if agent_info is not None:
+        create_kwargs["agent_info"] = agent_info
+        # Newer SDK (>= 1.143) requires a separate ``agent`` kwarg to link
+        # the run back to the deployed Reasoning Engine. Older releases
+        # carry that on ``agent_info.agent_resource_name`` instead — pass
+        # ``agent`` only if the SDK accepts it.
+        import inspect as _inspect
+        run_sig = _inspect.signature(client.evals.create_evaluation_run)
+        if "agent" in run_sig.parameters:
+            create_kwargs["agent"] = resolved
     try:
-        run = client.evals.create_evaluation_run(
-            dataset=inference_df,
-            metrics=run_metrics,
-            dest=destination,
-        )
+        run = client.evals.create_evaluation_run(**create_kwargs)
     except Exception as exc:  # noqa: BLE001 — surface SDK errors with context
         console.print(f"  [red]create_evaluation_run failed:[/] {exc}")
         raise click.Abort()
