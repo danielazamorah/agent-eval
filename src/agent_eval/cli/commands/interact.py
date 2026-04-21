@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
+from agent_eval.cli._pacing import _continue
 from agent_eval.core.interactions import InteractionRunner
 from agent_eval.core.processor import InteractionProcessor
 from agent_eval.core.converters import write_jsonl
@@ -196,6 +197,7 @@ def interact(agent_dir, app_name, questions_file, base_url, user_id, results_dir
         border_style="blue",
         padding=(1, 2),
     ))
+    _continue("Press Enter to start interacting →", console=console)
 
     # ── Build config ───────────────────────────────────────────────────────
 

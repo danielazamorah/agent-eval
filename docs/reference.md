@@ -8,48 +8,375 @@ For installation and getting started, see the [README](../README.md).
 
 ## Table of Contents
 
-1. [CLI Reference](#cli-reference)
+1. [Why this design](#why-this-design)
+2. [Mapping to the Vertex AI eval docs sidebar](#mapping-to-the-vertex-ai-eval-docs-sidebar)
+3. [Architecture overview](#architecture-overview)
+   - [The four metric families](#the-four-metric-families)
+   - [The two execution paths](#the-two-execution-paths)
+   - [Inference strategy per path (when we use `run_inference` and when we don't)](#inference-strategy-per-path)
+   - [Dataset row schema](#dataset-row-schema)
+   - [Folder layout (legacy → new)](#folder-layout-legacy--new)
+   - [Custom metric patterns](#custom-metric-patterns)
+3. [Authentication](#authentication)
+3. [CLI Reference](#cli-reference)
    - [init](#init)
    - [run](#run)
    - [simulate](#simulate)
    - [interact](#interact)
    - [evaluate](#evaluate)
    - [analyze](#analyze)
+   - [agent-engine](#agent-engine)
+   - [import](#import)
+   - [migrate](#migrate)
    - [convert](#convert)
    - [create-dataset](#create-dataset)
    - [dashboard](#dashboard)
-2. [Metrics](#metrics)
+4. [Metrics](#metrics)
    - [Deterministic Metrics](#deterministic-metrics)
    - [Managed Metrics (Vertex AI)](#managed-metrics-vertex-ai)
    - [Custom LLM-as-Judge Metrics](#custom-llm-as-judge-metrics)
-3. [Creating Custom Metrics](#creating-custom-metrics)
+5. [Creating Custom Metrics](#creating-custom-metrics)
    - [Basic Structure](#basic-structure)
    - [Dataset Mapping Constraint](#dataset-mapping-constraint)
    - [Available Source Columns](#available-source-columns)
-   - [Metric Routing with applies_to](#metric-routing-with-applies_to)
+   - [Per-row capability detection (`requires_reference` / `requires_multi_turn`)](#per-row-capability-detection)
    - [Combining Multiple Sources](#combining-multiple-sources)
    - [Structured Response Evaluation](#structured-response-evaluation)
    - [Binary Decomposition](#binary-decomposition)
    - [Example: Trajectory Accuracy](#example-trajectory-accuracy)
    - [Example: Tool Usage Quality](#example-tool-usage-quality)
-4. [Interaction Modes](#interaction-modes)
+6. [Interaction Modes](#interaction-modes)
    - [ADK User Sim](#adk-user-sim)
    - [DIY Interactions](#diy-interactions)
-5. [Data Formats](#data-formats)
+7. [Data Formats](#data-formats)
    - [Golden Dataset](#golden-dataset)
    - [Conversation Scenarios](#conversation-scenarios)
    - [Session Input](#session-input)
    - [Processed JSONL Fields](#processed-jsonl-fields)
-6. [Output Files](#output-files)
+8. [Output Files](#output-files)
    - [eval_summary.json](#eval_summaryjson)
    - [gemini_analysis.md](#gemini_analysismd)
    - [OPTIMIZATION_LOG.md](#optimization_logmd)
-7. [Run Comparison](#run-comparison)
-8. [Managed Metrics Catalog](#managed-metrics-catalog)
-9. [Models and Pricing](#models-and-pricing)
-10. [ADK Optimization Patterns](#adk-optimization-patterns)
-11. [AI Assistant Integration](#ai-assistant-integration)
-12. [Troubleshooting](#troubleshooting)
+9. [Run Comparison](#run-comparison)
+10. [Managed Metrics Catalog](#managed-metrics-catalog)
+11. [Models and Pricing](#models-and-pricing)
+12. [ADK Optimization Patterns](#adk-optimization-patterns)
+13. [AI Assistant Integration](#ai-assistant-integration)
+14. [Troubleshooting](#troubleshooting)
+15. [Experimental & on the roadmap](#experimental--on-the-roadmap)
+    - [BYOD — `agent-eval ingest-traces`](#byod-bring-your-own-data--agent-eval-ingest-traces)
+    - [Other deferred items from the plan](#other-deferred-items-from-the-plan)
+    - [SDK features `agent-eval` doesn't surface yet](#sdk-features-agent-eval-doesnt-surface-yet)
+
+---
+
+## Why this design
+
+`agent-eval` exists because we wanted to use the Vertex AI Generative AI Evaluation Service to evaluate our ADK agents — and we wanted the experience of *following the docs* to be the same as the experience of *using the CLI*. This section explains the three problems the SDK-aligned refactor (April 2026) addressed, so you understand the choices reflected in the rest of this doc.
+
+**1. Hardcoded reference requirements.** Earlier versions of `agent-eval` carried a hand-maintained set of "metrics that need a reference field." Every time Google added a new managed metric, our list went stale. The refactor replaces that with `metric_families.classify()` — which introspects the SDK directly via `ComputationMetricHandler.SUPPORTED_COMPUTATION_METRICS`, `TranslationMetricHandler.SUPPORTED_TRANSLATION_METRICS`, and `_evals_constant.SUPPORTED_PREDEFINED_METRICS`. New metrics land in the right family automatically.
+
+**2. The CLI didn't mirror the docs.** Users had to learn two mental models — Google's docs and our flow. The CLI now mirrors the [Vertex AI eval docs sidebar](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation/) one-for-one: *Define metrics* (init Step 3, family-grouped picker) → *Prepare dataset* (init Step 4 / `import`) → *Run evaluation* (`simulate` / `interact` → `evaluate`) → *View results* (`analyze` + `dashboard`) → *Evaluate agents* (`agent-engine` for the streamlined Path A).
+
+**3. Two folders, two data shapes, no clear story for Agent Engine.** The old layout had `app/eval/` (ours) sitting next to `tests/eval/evalsets/` (ADK's), with separate `scenarios/*.json` and `golden_dataset.json` files using different shapes, and unclear handling for Agent Engine deployments. The refactor consolidates everything into one folder (`tests/eval/`), one row shape (`dataset.jsonl`), and two named execution paths (A — Agent Engine; B — Local ADK source / any ADK FastAPI URL) — see [The two execution paths](#the-two-execution-paths). BYOD lives as a roadmap note, not a third path.
+
+**Doc strategy:** the [README](../README.md) is the e2e walk-through — it covers the two paths (Agent Engine + local ADK) end-to-end, including ASP scaffolding for users who don't have an agent yet. The CLI itself carries the in-flow technical detail (`--help`, questionary prompts, Rich panels). This document is the deep reference for when you want to know *why* something works the way it does, plus the catalog of every CLI command, metric, and data shape.
+
+---
+
+## Mapping to the Vertex AI eval docs sidebar
+
+Each section under *"Perform evaluation using the GenAI Client in Vertex AI SDK"* in the eval docs sidebar maps one-for-one to a step in `agent-eval`. Every row links to the official Vertex AI page so you can cross-reference what we're doing on your behalf:
+
+| Docs section | What `agent-eval` does for you |
+|---|---|
+| [Tutorial: Evaluate models using the GenAI Client](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-genai-sdk) | `agent-eval init` walks you through environment setup, agent discovery, and a first-run scaffold — the docs' tutorial, but for ADK agents instead of raw model calls. |
+| [Define your evaluation metrics](https://cloud.google.com/vertex-ai/generative-ai/docs/models/determine-eval) | `init` Step 3 — managed metrics grouped by family (adaptive / static / computation / translation), with `GENERAL_QUALITY` pre-checked per the docs' recommendation. |
+| ↳ [Details for managed rubric-based metrics](https://cloud.google.com/vertex-ai/generative-ai/docs/models/rubric-metric-details) | `metric_families.classify()` introspects the SDK's `_evals_constant.SUPPORTED_PREDEFINED_METRICS`, so the picker stays in sync with the managed `RubricMetric.*` entries automatically. |
+| [Prepare your evaluation dataset](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-dataset) | `init` Step 4 generates a unified `tests/eval/dataset.jsonl` using the canonical SDK columns (`prompt`, `response`, `reference`, `conversation_history`, `session_inputs`, `intermediate_events`) + free-form `expected_*` extras. `agent-eval import --from <evalset>` flattens existing ADK evalsets into the same file. |
+| [Run an evaluation](https://cloud.google.com/vertex-ai/generative-ai/docs/models/run-evaluation) | `agent-eval simulate` (multi-turn via ADK UserSim) or `agent-eval interact` (single-turn via ADK FastAPI) capture responses + traces, then `agent-eval evaluate` scores them with `client.evals.evaluate()`. |
+| [View and interpret evaluation results](https://cloud.google.com/vertex-ai/generative-ai/docs/models/view-evaluation) | `agent-eval analyze` produces a Gemini diagnosis + cumulative `OPTIMIZATION_LOG.md`; `agent-eval dashboard` opens an interactive comparison view. |
+| [Evaluate agents](https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-agents-client) | `agent-eval agent-engine` is the streamlined Path A — calls `client.evals.run_inference()` + `client.evals.create_evaluation_run()` against a deployed Reasoning Engine. For local ADK agents stick with the `evaluate` flow above. |
+
+---
+
+## Architecture overview
+
+`agent-eval` is a thin orchestration layer over the Vertex AI Generative AI Evaluation Service (Preview). The CLI's job is to walk you through the same workflow the docs describe — discover an agent, prepare a dataset, pick metrics, run inference + evaluation, view results — without you having to glue the SDK calls together yourself.
+
+This section is the mental model the rest of the doc assumes.
+
+### The four metric families
+
+Every Vertex AI managed metric belongs to one of four families. Knowing the family tells you what data the metric needs and how the SDK scores it.
+
+| Family | Examples | Reference required? | How scoring works |
+|---|---|---|---|
+| **Adaptive Rubric** (recommended start) | `GENERAL_QUALITY`, `TEXT_QUALITY`, `INSTRUCTION_FOLLOWING`, `MULTI_TURN_*`, `FINAL_RESPONSE_QUALITY`, `FINAL_RESPONSE_REFERENCE_FREE`, `TOOL_USE_QUALITY` | optional | Judge LLM generates rubrics on the fly from the prompt + response. |
+| **Static Rubric** | `GROUNDING`, `SAFETY`, `FINAL_RESPONSE_MATCH`, `HALLUCINATION` | optional / match-only | Judge LLM applies a fixed rubric. |
+| **Computation** (deterministic) | `EXACT_MATCH`, `BLEU`, `ROUGE_1`, `ROUGE_L_SUM`, `tool_*` | **required** | Mathematical comparison against `reference`. |
+| **Translation** (niche) | `comet`, `metricx` | **required** | Translation-quality scorers. |
+
+`agent-eval init` groups its checkbox picker by family using `metric_families.classify()`, which introspects the SDK directly — adding a new managed metric upstream lands it in the right group automatically.
+
+The Vertex AI docs recommend starting with `GENERAL_QUALITY` only and opting into more metrics as you learn what your agent needs. The CLI follows that recommendation: only `GENERAL_QUALITY` is pre-checked.
+
+### The two execution paths
+
+| Path | When it applies | Trace fidelity | Multi-turn UserSim | Auto-detected via |
+|---|---|---|---|---|
+| **A — Agent Engine** (streamlined) | Agent is deployed to a Reasoning Engine (typically via Agent Starter Pack `make backend`) | Full (managed) | **No** — `create_evaluation_run` is single-turn; Vertex doesn't ship a user simulator | `AGENT_ENGINE_RESOURCE_NAME` env var, or `deployment/agent_engine_metadata.json` from ASP |
+| **B — Local ADK source / any ADK FastAPI URL** | You have local agent source, OR you can point at any ADK FastAPI endpoint (local dev, Cloud Run, remote host) | Varies — see sub-modes below | **Yes** — local UserSim imports `agent.py` directly (no FastAPI server needed) | An `agent.py` reachable from `cwd` via `rglob` |
+
+> **A and B aren't mutually exclusive.** Almost every `make backend` user has both — the deployed Agent Engine artifact AND the local source it was built from. `agent-eval init` detects both and offers a **Both** option that scaffolds `tests/eval/dataset.jsonl` (for Path A) alongside `scenarios/` + `eval_data/` (for Path B). Run them in parallel against the same agent for the most coverage: Path A gives you Vertex's managed dashboard URL, Path B gives you full local trace fidelity and multi-turn UserSim coverage.
+
+> **Non-ADK agent? (BYOD)** There's no third path in the UI. The schema unification means you can hand-write a converter against the row shape in [Dataset row schema](#dataset-row-schema), drop the JSONL into `tests/eval/dataset.jsonl`, and run `agent-eval evaluate` like normal. A streamlined `agent-eval ingest-traces` command is on the [roadmap](#byod-bring-your-own-data--agent-eval-ingest-traces).
+
+`agent-eval init` runs `path_detector.detect_execution_path()` early and announces what it found, so the rest of the flow has shared vocabulary.
+
+**Path B has three sub-modes**, all hitting the same ADK FastAPI routes:
+
+| Sub-mode | Started by | Trace persistence |
+|---|---|---|
+| Local dev | `make playground`, `python -m google.adk.cli` | Full traces — latency, spans, tool calls |
+| Cloud Run | Deployed FastAPI on Cloud Run | **Often missing** — `agent_eval` falls back to state-derived metrics only (`processor.py` already handles this gracefully) |
+| Remote ADK | Any other ADK FastAPI URL | Depends on the host |
+
+If you pick the DIY interaction mode in `init`, the CLI surfaces the Cloud Run trace caveat upfront so you're not surprised when latency metrics come back empty.
+
+### Inference strategy per path
+
+The Vertex AI eval docs describe a clean two-step pattern: `client.evals.run_inference()` to generate responses, then `client.evals.evaluate()` to score them. That pattern fits perfectly when you're evaluating a raw model or an Agent Engine deployment — but it doesn't fit a *local ADK agent*, which lives behind ADK's FastAPI server, not behind Vertex's inference API.
+
+So `agent-eval` only uses `client.evals.run_inference()` on Path A. The other paths reach the agent through ADK-native channels and converge at `client.evals.evaluate()` for scoring. This table is the truth of which call drives which command:
+
+| Command | How it gets the agent's responses | How it scores them |
+|---|---|---|
+| `agent-eval agent-engine` (**Path A**) | `client.evals.run_inference(agent=<resource>, src=df)` — Vertex calls your deployed Reasoning Engine for you. | `client.evals.create_evaluation_run(...)` — inference + scoring + GCS upload, one call. |
+| `agent-eval simulate` (**Path B**, multi-turn) | ADK's [User Simulation](https://google.github.io/adk-docs/evaluate/user-sim/) drives a simulated user against your local agent. ADK writes traces to `.adk/eval_history/`; we convert them to JSONL. | `client.evals.evaluate(dataset, metrics)` |
+| `agent-eval interact` (**Path B**, single-turn) | Our REST client (`agent_client.py`) hits ADK's FastAPI endpoints directly: `/run`, `/apps/.../sessions/...`, `/debug/trace/session/{id}`. We capture the full trace ourselves. | `client.evals.evaluate(dataset, metrics)` |
+| `agent-eval evaluate` | (Reads existing JSONL from `simulate` / `interact`.) | `client.evals.evaluate(dataset, metrics)` |
+
+**Why not `run_inference()` for Path B?**
+
+`client.evals.run_inference()` is built for two cases (per the [Run an evaluation](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/run-evaluation) docs): a `model=` string for direct LLM calls, or an `agent=<reasoning-engine-resource>` for Agent Engine deployments. Local ADK agents fit neither — they're a FastAPI process you started locally or in Cloud Run. Reaching them through `run_inference` would require a managed bridge that doesn't exist.
+
+ADK provides better-fitting tools for the local case:
+
+- **UserSim** is the docs-aligned way to drive *multi-turn* agent dialogues with realistic, LLM-played user behavior. It's strictly more capable than passing a flat list of prompts to `run_inference()`.
+- **The ADK FastAPI debug endpoints** (`/debug/trace/session/{id}`) give us full execution traces — latency per step, intermediate events, tool calls, session state — which `run_inference()` doesn't surface for non-Agent-Engine deployments.
+
+The end result: every path produces the same `dataset.jsonl` row shape, and every path scores through `client.evals.evaluate()`. The only difference is *how the response and trace columns get populated*. Path A delegates that to Vertex; Path B delegates to ADK; both meet at the evaluation step.
+
+### Dataset row schema
+
+The unified dataset lives at `tests/eval/dataset.jsonl`. Every row is a JSON object with these fields:
+
+```jsonl
+{
+  "prompt": "Find docs about pricing tiers",
+  "reference": "Here are 3 documents about pricing...",
+  "session_inputs": {"app_name": "app", "user_id": "u1", "state": {}},
+  "conversation_history": [{"role": "user", "parts": [{"text": "..."}]}],
+  "expected_docs": ["doc_pricing_v2"],
+  "expected_tool_calls": [{"name": "search_docs", "args": {"query": "..."}}]
+}
+```
+
+**Two layers of fields:**
+
+- **Canonical SDK columns** (`prompt`, `response`, `reference`, `intermediate_events`, `session_inputs`, `conversation_history`, `context`) — used by managed metrics. Names are fixed.
+- **Free-form `expected_*` columns** — used by custom `LLMMetric` templates via `{expected_X}` placeholders. The SDK auto-resolves them via `getattr(eval_case, var_name)` (verified at `_evals_metric_handlers.py:547-551`), so any top-level row field is automatically available to custom metric templates.
+
+`response` and `intermediate_events` are added at runtime by `run_inference` (Path A) or `simulate` / `interact` (Path B). Optional fields per row enable mixed datasets — some rows multi-turn, some single-turn, some with reference, some without. Per-row capability detection (`dataset_io.detect_capabilities`) determines metric eligibility at evaluation time.
+
+**Sources of dataset rows:**
+
+1. **Gemini-generated** — `agent-eval init` drafts test cases from your agent code.
+2. **ADK evalset import** — `agent-eval import --from <file>.evalset.json` flattens existing ADK evalsets.
+3. **Hand-edited** — open `dataset.jsonl` and write rows directly.
+4. **Legacy migration** — `dataset_io.migrate_legacy()` converts the old `app/eval/scenarios/` + `app/eval/eval_data/golden_dataset.json` layout into rows, preserving originals under `tests/eval/.backup/<timestamp>/`.
+
+### Folder layout (legacy → new)
+
+The refactor moves eval artifacts into one folder that lives next to ADK's existing convention. Existing projects don't need to reorganize manually — `dataset_io.migrate_legacy()` handles the conversion and preserves originals.
+
+**Before** (two folders, two data shapes — confusing):
+
+```
+my-agent/
+├── app/
+│   └── eval/                        ← scaffolded by old agent-eval
+│       ├── scenarios/*.json
+│       ├── eval_data/golden_dataset.json
+│       └── results/
+└── tests/
+    └── eval/evalsets/*.evalset.json ← ADK's folder
+```
+
+**After** (one folder, one shape — extends ADK's convention):
+
+```
+my-agent/
+├── app/                             ← agent code (untouched)
+└── tests/
+    └── eval/
+        ├── dataset.jsonl            ← unified row shape (was scenarios/ + golden_dataset.json)
+        ├── evalsets/*.evalset.json  ← ADK's existing files (preserved; importable via `agent-eval import`)
+        ├── metrics/
+        │   └── metric_definitions.json
+        └── results/
+            └── <timestamp>/…
+```
+
+**Rationale:** ADK already creates `tests/eval/`. Extending that folder instead of inventing `app/eval/` means one mental model, no parallel hierarchies, and existing ADK evalsets stay first-class — they become inputs you can import with `agent-eval import --from <file>.evalset.json`.
+
+**Migration:** `dataset_io.migrate_legacy(agent_dir)` walks the old layout, flattens scenario rows + golden_dataset entries into the new row shape, writes them to `tests/eval/dataset.jsonl`, and copies the originals into `tests/eval/.backup/<timestamp>/` so you don't lose data. `expected_behavior` becomes the canonical `reference` column; `expected_docs`, `expected_tool_call`, etc. are kept verbatim as flat top-level columns (the SDK's `getattr(eval_case, var_name)` mechanism makes them automatically available to custom `LLMMetric` templates).
+
+### Custom metric patterns
+
+The Vertex AI docs describe five custom metric patterns. `metric_factory.py` exposes all five, defined in `tests/eval/metrics/metric_definitions.json` using a unified `kind` schema. The CLI's "AI generation" flow drafts pattern #2 (`custom_llm_judge`) for you, but power users can add the others by editing the JSON directly:
+
+| `kind` | Wraps | Use case |
+|---|---|---|
+| `managed` | `RubricMetric.<NAME>` | Pin a managed metric exactly as-is. |
+| `parametrized_managed` | `RubricMetric.<NAME>(metric_spec_parameters=…)` | Add custom guidelines or rubric groups to a managed metric. |
+| `custom_llm_judge` | `LLMMetric(prompt_template=MetricPromptBuilder(…))` | Hand-written LLM judge with instruction + criteria + rating scores. |
+| `python_function` | `Metric(custom_function=…)` | In-process deterministic check (Python). **Not compatible with Path A** — `metric_factory.to_evaluation_run_metric()` rejects this kind for Agent Engine runs. |
+| `remote_code` | `Metric(remote_custom_function=…)` | Sandboxed code execution metric. |
+
+Schema example:
+
+```jsonc
+{
+  "general_quality_with_guidelines": {
+    "kind": "parametrized_managed",
+    "base": "general_quality_v1",
+    "guidelines": "Must maintain professional tone, no financial advice."
+  },
+  "language_simplicity": {
+    "kind": "custom_llm_judge",
+    "instruction": "Evaluate simplicity for a 5-year-old.",
+    "criteria": {"Vocabulary": "...", "Sentences": "..."},
+    "rating_scores": {"5": "...", "1": "..."}
+  },
+  "contains_keyword": {
+    "kind": "python_function",
+    "module": "tests/eval/custom_metrics.py",
+    "function": "contains_keyword"
+  }
+}
+```
+
+`metric_factory.build_all()` reads this file and instantiates the right SDK type. Path A automatically wraps each metric via `to_evaluation_run_metric()` so it can be passed to `client.evals.create_evaluation_run()`.
+
+---
+
+## Authentication
+
+The evaluation pipeline requires **Vertex AI** on Google Cloud. Two commands are involved, and they have **separate jobs** — keeping them separate is intentional, so you can re-run setup whenever your shell or token expires without re-doing init's per-agent scaffolding work.
+
+| Command | Job | Cadence |
+|---|---|---|
+| **`agent-eval setup`** | The only command that *configures* your GCP env. Walks gcloud auth, picks your project + location, enables the Vertex AI API, sets the ADC quota project, and (interactively) binds the autorater IAM role. Idempotent — already-done steps are detected and skipped. | Once per shell session (or after switching projects / refreshing tokens) |
+| **`agent-eval init`** | Verifies the env *looks* ready (project set, ADC file present, Vertex AI API enabled). If anything is missing it **aborts immediately** with a one-line pointer back to `agent-eval setup` — it never tries to fix things itself. | Once per agent |
+
+### What `setup` does (six numbered steps)
+
+| Step | Action | Skipped if |
+|---|---|---|
+| 1 | `gcloud auth login` for your personal account (must NOT be a `*-compute@`/`gce-sa@` service account — those usually can't enable APIs or grant IAM) | A non-service-account gcloud user is already active |
+| 2 | `gcloud auth application-default login` — creates the ADC file the Python SDK reads | ADC file is present **and** its `account` (or `client_email`) matches the active gcloud account from step 1 (see "ADC validation" below) |
+| 3 | Resolve `GOOGLE_CLOUD_PROJECT` + `GOOGLE_CLOUD_LOCATION`, write them to `.env`, and bind ADC's quota project to your project (`gcloud auth application-default set-quota-project`) | Both env vars already set + quota project already bound |
+| 4 | Enable the four foundation APIs: `serviceusage`, `cloudresourcemanager`, `aiplatform`, `iam` (Service Usage must come first or the others can't be enabled) | API already enabled (per `gcloud services list --enabled`) |
+| 5 | Bind `roles/aiplatform.serviceAgent` to the AI Platform service agent (the autorater) so Vertex can grade your traces | Binding already in place |
+| 6 | (Opt-in) Enable Cloud Build / Cloud Run / Artifact Registry — needed only if you'll deploy with Agent Starter Pack | You answered "no" to the ASP prompt, or the API is already enabled |
+
+Run it once at the top of a fresh shell. Re-running on an already-configured project is cheap.
+
+#### ADC validation (Step 2 — why file existence isn't enough)
+
+Step 2 doesn't trust file existence alone. On Google Compute Engine VMs and Cloud Workstations, `gcloud auth application-default print-access-token` falls back to the GCE metadata service and lies about the identity in use. And `gcloud auth application-default revoke` can leave readable-but-stale artifacts behind. To catch both, step 2:
+
+1. Confirms the ADC file exists at the expected path (`$GOOGLE_APPLICATION_CREDENTIALS` → `$CLOUDSDK_CONFIG/application_default_credentials.json` → `~/.config/gcloud/application_default_credentials.json`).
+2. Reads the JSON and pulls out the `account` (user creds) or `client_email` (service-account JSON key).
+3. Compares it case-insensitively to the active gcloud account from step 1.
+
+Three failure modes force a re-run of `gcloud auth application-default login`:
+
+| Reason | What you'll see |
+|---|---|
+| `missing` | "No ADC file at `<path>` — on a VM, gcloud may fall back to metadata creds — that's not what we want." |
+| `unreadable` | "ADC file at `<path>` is present but unreadable. It may be a leftover from `gcloud auth application-default revoke`." |
+| `mismatch` | "ADC file is for `<adc-email>` but you're logged in as `<gcloud-email>`. These need to match — otherwise the Python SDK will use the wrong identity." |
+
+On match, the OK line includes the email so you can eyeball it: `> ADC file present at /home/.../application_default_credentials.json  (account: you@example.com)`.
+
+#### Resilient-on-failure (every step)
+
+Every step that runs `gcloud` (1, 2, 3-quota-project, 4, 5, 6) is wrapped in the same retry loop. If the command fails, you get an interactive choice:
+
+- **Try again** — re-runs the same gcloud command (useful for transient errors, OAuth flow restarts, etc.)
+- **Skip this step (I'll fix it manually before re-running)** — keeps `agent-eval setup` moving so you can finish other steps and come back to the failing one. Common case: you don't have `serviceusage.services.enable` permission on the project — skip, ask a project owner to enable the API, then re-run setup.
+- **Exit setup** — calls `_abort_setup()` which prints "Re-run `agent-eval setup` after fixing the issue above." and aborts the click command. No silent half-finished state.
+
+Permission-denied errors are detected explicitly and the prompt nudges you toward Skip + an owner-only command line you can hand off:
+
+```
+!     could not enable
+      PERMISSION_DENIED: ...
+      You don't seem to have permission to enable APIs on this project.
+      Ask a project owner to run:  gcloud services enable aiplatform.googleapis.com --project=PROJECT
+?    Enable aiplatform.googleapis.com failed. What now?  (Use arrow keys)
+ » Try again
+   Skip this step (I'll fix it manually before re-running)
+   Exit setup
+```
+
+`--auto-approve` / `-y` (CI mode) bypasses the menu — failures print the warning and continue, since there's no human to answer.
+
+### What `init` checks (and only checks)
+
+| Check | If missing |
+|-------|-----------|
+| `GOOGLE_CLOUD_PROJECT` env var | Abort with: *"Run `agent-eval setup` first."* |
+| Application Default Credentials file on disk | Abort with the same pointer |
+| Vertex AI API enabled on the project | Abort with the same pointer |
+
+There are no prompts, no fixes, no `.env` writes from init. It's purely a guardrail so init can proceed knowing the env is sane.
+
+### Manual setup
+
+If you prefer to configure everything yourself (or are running in CI), set these before running any `agent-eval` command:
+
+```bash
+# 1. Authenticate
+gcloud auth login
+gcloud auth application-default login
+
+# 2. Set your project
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+export GOOGLE_CLOUD_LOCATION="us-central1"
+gcloud auth application-default set-quota-project $GOOGLE_CLOUD_PROJECT
+
+# 3. Enable Vertex AI API
+gcloud services enable aiplatform.googleapis.com --project=$GOOGLE_CLOUD_PROJECT
+
+# 4. Grant autorater permissions (one-time)
+PROJECT_NUMBER=$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format="value(projectNumber)")
+
+gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
+    --member="serviceAccount:service-$PROJECT_NUMBER@gcp-sa-aiplatform.iam.gserviceaccount.com" \
+    --role="roles/aiplatform.serviceAgent"
+```
+
+### Common auth issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Empty metrics / all scores zero | Using `GOOGLE_API_KEY` instead of Vertex AI | Remove `GOOGLE_API_KEY`, set `GOOGLE_CLOUD_PROJECT` |
+| Permission denied on autorater | Service account lacks permissions | Run the autorater IAM command above |
+| Gemini model location errors | Gemini 3+ models require `global` region | Auto-configured by default; override with `--location global` |
 
 ---
 
@@ -57,7 +384,7 @@ For installation and getting started, see the [README](../README.md).
 
 ### init
 
-Scaffolds the `eval/` folder structure for an ADK agent. Discovers `agent.py` files in the current directory tree and lets you select which agent to evaluate.
+Scaffolds the `eval/` folder structure for an ADK agent. Runs a quick readiness check on your Google Cloud env (and aborts pointing you at `agent-eval setup` if anything's missing — `init` never configures gcloud itself), then discovers `agent.py` files in the current directory tree and lets you select which agent to evaluate.
 
 ```bash
 uv run agent-eval init
@@ -71,29 +398,82 @@ uv run agent-eval init
 | `--auto-approve`, `-y` | `false` | Skip interactive prompts, use defaults |
 | `--ai-metrics` | `false` | Generate tailored metrics with AI (multi-step Gemini pipeline) |
 
+#### Environment Setup
+
+Before agent selection, `init` runs a quick readiness check against your Google Cloud environment — `GOOGLE_CLOUD_PROJECT`, the ADC file, and the Vertex AI API. If anything is missing it stops with a one-line pointer to `agent-eval setup`, which is the dedicated command that walks you through gcloud auth, ADC creation, API enablement, the autorater IAM binding, and the optional ASP-prereq APIs. See [Authentication](#authentication) for the full breakdown of what `setup` does.
+
 #### AI-Powered Metric Generation
 
-When you select "Generate with AI" in Step 3 (the default), or use `--ai-metrics` with `-y`, the CLI runs a multi-step pipeline:
+Step 3 runs a guided metric configuration pipeline (or use `--ai-metrics` with `-y` for non-interactive):
 
-1. **Managed metrics selection** — Discovers all available metrics from the Vertex AI SDK at runtime, displays them in a table, and lets you select which to include. Metrics are classified as server-side (API Predefined) or client-side (GCS YAML) with correct `use_gemini_format` settings applied automatically.
+1. **Existing metrics detection** — If you've run `init` before, the CLI loads your existing `metric_definitions.json`, shows what you have, and pre-checks your previous selections.
 
-2. **Agent analysis** (Gemini Call 1) — Analyzes your agent's source code to identify tools, state variables, sub-agents, and key behaviors. This is a factual extraction step with minimal hallucination risk.
+2. **Managed metrics selection** — Discovers all available metrics from the Vertex AI SDK at runtime and presents an interactive checkbox UI (arrow keys to navigate, space to toggle, enter to confirm). Metrics are grouped into server-side (API Predefined, auto-evaluated by Google) and template-based (GCS YAML, evaluated by LLM judge). First run pre-selects only `GENERAL_QUALITY` (per the Vertex AI docs' recommended starting point — *"Start with `GENERAL_QUALITY` as the default"*); re-runs pre-select whatever you had before.
 
-3. **Metric generation** (Gemini Call 2) — Generates custom LLM-as-judge metric definitions tailored to your agent, combining the analysis results with your evaluation priorities and selected managed metrics.
+3. **Custom metrics priorities** — Optionally describe what matters most for your agent (e.g., "accuracy of billing lookups, response tone"). Press Enter to skip — Gemini will pick what to focus on by reading the agent code. Custom metric generation always runs; the accept/refine/skip loop after generation is your off-ramp.
 
-4. **Evaluation data generation** (Gemini Call 3) — Generates conversation scenarios and golden dataset entries based on your agent's capabilities and the metric definitions.
+4. **Agent analysis** (Gemini Call 1) — Analyzes your agent's source code to identify tools, state variables, sub-agents, and key behaviors. Surfaces any state-variable additions that would unlock richer metrics, with copy-paste-ready code snippets and an AI-generated disclaimer. After you've added them, the loop re-analyzes so the new state is visible to the next two calls.
 
-After each step you can accept, refine (re-run with updated priorities), or skip.
+5. **Metric generation** (Gemini Call 2) — Generates custom LLM-as-judge metric definitions that complement your selected managed metrics. Defaults to a 0-1 rubric scale, includes at least one `requires_reference: true` metric that compares the agent response against `reference_data.<field>` (the field name is chosen to match your agent's domain — e.g. `expected_response`, `expected_docs`, `expected_tool_calls`). For managed metrics that need a reference (e.g. `FINAL_RESPONSE_MATCH`), Gemini also sets a matching `reference_field` so the evaluator knows which slot in `reference_data` to read.
 
-**Non-destructive updates:** If eval files already exist, they are backed up to `eval/.backup/<timestamp>/` before AI content is written. Scenarios and golden data are merged with existing entries.
+6. **Evaluation data generation** (Gemini Call 3) — Generates conversation scenarios (multi-turn, for simulation) and golden dataset entries (single-turn, for regression testing). The same `reference_data.<field>` chosen in step 5 is populated here as a starter — you're expected to refine the values with the actual answers you want the agent to produce. The "How everything connects" section flags any reference fields that are required by metrics but missing from the generated golden data.
+
+After generation you can accept, refine (provide feedback and re-run), or skip to starter metrics.
+
+**Non-destructive re-runs:** If eval files already exist, they are backed up to `eval/.backup/<timestamp>/` before AI content is written. Existing custom metrics are preserved (Gemini is asked to keep them as-is or improve them). Scenarios and golden data are merged with existing entries.
+
+**Resilient reference-field handling:** Reference data is a dict — users can put arbitrary domain-specific fields in it (e.g. `expected_docs`, `expected_citations`, `expected_tool_calls`). The evaluator resolves which field to compare against in three layers: (1) the metric's explicit `reference_field` if set; (2) a priority list of conventional names — `expected_response`, `expected_behavior`, `expected_output`, `expected_answer`, `ground_truth`, `reference`, `gold_response`; (3) a final fallback that joins all populated fields as `key: value` pairs so the judge always has *something* to compare against. New managed metrics that need a reference only need to be added to `_MANAGED_METRICS_REQUIRE_REFERENCE` in `src/agent_eval/core/metric_discovery.py`.
 
 ```bash
-# Interactive — choose AI generation in Step 3
+# Interactive — runs the full pipeline above
 uv run agent-eval init
 
-# Non-interactive with AI metrics
+# Non-interactive — auto-selects general_quality + safety, runs all three Gemini calls
 uv run agent-eval init -y --ai-metrics
 ```
+
+#### Init Flow Diagram
+
+```mermaid
+flowchart TD
+    A[Banner] --> B[Step 0: Verify env<br/>project, region, ADC, API]
+    B --> C{auto-approve<br/>-y?}
+    C -->|yes| D[Auto-pick first agent<br/>+ default mode 'both']
+    C -->|no| E[Step 1: Pick mode<br/>user-sim / diy / both]
+    E --> F[Step 2: Discover agents<br/>rglob agent.py]
+    F --> G[Pick agent module]
+    D --> H{ai-metrics<br/>flag?}
+    G --> I[Step 3: Managed metric selection<br/>checkbox UI with reference tags]
+    I --> J[Step 3b: Custom priorities<br/>free-text, optional]
+    J --> K[Gemini Call 1<br/>analyze_agent_data]
+    K --> L[Display analysis<br/>+ state-var suggestions]
+    L --> M{Add state vars<br/>to agent code?}
+    M -->|yes, re-analyze| K
+    M -->|no, continue| N[Gemini Call 2<br/>generate_metric_definitions]
+    N --> O[Display metrics<br/>+ rationale]
+    O --> P{Accept /<br/>Refine / Skip}
+    P -->|refine| N
+    P -->|accept| Q[Gemini Call 3<br/>generate_eval_data]
+    Q --> R[Display scenarios<br/>+ golden data]
+    R --> S{Accept /<br/>Refine / Skip}
+    S -->|refine| Q
+    S -->|accept| T[Connection map<br/>shows reference field<br/>coverage + gaps]
+    H -->|yes| U[Auto-run K -> N -> Q<br/>preserve existing eval files]
+    H -->|no| V[Skip AI<br/>use STARTER_METRICS]
+    T --> W[Scaffold eval/<br/>backup existing first]
+    U --> W
+    V --> W
+    W --> X[Next Steps panel]
+
+    style B fill:#e1f5ff
+    style K fill:#fff4e1
+    style N fill:#fff4e1
+    style Q fill:#fff4e1
+    style T fill:#e1ffe1
+    style W fill:#ffe1f5
+```
+
+The orange nodes are Gemini API calls; the green node is where reference-field coverage is verified before scaffolding.
 
 ---
 
@@ -180,7 +560,12 @@ Before running, start your agent in a separate terminal:
 | `--results-dir` | auto-detected | Output directory |
 | `--run-id` | prompted | Name for results folder |
 | `--user-id` | `eval_user` | User ID for session |
+| `--num-questions` | `-1` (all) | Limit number of questions to run |
 | `--runs` | `1` | Number of runs per question |
+| `--skip-traces` | `false` | Skip trace retrieval (faster, but no deterministic metrics) |
+| `--filter` | none | Metadata filters in `key:value` format (can specify multiple) |
+| `--state` | none | State variables in `key:value` format (can specify multiple) |
+| `--user` | `$USER` | Operator username |
 | `--debug` | `false` | Show detailed interaction and trace logs |
 
 **Output:** `<results-dir>/<run-id>/raw/processed_interaction_<app_name>.jsonl`
@@ -244,7 +629,7 @@ uv run agent-eval analyze \
 | `--report-tone` | none | Tone of the report |
 | `--report-length` | none | Length of the report |
 | `--model` | `gemini-3.1-pro-preview` | Gemini model for analysis |
-| `--location` | `global` | Vertex AI region (use `global` for Gemini 3+ models) |
+| `--location` | auto-configured | Vertex AI region (auto-selects `global` for Gemini 3+ models, `us-central1` otherwise) |
 | `--skip-gemini` | `false` | Skip AI analysis, still generate metrics table |
 | `--gcs-bucket` | none | GCS bucket for uploading results |
 | `--debug` | `false` | Show Gemini API logs |
@@ -252,6 +637,78 @@ uv run agent-eval analyze \
 **Output:** `question_answer_log.md`, `gemini_analysis.md`, `OPTIMIZATION_LOG.md` (in parent results dir)
 
 See [Run Comparison](#run-comparison) for details on how comparison works.
+
+---
+
+### agent-engine
+
+Streamlined Path A runner for agents deployed to **Agent Engine** (Reasoning Engines). Wraps `client.evals.create_evaluation_run()` — Vertex handles inference, scoring, and GCS upload in one managed call.
+
+```bash
+agent-eval agent-engine [OPTIONS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--dataset` | `tests/eval/dataset.jsonl` | Unified dataset JSONL with `prompt` / `session_inputs` rows. |
+| `--metrics` | `tests/eval/metrics/metric_definitions.json` | Metric definitions (unified `kind` schema — see [Custom metric patterns](#custom-metric-patterns)). |
+| `--resource-name` | env `AGENT_ENGINE_RESOURCE_NAME` or auto-detection | Agent Engine resource (`projects/.../reasoningEngines/...`). |
+| `--dest` | `gs://<project>-agent-eval/<timestamp>/` | GCS destination for results. |
+| `--project` | env `GOOGLE_CLOUD_PROJECT` | GCP project ID. |
+| `--location` | env `GOOGLE_CLOUD_LOCATION` or `us-central1` | GCP location. |
+| `--debug` | _off_ | Show full SDK logs (otherwise suppressed). |
+
+**When to use this instead of `evaluate`:**
+
+- Your agent is deployed via [Agent Starter Pack](https://adk.dev/deploy/agent-engine/asp/) (`uvx agent-starter-pack enhance --adk -d agent_engine && make backend`).
+- You want managed inference — no local FastAPI server required, no traces to capture yourself.
+- You want a single `dashboard_url` to share with stakeholders.
+
+The dataset only needs `prompt` (and optionally `session_inputs`) — `reference` is not required, since the managed adaptive rubrics judge quality without it. Python in-process metrics (`kind: python_function`) are skipped with a warning, since `create_evaluation_run` cannot execute local Python.
+
+---
+
+### import
+
+Converts an ADK `.evalset.json` file into the unified `dataset.jsonl` format.
+
+```bash
+agent-eval import --from <path-to-evalset.json> [OPTIONS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--from` | _required_ | ADK `.evalset.json` file to import. |
+| `--out` | `tests/eval/dataset.jsonl` | Destination dataset JSONL. |
+| `--overwrite` | _off_ (appends) | Replace the output file instead of appending. |
+
+The importer flattens each ADK `eval_case` into one row: the **last** user turn becomes `prompt`, earlier turns become `conversation_history`, `session_input` (ADK's singular form) maps to `session_inputs`, and any tool calls collected across the conversation become `expected_tool_calls`. Existing ADK evalsets become first-class inputs alongside Gemini-generated rows and hand-edited rows.
+
+---
+
+### migrate
+
+Converts a project from the legacy `eval/scenarios/` + `eval/eval_data/golden_dataset.json` layout into the unified `tests/eval/dataset.jsonl`. Originals are copied to `tests/eval/.backup/<timestamp>/` so nothing is lost.
+
+```bash
+agent-eval migrate [OPTIONS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--agent-dir` | `.` | Project root (auto-detects `app/eval/` or `eval/` underneath). |
+| `--out` | `tests/eval/dataset.jsonl` | Destination unified dataset JSONL. |
+| `--dry-run` | _off_ | Print the migration plan (rows, files, backup path) without writing anything. |
+| `--no-backup` | _off_ | Skip copying originals into `tests/eval/.backup/` (rarely needed). |
+
+**What it does:**
+
+1. Auto-detects the legacy folder via `dataset_io._find_legacy_eval_dir()` — tries `<agent-dir>/app/eval/`, then `<agent-dir>/eval/`.
+2. Flattens `scenarios/conversation_scenarios.json` (`starting_prompt` → `prompt`, `conversation_plan` preserved as a column) and `eval_data/golden_dataset.json` (last `user_inputs` → `prompt`, multi-turn user_inputs → `conversation_history`, `expected_behavior` → `reference`) into the unified row shape.
+3. Copies `metric_definitions.json` from `<legacy>/metrics/` into `tests/eval/metrics/` if not already there.
+4. Copies the original files to `tests/eval/.backup/<timestamp>/` (unless `--no-backup`), so `agent-eval simulate` keeps working against the legacy layout while you transition.
+
+`init` also offers to run this for you when it detects a legacy layout.
 
 ---
 
@@ -289,7 +746,8 @@ uv run agent-eval create-dataset \
 | `--input` | required | Path to ADK test JSON |
 | `--output` | required | Path for output golden dataset |
 | `--agent-name` | required | Agent name for metadata |
-| `--metadata` | none | Tags in `key:value` format |
+| `--metadata` | none | Tags in `key:value` format (can specify multiple) |
+| `--prefix` | `q` | Question ID prefix (produces `q_001`, `q_002`, etc.) |
 
 ---
 
@@ -336,16 +794,17 @@ Automatically calculated from OpenTelemetry session traces. No configuration nee
 
 | Metric Group | Key Fields | Description |
 |-------------|------------|-------------|
-| `token_usage` | `total_tokens`, `llm_calls`, `prompt_tokens`, `completion_tokens`, `estimated_cost_usd` | Token consumption and cost |
-| `latency_metrics` | `total_seconds`, `llm_latency_seconds`, `tool_latency_seconds`, `first_response_seconds`, `avg_turn_latency` | Where time is spent |
-| `cache_efficiency` | `hit_rate`, `cached_tokens`, `fresh_prompt_tokens` | KV-cache performance |
-| `tool_success_rate` | `rate`, `failed_calls`, `failed_list` | Tool reliability |
-| `thinking_metrics` | `reasoning_ratio`, `thinking_tokens` | Model reasoning analysis |
-| `tool_utilization` | `total_calls`, `unique_tools`, `tool_counts` | Tool usage patterns |
-| `grounding_utilization` | `chunks_used` | RAG grounding usage |
-| `context_saturation` | `max_tokens`, `peak_span` | Context window utilization |
-| `agent_handoffs` | `total`, `unique_agents`, `agents_list` | Sub-agent delegation |
-| `output_density` | `avg_output_tokens` | Output verbosity |
+| `token_usage` | `total_tokens`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `llm_calls`, `models_used`, `estimated_cost_usd` | Token consumption and cost |
+| `latency_metrics` | `total_latency_seconds`, `average_turn_latency_seconds`, `llm_latency_seconds`, `tool_latency_seconds`, `time_to_first_response_seconds` | Where time is spent |
+| `cache_efficiency` | `cache_hit_rate`, `total_cached_tokens`, `total_fresh_prompt_tokens`, `total_input_tokens` | KV-cache performance |
+| `tool_success_rate` | `tool_success_rate`, `total_tool_calls`, `failed_tool_calls`, `failed_tools_list` | Tool reliability |
+| `thinking_metrics` | `reasoning_ratio`, `total_thinking_tokens`, `total_candidate_tokens`, `total_output_tokens`, `turns_with_thinking` | Model reasoning analysis |
+| `tool_utilization` | `total_tool_calls`, `unique_tools_used`, `tool_counts` | Tool usage patterns |
+| `grounding_utilization` | `total_grounding_chunks`, `total_grounded_responses`, `total_llm_responses` | RAG grounding usage |
+| `context_saturation` | `max_total_tokens`, `peak_usage_span` | Context window utilization |
+| `agent_handoffs` | `total_handoffs`, `unique_agents_count`, `agents_invoked_list` | Sub-agent delegation |
+| `output_density` | `average_output_tokens`, `total_output_tokens`, `llm_calls_count` | Output verbosity |
+| `sandbox_usage` | `total_sandbox_ops`, `unique_ops_used`, `sandbox_tools_used` | Code execution / sandbox tool usage |
 
 ### Managed Metrics (Vertex AI)
 
@@ -402,6 +861,8 @@ Your own scoring rubrics, defined in `metric_definitions.json`. These use `metri
 
 ## Creating Custom Metrics
 
+> **Two schemas live side by side today.** This section documents the **trace-driven schema** (`metric_type`, `dataset_mapping`, `requires_reference` / `requires_multi_turn`, `template`) used by `agent-eval evaluate` against the JSONL produced by `simulate` / `interact`. The **unified schema** (`kind: managed | parametrized_managed | custom_llm_judge | python_function | remote_code`) is used by `agent-eval agent-engine` (Path A) — see [Custom metric patterns](#custom-metric-patterns) above. Both schemas read the same `tests/eval/metrics/metric_definitions.json` file; `metric_factory.py` discriminates on the `kind` field, while the trace-driven evaluator path keys off `metric_type`.
+
 ### Basic Structure
 
 ```json
@@ -410,7 +871,6 @@ Your own scoring rubrics, defined in `metric_definitions.json`. These use `metri
     "my_metric": {
       "metric_type": "llm",
       "agents": ["my_agent"],
-      "applies_to": "all",
       "score_range": {"min": 0, "max": 5, "description": "0=Fail, 5=Perfect"},
       "dataset_mapping": {
         "prompt": {"source_column": "user_inputs"},
@@ -421,6 +881,8 @@ Your own scoring rubrics, defined in `metric_definitions.json`. These use `metri
   }
 }
 ```
+
+> Add `"requires_reference": true` or `"requires_multi_turn": true` to skip rows that don't carry the data the metric needs — see [Per-row capability detection](#per-row-capability-detection) below.
 
 ### Dataset Mapping Constraint
 
@@ -464,21 +926,20 @@ These are the values you can use in `source_column`:
 "response": {"source_column": "final_response:top_recommendation"}
 ```
 
-### Metric Routing with applies_to
+<a id="per-row-capability-detection"></a>
+### Per-row capability detection (`requires_reference` / `requires_multi_turn`)
 
-Controls which interaction data a metric runs on:
+Routing decisions are **per-row, not per-metric**. The evaluator inspects each row via `dataset_io.detect_capabilities` to see what data is actually present (reference / multi-turn user_inputs / session_inputs / intermediate_events / response), then matches that against the metric's required capability flags.
 
-| `applies_to` | Runs on | Use when |
+| Flag | What it requires from the row | Use it for |
 |---|---|---|
-| `"all"` (default) | All data | Metric evaluates the response itself (safety, quality, tool use) |
-| `"scenarios"` | Multi-turn data from `simulate` | Metric evaluates conversation flow or trajectory. No reference answers available. |
-| `"golden_dataset"` | Single-turn data from `interact` | Metric compares against expected behavior. Reference answers available. |
+| `"requires_reference": true` | The row has reference / expected data (`reference_data` dict, `reference` column, or `expected_*` field). | Correctness checks, fact-grounding, expected-tool-call comparisons. |
+| `"requires_multi_turn": true` | The row's `user_inputs` has > 1 turn, **or** the row came from `simulate` (`source_type == "simulation"`). | Trajectory / conversation flow / turn-by-turn coherence metrics. |
+| _neither_ (default) | No requirement — runs on every row. | General quality, safety, tone — anything that scores the response on its own. |
 
-**Why this matters:**
-- **Scenarios** test conversational behavior (turn-by-turn coherence, trajectory). There's no "right answer" — metrics evaluate the agent's approach.
-- **Golden dataset** queries include expected behavior, so metrics can check correctness.
+**Why this matters:** the same `tests/eval/dataset.jsonl` file can hold a mix of single-turn and multi-turn rows, with reference data on some and not others. With per-row capability filtering, a `correctness` metric quietly skips rows without reference data instead of erroring; a `trajectory_accuracy` metric quietly skips single-turn rows. The evaluator reports skipped rows in its summary so you know what got filtered and why.
 
-**Recommendation:** Assign metrics that need reference data to `"golden_dataset"`, trajectory metrics to `"scenarios"`, and general quality/safety metrics to `"all"`.
+> **Backward compatibility.** The legacy `applies_to` field still works — `applies_to: "golden_dataset"` is interpreted as `requires_reference: true`, and `applies_to: "scenarios"` as `requires_multi_turn: true`. Run `agent-eval migrate` to drop `applies_to` from existing metric files.
 
 ### Combining Multiple Sources
 
@@ -540,7 +1001,7 @@ Evaluates whether the agent took the right execution path:
   "trajectory_accuracy": {
     "metric_type": "llm",
     "agents": ["my_agent"],
-    "applies_to": "scenarios",
+    "requires_multi_turn": true,
     "score_range": {"min": 0, "max": 5, "description": "0=Wrong, 5=Perfect"},
     "dataset_mapping": {
       "prompt": {"source_column": "user_inputs"},
@@ -592,6 +1053,8 @@ Evaluates tool selection and argument quality using combined reference data:
 Generates multi-turn conversations from scenario definitions. An LLM simulates realistic users following your conversation scripts.
 
 **When to use:** Multi-turn conversational agents, rapid prototyping (no golden dataset needed), exploring agent behavior across many scenarios.
+
+> These files live under `eval/scenarios/` rather than `tests/eval/` because ADK's runtime (`adk eval`) expects them at fixed paths next to `agent.py`. The unified `tests/eval/dataset.jsonl` is the right home for Path A and DIY rows; UserSim scenarios stay where ADK reads them.
 
 **Files needed:**
 
@@ -824,14 +1287,14 @@ A static fallback catalog (`src/agent_eval/managed_metrics_catalog.json`) is inc
 
 ### Analysis Models
 
-The `analyze` command uses Gemini for AI-powered analysis. Default: `gemini-3.1-pro-preview` (requires `global` region, auto-configured).
+The `analyze` command uses Gemini for AI-powered analysis. Default: `gemini-3.1-pro-preview`. The region is auto-configured (`global` for Gemini 3+ models, `us-central1` for older models).
 
 | Model | Region | Status |
 |-------|--------|--------|
 | `gemini-3.1-pro-preview` | `global` | **Default** |
 | `gemini-3-flash-preview` | `global` | Active (faster, lower cost) |
-| `gemini-2.5-pro` | `us-central1` | Sunsetting June 2026 |
-| `gemini-2.5-flash` | `us-central1` | Sunsetting June 2026 |
+| `gemini-2.5-pro` | `us-central1` | Sunsetting 2026-06-17 |
+| `gemini-2.5-flash` | `us-central1` | Sunsetting 2026-06-17 |
 
 Override with `--model` and `--location`:
 
@@ -843,13 +1306,14 @@ uv run agent-eval analyze --results-dir eval/results/v2 --model gemini-3-flash-p
 
 The `evaluate` command estimates per-run cost using model pricing stored in `src/agent_eval/core/deterministic_metrics.py`. Current pricing (April 2026):
 
-| Model | Input / 1M tokens | Output / 1M tokens |
-|-------|-------------------|---------------------|
-| `gemini-3.1-pro` | $2.00 | $12.00 |
-| `gemini-3-flash` | $0.50 | $3.00 |
-| `gemini-2.5-pro` | $1.25 | $10.00 |
-| `gemini-2.5-flash` | $0.30 | $2.50 |
-| `gemini-2.0-flash` | $0.15 | $0.60 |
+| Model | Input / 1M tokens | Output / 1M tokens | Notes |
+|-------|-------------------|---------------------|-------|
+| `gemini-3.1-pro` | $2.00 | $12.00 | Current default |
+| `gemini-3.1-flash-lite` | $0.25 | $1.50 | Lightweight |
+| `gemini-3-flash` | $0.50 | $3.00 | |
+| `gemini-2.5-pro` | $1.25 | $10.00 | Sunsetting 2026-06-17 |
+| `gemini-2.5-flash` | $0.30 | $2.50 | Sunsetting 2026-06-17 |
+| `gemini-2.0-flash` | $0.15 | $0.60 | Sunsetting 2026-06-01 |
 
 Source: [Vertex AI Generative AI Pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing)
 
@@ -960,29 +1424,17 @@ Requires: `pip install agent-eval[dashboard]`. See the [dashboard](#dashboard) C
 
 ### Vertex AI authentication errors
 
-```bash
-gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT=your-project-id
-gcloud auth application-default set-quota-project $GOOGLE_CLOUD_PROJECT
-```
+**Fix:** Re-run `agent-eval init` — it will detect and fix missing credentials, project ID, and API configuration. Or see [Manual setup](#manual-setup) for the full list of commands.
 
 ### Permission denied on autorater model
 
 **Cause:** Vertex AI service account lacks permissions.
-**Fix:**
-
-```bash
-export PROJECT_NUMBER=$(gcloud projects describe $GOOGLE_CLOUD_PROJECT --format="value(projectNumber)")
-
-gcloud projects add-iam-policy-binding $GOOGLE_CLOUD_PROJECT \
-    --member="serviceAccount:service-$PROJECT_NUMBER@gcp-sa-aiplatform.iam.gserviceaccount.com" \
-    --role="roles/aiplatform.serviceAgent"
-```
+**Fix:** See the autorater permissions command in [Manual setup](#manual-setup). This is also shown during `agent-eval init`.
 
 ### Gemini model location errors
 
 **Cause:** Gemini 3+ models require `global` region.
-**Fix:** Use `--location global`. The default model (`gemini-3.1-pro-preview`) auto-configures to `global`.
+**Fix:** Auto-configured by default. Override with `--location global` if needed.
 
 ### ADK UserSim: "Error rendering metric prompt template"
 
@@ -1006,6 +1458,49 @@ Add `--debug` to any command to see detailed logs from ADK, Vertex AI SDK, and o
 ```bash
 uv run agent-eval run --agent-dir ./my_agent --debug
 ```
+
+---
+
+## Experimental & on the roadmap
+
+This section is a developer signpost — features sketched in the SDK-aligned plan that are intentionally deferred. They don't block the main workflow, and we'd rather build them once we have real-world signal.
+
+### BYOD (Bring-Your-Own-Data) — `agent-eval ingest-traces`
+
+**Status:** designed, not yet implemented (Step 10 of the SDK-aligned refactor).
+
+**The problem this solves.** Today's CLI assumes you have either an ADK agent (Path B) or an Agent Engine deployment (Path A). But plenty of agents in the wild aren't ADK-based — LangGraph, custom LLM pipelines, in-house frameworks. They typically emit OpenTelemetry traces. We want those agents to be evaluable too, without forcing a rewrite.
+
+**The proposed flow:**
+
+1. User runs `agent-eval ingest-traces ./my-traces/` against a directory of OTel JSONL or arbitrary trace dumps.
+2. CLI inspects the first 3 traces, calls Gemini with: *"Here's a sample trace. Generate a Python conversion script that produces rows matching this JSON schema: `{prompt, response, conversation_history, intermediate_events, session_inputs}`."*
+3. CLI writes the draft to `tests/eval/byod_converter.py` for the user to review and tweak.
+4. User runs `python tests/eval/byod_converter.py ./my-traces/ tests/eval/dataset.jsonl` to produce rows compatible with the rest of the pipeline.
+5. From there, evaluation works exactly like Path B — the dataset is just `dataset.jsonl`, the metrics live in `metric_definitions.json`, and the SDK doesn't care where the rows came from.
+
+**Why it's deferred.** The dataset schema unification (`dataset_io.py`, the canonical SDK columns + free-form `expected_*` extras, the `getattr`-based custom metric resolution) is the *enabler* — once that's in place, BYOD is mechanical. But designing the converter prompt well requires real OTel trace samples. Building it speculatively risks producing a converter that handles toy examples and breaks on the messy traces people actually have. We'd rather wait for the first user with a non-ADK agent and design `ingest-traces` against their data.
+
+**If you want to BYOD today (manual path):** the schema unification means you can hand-write a converter against the row shape documented in [Dataset row schema](#dataset-row-schema), drop the JSONL into `tests/eval/dataset.jsonl`, and run `agent-eval evaluate` like normal. The CLI doesn't validate the agent framework — it only reads rows.
+
+### Other deferred items from the plan
+
+- **5-option custom-metrics flow in `init`** — `metric_factory.py` already supports all five `kind` values (`managed`, `parametrized_managed`, `custom_llm_judge`, `python_function`, `remote_code`). The init flow currently exposes only the Gemini-drafted `custom_llm_judge` path because the questionary forms for the other four would add ~200 lines of UI for capability that power users can already access by hand-editing `metric_definitions.json`. If you want that UI surfaced interactively, file an issue.
+- **Folder collapse for Path B** — the unified `tests/eval/` layout shipped for Path A (Agent Engine — `dataset.jsonl` + `metrics/metric_definitions.json` + `results/`). Path B's local UserSim still reads `eval/scenarios/conversation_scenarios.json` and `eval/scenarios/session_input.json` directly because ADK's runtime expects those filenames at those paths. Once ADK exposes a hook for an alternative scenarios source, Path B will collapse into `tests/eval/` too.
+
+### SDK features `agent-eval` doesn't surface yet
+
+The Vertex AI eval SDK has a few more capabilities we've intentionally left at the SDK level — they're powerful, but adding CLI surface for them would conflate concerns or duplicate functionality the SDK already exposes cleanly. Listed here so you know what's possible and where to reach past the CLI when you need to.
+
+| SDK capability | Where to find it | Why we don't wrap it |
+|---|---|---|
+| **`client.evals.generate_rubrics()` + `rubric_groups`** | [Define your evaluation metrics](https://cloud.google.com/vertex-ai/generative-ai/docs/models/determine-eval) | You can pre-generate per-prompt rubrics for an entire dataset and reuse them across runs (cheaper, more consistent than regenerating every time). The CLI defaults to in-flight rubric generation because most users iterate on prompts faster than they iterate on rubrics — but the `parametrized_managed` `kind` already accepts `rubric_groups` if you want this. |
+| **`client.evals.batch_evaluate()` (async, large-scale)** | [Run an evaluation](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/run-evaluation) | For datasets too large to score synchronously. We default to `evaluate()` because typical agent-eval datasets are 10–200 rows; if you have thousands of rows, call `batch_evaluate()` directly with the JSONL `agent-eval` produces. |
+| **Multi-candidate comparison via `evaluate(dataset=[run_a, run_b], …)`** | [View and interpret results](https://cloud.google.com/vertex-ai/generative-ai/docs/models/view-evaluation) | Single-call comparison with built-in win/tie rates. Today `agent-eval analyze` and `agent-eval dashboard` compare runs *post-hoc* by reading their `eval_summary.json` files, which is friendlier when runs were generated days apart. The SDK's single-call path is better for A/B harness experiments — pass the JSONL files yourself when you need it. |
+| **Versioned `RubricMetric(version='v1')`** | [Details for managed rubric-based metrics](https://cloud.google.com/vertex-ai/generative-ai/docs/models/rubric-metric-details) | Pinning a metric to a specific judge version makes results reproducible across SDK upgrades. `metric_factory.py` already accepts a `version` field on the `parametrized_managed` `kind` — the init flow just doesn't ask for it because `version=None` (latest) is what you want when you're iterating. |
+| **GCS-YAML legacy metrics** (COHERENCE, FLUENCY, FULFILLMENT, GROUNDEDNESS, SAFETY, SUMMARIZATION_QUALITY, etc.) | [Older Vertex evaluation module](https://cloud.google.com/vertex-ai/docs/generative-ai/models/evaluation) | Predecessors to the GenAI Eval SDK we use. They work but aren't the recommended path; the SDK's `RubricMetric.SAFETY` etc. supersede them. Not exposed in our family-grouped picker because they'd duplicate names and confuse the "start with `GENERAL_QUALITY`" recommendation. |
+
+If any of these become a frequent ask, they're cheap to wrap — the underlying SDK calls already work, we'd just be surfacing them in the CLI. File an issue with the use case.
 
 ---
 

@@ -11,6 +11,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
+from agent_eval.cli._pacing import _continue
+
 console = Console()
 
 
@@ -118,6 +120,36 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         if not eval_path:
             console.print(f"\n  [red]Error:[/] No eval/ directory found near {agent_path}")
             console.print(f"  [dim]Run `uv run agent-eval init` first to scaffold one.[/]")
+            sys.exit(1)
+
+    # Path-aware guard: if the project was scaffolded for Path A only
+    # (tests/eval/dataset.jsonl present, no scenarios or golden data) and a
+    # deployed Agent Engine is detected, point the user at the right command
+    # rather than silently dropping --base-url / --questions-file flags that
+    # don't map to the streamlined path.
+    scenarios_dir = eval_path / "scenarios"
+    golden_dir = eval_path / "eval_data"
+    has_scenarios = scenarios_dir.is_dir() and any(scenarios_dir.glob("*.json"))
+    has_golden = golden_dir.is_dir() and any(golden_dir.glob("*.json"))
+    dataset_jsonl = agent_path.parent / "tests" / "eval" / "dataset.jsonl"
+    if not has_scenarios and not has_golden and dataset_jsonl.exists():
+        from agent_eval.core.path_detector import detect_execution_path
+        det = detect_execution_path(agent_path.parent)
+        if det.agent_engine_resource:
+            console.print(
+                f"\n  [yellow]This project is scaffolded for Path A only.[/]"
+            )
+            console.print(
+                f"  [dim]Found:[/] [cyan]{dataset_jsonl}[/] [dim]+ deployed Agent Engine[/]"
+            )
+            console.print(
+                f"  [dim]Missing:[/] scenarios/ and eval_data/ (Path B inputs)"
+            )
+            console.print(
+                f"\n  Use [cyan]agent-eval agent-engine[/] for the streamlined "
+                f"managed eval, or re-run [cyan]agent-eval init[/] and choose "
+                f"[bold]Path B[/] (or [bold]Both[/]) to scaffold local UserSim/DIY artifacts."
+            )
             sys.exit(1)
 
     # Discover eval files dynamically
@@ -254,6 +286,7 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
         border_style="blue",
         padding=(1, 2),
     ))
+    _continue("Press Enter to start the pipeline →", console=console)
 
     # ── Set up results directory ───────────────────────────────────────────
 
@@ -381,8 +414,9 @@ def run(agent_dir, eval_dir, run_id, run_simulate, run_interact, base_url,
 
     comparison_info = ""
     if analysis_result and analysis_result.get("comparison_data"):
-        baseline_id = analysis_result["comparison_data"].get("baseline_id", "previous")
-        comparison_info = f"\n[bold]Compared to:[/]  {baseline_id}\n"
+        cmp = analysis_result["comparison_data"]
+        baseline_label = cmp.get("baseline_run_name") or cmp.get("baseline_id", "previous")
+        comparison_info = f"\n[bold]Compared to:[/]  {baseline_label}\n"
 
     console.print(Panel(
         f"[bold green]Pipeline complete![/]  ({' + '.join(completed)})\n"

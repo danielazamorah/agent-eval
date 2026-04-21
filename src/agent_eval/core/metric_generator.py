@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -87,36 +88,36 @@ Each metric must follow this exact JSON structure:
 {{
     "metric_name_snake_case": {{
         "metric_type": "llm",
-        "applies_to": "all",
         "score_range": {{
             "min": 0,
-            "max": 5,
-            "description": "0=Completely wrong, 5=Perfect"
+            "max": 1,
+            "type": "rubric",
+            "description": "0=Fails criteria, 1=Meets all criteria"
         }},
         "dataset_mapping": {{
             "prompt": {{"source_column": "user_inputs"}},
             "response": {{"source_column": "final_response"}},
             "reference": {{"source_column": "trace_summary"}}
         }},
-        "template": "Evaluate...\\n\\n**User Request:** {{prompt}}\\n**Response:** {{response}}\\n**Context:** {{reference}}\\n\\nScore: [0-5]\\nExplanation: [Your reasoning]"
+        "template": "Evaluate...\\n\\n**User Request:** {{prompt}}\\n**Response:** {{response}}\\n**Context:** {{reference}}\\n\\nScore: [0-1]\\nExplanation: [Your reasoning]"
     }}
 }}
 ```
 
-### `applies_to` — which data a metric runs on
+### Per-row capability flags — which rows a metric is eligible for
 
-The evaluation framework has TWO distinct data sources, and each metric must declare which source(s) it applies to. Getting this wrong means metrics run on incompatible data and produce meaningless scores.
+Routing is per-row, not per-metric-type. Each metric declares what a row must contain to be eligible; the evaluator filters rows accordingly.
 
-| Value | Data source | Key characteristics |
+| Flag | When to set | Effect at evaluation time |
 |---|---|---|
-| `"all"` (default) | Both sources | Use for metrics that evaluate ANY agent response (e.g., tool usage quality, response completeness). |
-| `"scenarios"` | Multi-turn ADK User Sim data only | This data has conversation_history and trajectory but **NO reference/expected answers**. Use for: conversation flow, trajectory accuracy, turn-by-turn coherence, multi-turn context handling. API Predefined multi-turn metrics (e.g., MULTI_TURN_GENERAL_QUALITY) MUST use this. |
-| `"golden_dataset"` | Single-turn golden dataset data only (from interact) | This data **HAS reference_data with expected answers**. Use for: correctness vs ground truth, factual accuracy, expected tool calls. Metrics that use `reference_data` fields in their mapping MUST use this. |
+| `requires_reference: true` | Metric compares the agent's response against a user-curated expected output (uses `reference_data:<field>` in its mapping) | Only runs on rows whose `reference_data` is non-empty (golden-style rows). |
+| `requires_multi_turn: true` | Metric evaluates conversation flow, trajectory, or turn coherence | Only runs on rows with multi-turn history (simulation rows or golden rows with multiple user inputs). |
+| both unset (default) | Metric evaluates any single agent response | Runs on every row. |
 
-**Decision rules for `applies_to`:**
-- Does the metric use `reference_data.*` fields (expected answers, expected tools)? → `"golden_dataset"` (this data is only available from golden datasets)
-- Does it evaluate multi-turn conversation flow, trajectory, or turn coherence? → `"scenarios"` (only multi-turn data has meaningful conversation_history)
-- Does it evaluate the response quality in a way that works for both? → `"all"`
+**Decision rules:**
+- Uses `reference_data:*` fields (expected answers, expected tools)? → set `requires_reference: true`
+- Evaluates multi-turn conversation flow / trajectory? → set `requires_multi_turn: true`
+- General response quality that works for any row? → omit both flags
 
 ### Available Managed (Predefined) Metrics
 
@@ -127,25 +128,24 @@ In addition to custom LLM metrics, you can include **managed metrics** — Googl
 "metric_name": {{
     "is_managed": true,
     "managed_metric_name": "METRIC_NAME",
-    "use_gemini_format": true,
-    "applies_to": "all"
+    "use_gemini_format": true
 }}
 ```
 
-| Managed Metric | applies_to | What it evaluates |
+| Managed Metric | Row requirement | What it evaluates |
 |---|---|---|
-| `GENERAL_QUALITY` | all | Overall response quality (rubric, 0-1 pass rate) |
-| `TEXT_QUALITY` | all | Writing quality: grammar, clarity, structure (1-5) |
-| `INSTRUCTION_FOLLOWING` | all | Adherence to user instructions (1-5) |
-| `FLUENCY` | all | Language fluency and naturalness (1-5) |
-| `COHERENCE` | all | Logical flow and consistency (1-5) |
-| `GROUNDEDNESS` | all | Whether claims are supported by context (1-5) |
-| `SAFETY` | all | Freedom from harmful content (rubric, 0-1 pass rate) |
-| `VERBOSITY` | all | Response length appropriateness (-2 to 2) |
-| `SUMMARIZATION_QUALITY` | all | Summarization coverage/accuracy (1-5) |
-| `QUESTION_ANSWERING_QUALITY` | all | QA accuracy and completeness (1-5) |
-| `MULTI_TURN_CHAT_QUALITY` | **scenarios** | Multi-turn conversation quality (rubric, 0-1 pass rate) |
-| `MULTI_TURN_SAFETY` | **scenarios** | Safety across multi-turn conversations (rubric, 0-1 pass rate) |
+| `GENERAL_QUALITY` | any row | Overall response quality (rubric, 0-1 pass rate) |
+| `TEXT_QUALITY` | any row | Writing quality: grammar, clarity, structure (1-5) |
+| `INSTRUCTION_FOLLOWING` | any row | Adherence to user instructions (1-5) |
+| `FLUENCY` | any row | Language fluency and naturalness (1-5) |
+| `COHERENCE` | any row | Logical flow and consistency (1-5) |
+| `GROUNDEDNESS` | any row | Whether claims are supported by context (1-5) |
+| `SAFETY` | any row | Freedom from harmful content (rubric, 0-1 pass rate) |
+| `VERBOSITY` | any row | Response length appropriateness (-2 to 2) |
+| `SUMMARIZATION_QUALITY` | any row | Summarization coverage/accuracy (1-5) |
+| `QUESTION_ANSWERING_QUALITY` | any row | QA accuracy and completeness (1-5) |
+| `MULTI_TURN_CHAT_QUALITY` | **multi-turn rows** (`requires_multi_turn: true`) | Multi-turn conversation quality (rubric, 0-1 pass rate) |
+| `MULTI_TURN_SAFETY` | **multi-turn rows** (`requires_multi_turn: true`) | Safety across multi-turn conversations (rubric, 0-1 pass rate) |
 
 **When to use managed vs custom metrics:**
 - Use **managed metrics** for standard quality dimensions (quality, safety, fluency) — they're well-calibrated and free
@@ -187,6 +187,7 @@ Note: In the `template` field inside `source_columns`, colons are replaced with 
 | `extracted_data:system_instruction` | Agent's system prompt / instruction |
 | `extracted_data:sub_agent_trace` | Agent's step-by-step reasoning trace |
 | `extracted_data:<state_var_name>` | Any agent-specific state variable (e.g., `extracted_data:cart`, `extracted_data:user_preferences`). Look at the agent's `state` usage in the source code to find custom variables. |
+| `reference_data:<field_name>` | The user-curated expected output for a golden question (only available on rows that have reference_data; pair with `requires_reference: true`). The `<field_name>` is whatever you choose to put in the golden dataset — common conventions: `expected_response`, `expected_behavior`, `expected_output`, `expected_answer`, `ground_truth`. For domain-specific agents, use a name that fits: `expected_docs` (RAG), `expected_tool_calls` (tool agents), `expected_citations` (research). **Custom metrics that need reference must use the SAME field name the golden data populates.** |
 
 ### Example metrics (for format reference only):
 
@@ -231,7 +232,7 @@ Note: In the `template` field inside `source_columns`, colons are replaced with 
 3. Generate additional metrics to fill gaps — target 3-5 total metrics (fewer focused metrics are better than many vague ones — each metric costs API calls per eval case)
 4. You can include both **managed metrics** (predefined, no template needed) and **custom LLM metrics** (with template + dataset_mapping). Use managed metrics for standard dimensions (quality, safety, fluency) and custom metrics for agent-specific behaviors.
 5. Each metric should target a distinct quality dimension
-6. Set `applies_to` correctly: use `"golden_dataset"` for metrics that need reference data, `"scenarios"` for metrics that evaluate multi-turn conversation flow, `"all"` for general metrics
+6. Set per-row capability flags correctly: add `requires_reference: true` for metrics that need reference data, `requires_multi_turn: true` for metrics that evaluate multi-turn conversation flow, omit both for general metrics
 7. Reference the agent's actual tool names, state variables, and capabilities in custom metric templates
 
 **Part 2 — Recommendations:**
@@ -249,7 +250,7 @@ Provide expert recommendations for the developer's evaluation strategy:
 - The template placeholders `{{prompt}}`, `{{response}}`, `{{reference}}` must match the dataset_mapping keys
 - Score range should be 0-5 for consistency, but 0-1 (binary pass/fail) or 0-3 (checklist) are valid if they match the metric's evaluation style
 - Only use valid source_columns from the table above
-- Set `applies_to` to `"all"`, `"scenarios"`, or `"golden_dataset"` — see table above for guidance
+- Use `requires_reference: true` and/or `requires_multi_turn: true` to gate metrics on row capabilities — see table above for guidance
 
 **Respond with ONLY a JSON object** (no markdown fences, no extra text):
 
@@ -299,9 +300,24 @@ Read the source code carefully and identify:
 2. **state_variables** — Session state variables the agent reads/writes. Look for `state["key"]`, `state.get("key")`, or state assignments. These are critical — they bridge agent logic and evaluation. Data saved to state during execution becomes available for evaluation metrics via `extracted_data:state_variables.<key>`.
 3. **sub_agents** — Sub-agents delegated to (name, purpose, when triggered)
 4. **key_behaviors** — Behaviors worth evaluating: capability boundaries (what the agent refuses), error handling, domain-specific logic, multi-step workflows, edge cases
-5. **data_summary** — A concise human-readable summary of what evaluation data is available
+5. **suggested_state_variables** — State variables the agent DOES NOT currently have but WOULD benefit from for evaluation. For each tool or key behavior, consider: would saving intermediate results, decisions, or status to session state make it easier to evaluate the agent? Only suggest variables that have clear evaluation value. For each suggestion include:
+   - `name`: Variable name (snake_case, max 30 chars)
+   - `purpose`: Why this variable helps evaluation (1 sentence)
+   - `code_snippet`: Actual Python code showing how to add it. Follow ADK conventions:
+     - For tools: add `tool_context: ToolContext` parameter (from `google.adk.tools`) if not already present, then use `tool_context.state["name"] = value`
+     - For callbacks: use `ctx: CallbackContext` parameter (from `google.adk.agents.callback_context`), then use `ctx.state["name"] = value`
+     Show the minimal code change — include the function signature and the line where the value is computed so the user knows exactly where to paste it.
+     Snippet quality rules — REQUIRED for safe copy/paste:
+     - PRESERVE the original function's docstring exactly as written; do not omit or shorten it
+     - Show the COMPLETE function body, not a partial fragment — include the return statement and any existing logic before/after the new state assignment
+     - Use 4-space indentation consistently — no tabs, no mixed indentation, no leading/trailing whitespace lines
+     - Begin with the necessary `from google.adk.tools import ToolContext` (or callback_context import) on its own line at the top of the snippet
+   - `evaluation_use`: What kind of metric could use this data (1 sentence)
 
-**IMPORTANT:** Be factual — only report what is explicitly in the code. Do not invent tools, state variables, or behaviors.
+   IMPORTANT: Do NOT suggest state variables that already exist (listed in item 2). If the agent already has 3+ meaningful state variables, return an empty list — the agent likely has enough observability. Only suggest 1-3 variables maximum.
+6. **data_summary** — A concise human-readable summary of what evaluation data is available
+
+**IMPORTANT:** Be factual — only report what is explicitly in the code. Do not invent tools, state variables, or behaviors. For suggested_state_variables, base suggestions on actual code patterns you see.
 
 **Respond with ONLY a JSON object:**
 
@@ -317,6 +333,9 @@ Read the source code carefully and identify:
     ],
     "key_behaviors": [
         "description of a behavior worth evaluating"
+    ],
+    "suggested_state_variables": [
+        {{"name": "variable_name", "purpose": "Why this helps evaluation", "code_snippet": "from google.adk.tools import ToolContext\\n\\ndef tool_name(args: str, tool_context: ToolContext) -> dict:\\n    \\"\\"\\"Original docstring preserved verbatim — describes what the tool does.\\"\\"\\"\\n    result = compute_result(args)\\n    tool_context.state[\\"variable_name\\"] = result\\n    return result", "evaluation_use": "What metric could use this"}}
     ],
     "data_summary": "Human-readable summary of available evaluation data."
 }}
@@ -354,29 +373,29 @@ Each custom metric must follow this exact JSON structure:
 {{
     "metric_name_snake_case": {{
         "metric_type": "llm",
-        "applies_to": "all",
         "score_range": {{
             "min": 0,
-            "max": 5,
-            "description": "0=Completely wrong, 5=Perfect"
+            "max": 1,
+            "type": "rubric",
+            "description": "0=Fails criteria, 1=Meets all criteria"
         }},
         "dataset_mapping": {{
             "prompt": {{"source_column": "user_inputs"}},
             "response": {{"source_column": "final_response"}},
             "reference": {{"source_column": "trace_summary"}}
         }},
-        "template": "Evaluate...\\n\\n**User Request:** {{prompt}}\\n**Response:** {{response}}\\n**Context:** {{reference}}\\n\\nScore: [0-5]\\nExplanation: [Your reasoning]"
+        "template": "Evaluate...\\n\\n**User Request:** {{prompt}}\\n**Response:** {{response}}\\n**Context:** {{reference}}\\n\\nScore: [0-1]\\nExplanation: [Your reasoning]"
     }}
 }}
 ```
 
-### `applies_to` — which data a metric runs on
+### Per-row capability flags
 
-| Value | Data source | Key characteristics |
+| Flag | When to set | Effect at evaluation time |
 |---|---|---|
-| `"all"` (default) | Both sources | Use for metrics that evaluate ANY agent response. |
-| `"scenarios"` | Multi-turn ADK User Sim data only | Has conversation_history, trajectory. **NO reference/expected answers.** |
-| `"golden_dataset"` | Single-turn golden dataset only | **HAS reference_data with expected answers.** |
+| `requires_reference: true` | Metric uses `reference_data:<field>` and needs a curated expected answer | Only runs on rows whose `reference_data` is non-empty. |
+| `requires_multi_turn: true` | Metric evaluates conversation flow / trajectory | Only runs on rows with multi-turn history. |
+| both unset (default) | Single-turn quality, works on any row | Runs on every row. |
 
 ### ONLY these three placeholder names are allowed:
 
@@ -433,12 +452,21 @@ Note: In the `template` field inside `source_columns`, colons are replaced with 
 1. Generate 2-4 CUSTOM LLM-as-judge metrics tailored to this specific agent
 2. If existing custom metrics are provided: **preserve and improve them** — never silently drop metrics
 3. Each custom metric should target a distinct quality dimension relevant to this agent
-4. Set `applies_to` correctly: `"golden_dataset"` for metrics needing reference data, `"scenarios"` for multi-turn flow metrics, `"all"` for general metrics
+4. Set per-row capability flags correctly: `requires_reference: true` for metrics needing reference data, `requires_multi_turn: true` for multi-turn flow metrics, omit both for general metrics
 5. Reference the agent's actual tool names, state variables, and capabilities
 6. **Do NOT generate generic metrics** (safety, fluency, coherence) — the user has already selected managed metrics for those
 7. Every template MUST end with `Score: [X]` format followed by `\\nExplanation: [Your reasoning]`
 8. dataset_mapping keys MUST ONLY be `prompt`, `response`, and/or `reference`
 9. Include the user-selected managed metrics EXACTLY as shown in the "Selected Managed Metrics" section
+10. **Default to a 0-1 rubric scale** (`"min": 0, "max": 1, "type": "rubric"`) for new metrics. The template's score line should read `Score: [0-1]`. Use 1-5 pointwise only when the metric genuinely needs gradations (e.g., quality tiers); document why in the score description.
+11. **Include AT LEAST ONE metric with `requires_reference: true` that uses `reference_data:<field>` as its `reference`.** This metric scores how well the agent's actual response aligns with the user-curated expected output — the most common evaluation pattern. **Pick a field name that fits the agent's domain**, do NOT default to "expected_behavior":
+    - Generic chatbots / Q&A → `expected_response`
+    - RAG / retrieval agents → `expected_docs` or `expected_passages`
+    - Tool-using agents → `expected_tool_calls` or `expected_response`
+    - Research / cited agents → `expected_citations`
+    - Anything else → pick a snake_case field name that names the artefact you'd compare
+    Example mapping: `"reference": {{"source_column": "reference_data:expected_response"}}`. The template should compare `{{response}}` against `{{reference}}` and judge alignment. **The same field name MUST be populated by the golden data generated in the next step** — your choice here drives both sides.
+12. **For each managed metric with `requires_reference: true` (e.g. FINAL_RESPONSE_MATCH), add `"reference_field": "<field_name>"`** pointing at the same golden-data field your custom reference metric uses. This tells the evaluator which slot in `reference_data` to compare against. Omit `reference_field` only if you want the evaluator to auto-detect from a priority list of conventional names.
 
 **Respond with ONLY a JSON object** (no markdown fences):
 
@@ -468,6 +496,8 @@ EVAL_DATA_PROMPT = """You are a Senior Evaluation Architect generating test data
 ---
 
 {existing_data_section}
+
+{user_priorities_section}
 
 ---
 
@@ -500,6 +530,20 @@ Good golden data covers:
 - Edge cases and out-of-scope requests
 - Queries that require specific tools
 - Queries where the expected response can be verified
+
+**ABOUT `expected_behavior` — IMPORTANT:** This field is what reference-based metrics
+will compare the agent's actual response against. The text you generate is a STARTER —
+the user is expected to review and refine it with the actual answer they want the
+agent to produce (e.g., "Returns total monthly spend of $1,247.50, broken down by
+category" rather than the vaguer "explains spending"). Generate plausible behavioral
+descriptions grounded in the agent's actual capabilities; the user will sharpen them
+into precise expected outputs.
+
+**CRITICAL quality requirements:**
+- Every entry MUST test a DISTINCT scenario — no near-duplicate queries
+- The `expected_behavior` field MUST NOT be empty — always describe what the agent should do
+- Vary the query style and complexity across entries
+- Each `user_inputs` list should contain a unique query not repeated in other entries
 
 {existing_data_instructions}
 
@@ -562,7 +606,7 @@ def analyze_agent_data(
         raise MetricGenerationError("Could not parse agent analysis from Gemini response.")
 
     # Validate expected keys
-    for key in ("tools", "state_variables", "key_behaviors"):
+    for key in ("tools", "state_variables", "key_behaviors", "suggested_state_variables"):
         if key not in parsed:
             parsed[key] = [] if key != "state_variables" else {}
 
@@ -669,6 +713,7 @@ def generate_eval_data(
     metric_definitions: Dict[str, Any],
     existing_scenarios: Optional[List] = None,
     existing_golden: Optional[List] = None,
+    user_priorities: str = "",
     model: str = "gemini-3.1-pro-preview",
 ) -> Dict[str, Any]:
     """Gemini Call 3: Generate scenarios and golden data.
@@ -703,12 +748,23 @@ def generate_eval_data(
             "cover gaps. If an existing entry has issues, include an improved version."
         )
 
+    # User priorities section
+    user_priorities_section = ""
+    if user_priorities:
+        user_priorities_section = (
+            "## Developer Priorities for Test Data\n\n"
+            "The developer wants test data that focuses on:\n"
+            f"> {user_priorities}\n\n"
+            "Design scenarios and golden queries that specifically test these priorities."
+        )
+
     prompt = EVAL_DATA_PROMPT.format(
         agent_source_code=source_parts,
         agent_analysis_json=json.dumps(agent_analysis, indent=2),
         metric_definitions_json=json.dumps(metric_definitions, indent=2),
         existing_data_section=existing_data_section,
         existing_data_instructions=existing_data_instructions,
+        user_priorities_section=user_priorities_section,
         agent_name=agent_name,
     )
 
@@ -717,9 +773,26 @@ def generate_eval_data(
     if not parsed:
         raise MetricGenerationError("Could not parse eval data from Gemini response.")
 
+    # Deduplicate golden data by user_inputs and fill empty expected_behavior
+    golden = parsed.get("golden_data", [])
+    seen_queries: set[str] = set()
+    unique_golden: list[dict] = []
+    for entry in golden:
+        query_key = str(entry.get("user_inputs", []))
+        if query_key not in seen_queries:
+            seen_queries.add(query_key)
+            # Ensure expected_behavior is not empty
+            ref = entry.get("reference_data", {})
+            if isinstance(ref, dict) and not ref.get("expected_behavior", "").strip():
+                ref["expected_behavior"] = entry.get("description", "Agent should respond appropriately")
+                entry["reference_data"] = ref
+            elif not isinstance(ref, dict) and not entry.get("expected_behavior", "").strip():
+                entry["expected_behavior"] = entry.get("description", "Agent should respond appropriately")
+            unique_golden.append(entry)
+
     return {
         "scenarios": parsed.get("scenarios", []),
-        "golden_data": parsed.get("golden_data", []),
+        "golden_data": unique_golden,
         "strategy": parsed.get("strategy", ""),
     }
 
@@ -961,8 +1034,25 @@ def _build_prompt(
     )
 
 
+# Backoff schedule for 429 / RESOURCE_EXHAUSTED retries: 2s, 4s, 8s, 16s.
+# 4 retries on top of the initial attempt — caps at ~30s total wait before
+# the caller's fallback kicks in.
+_RETRY_BACKOFF_SECONDS = (2, 4, 8, 16)
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """True when a Gemini API error looks like a retryable quota/rate-limit hit."""
+    msg = str(exc).upper()
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "RATE LIMIT" in msg
+
+
 def _call_gemini(prompt: str, model: str) -> str:
-    """Call the Gemini API and return the response text."""
+    """Call the Gemini API and return the response text.
+
+    Retries with exponential backoff on 429 / RESOURCE_EXHAUSTED so a transient
+    quota blip doesn't drop the user into the "continuing with defaults"
+    fallback. Non-retryable errors raise immediately.
+    """
     try:
         from google import genai
         from google.genai.types import HttpOptions
@@ -983,20 +1073,32 @@ def _call_gemini(prompt: str, model: str) -> str:
             "Set it with: export GOOGLE_CLOUD_PROJECT=your-project-id"
         )
 
-    try:
-        client = genai.Client(
-            vertexai=True,
-            project=project,
-            location=location,
-            http_options=HttpOptions(api_version="v1"),
+    client = genai.Client(
+        vertexai=True,
+        project=project,
+        location=location,
+        http_options=HttpOptions(api_version="v1"),
+    )
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(len(_RETRY_BACKOFF_SECONDS) + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            last_exc = e
+            if not _is_rate_limited(e) or attempt == len(_RETRY_BACKOFF_SECONDS):
+                break
+            time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+
+    if last_exc is not None and _is_rate_limited(last_exc):
+        raise MetricGenerationError(
+            f"Gemini API rate-limited after {len(_RETRY_BACKOFF_SECONDS)} retries: {last_exc}"
         )
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        raise MetricGenerationError(f"Gemini API call failed: {e}")
+    raise MetricGenerationError(f"Gemini API call failed: {last_exc}")
 
 
 def _extract_json(text: str) -> Optional[Dict]:
@@ -1083,18 +1185,20 @@ def _validate_single_metric(name: str, defn: Dict) -> List[str]:
     if defn.get("is_managed"):
         if not defn.get("managed_metric_name"):
             errors.append(f"'{name}': managed metric missing 'managed_metric_name'")
-        applies_to = defn.get("applies_to", "all")
-        if applies_to not in ("all", "scenarios", "golden_dataset"):
+        if "applies_to" in defn and defn["applies_to"] not in ("all", "scenarios", "golden_dataset"):
             errors.append(
-                f"'{name}': applies_to must be 'all', 'scenarios', or 'golden_dataset', got '{applies_to}'"
+                f"'{name}': legacy applies_to must be 'all', 'scenarios', or 'golden_dataset', "
+                f"got '{defn['applies_to']}'"
             )
         return errors
 
-    # Validate applies_to
-    applies_to = defn.get("applies_to", "all")
-    if applies_to not in ("all", "scenarios", "golden_dataset"):
+    # Legacy applies_to is optional; per-row capability flags
+    # (requires_reference / requires_multi_turn) are the canonical routing
+    # mechanism but old metric files may still carry applies_to.
+    if "applies_to" in defn and defn["applies_to"] not in ("all", "scenarios", "golden_dataset"):
         errors.append(
-            f"'{name}': applies_to must be 'all', 'scenarios', or 'golden_dataset', got '{applies_to}'"
+            f"'{name}': legacy applies_to must be 'all', 'scenarios', or 'golden_dataset', "
+            f"got '{defn['applies_to']}'"
         )
 
     # Check required fields
@@ -1135,18 +1239,32 @@ def _validate_single_metric(name: str, defn: Dict) -> List[str]:
         # Support both simple source_column and combined template syntax
         if "source_column" in config:
             col = config["source_column"]
-            if col not in VALID_SOURCE_COLUMNS and not col.startswith("extracted_data:"):
+            if (
+                col not in VALID_SOURCE_COLUMNS
+                and not col.startswith("extracted_data:")
+                and not col.startswith("reference_data:")
+            ):
                 errors.append(
                     f"'{name}.{placeholder}': invalid source_column '{col}'. "
                     f"Must be one of: {', '.join(sorted(VALID_SOURCE_COLUMNS))}"
                 )
         elif "source_columns" in config and "template" in config:
             # Combined template syntax — validate each source column
-            for col in config["source_columns"]:
-                if col not in VALID_SOURCE_COLUMNS and not col.startswith("extracted_data:"):
+            cols = config["source_columns"]
+            for col in cols:
+                if (
+                col not in VALID_SOURCE_COLUMNS
+                and not col.startswith("extracted_data:")
+                and not col.startswith("reference_data:")
+            ):
                     errors.append(
                         f"'{name}.{placeholder}': invalid source_column '{col}' in source_columns"
                     )
+            # Check for duplicate source_columns
+            if len(cols) != len(set(cols)):
+                errors.append(
+                    f"'{name}.{placeholder}': duplicate entries in source_columns"
+                )
         else:
             errors.append(f"'{name}.{placeholder}': must have 'source_column' or 'source_columns' + 'template'")
 

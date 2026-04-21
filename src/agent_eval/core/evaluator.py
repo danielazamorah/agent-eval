@@ -18,7 +18,11 @@ from vertexai import Client, types
 
 from agent_eval.core.config import CONFIG, get_project_id
 from agent_eval.core.deterministic_metrics import DETERMINISTIC_METRICS, evaluate_deterministic_metrics
-from agent_eval.core.data_mapper import map_dataset_columns, robust_json_loads
+from agent_eval.core.data_mapper import (
+    extract_reference_text,
+    map_dataset_columns,
+    robust_json_loads,
+)
 from agent_eval.core.metric_discovery import is_api_predefined as _is_api_predefined_discovery
 from agent_eval.core.metric_discovery import _GCS_PLACEHOLDERS
 
@@ -52,6 +56,56 @@ for _name in _NOISY_LOGGERS:
 def _is_api_predefined(managed_metric_name: str) -> bool:
     """Delegate to metric_discovery.is_api_predefined()."""
     return _is_api_predefined_discovery(managed_metric_name)
+
+
+# Capability tags used for per-row metric routing. Mirrors
+# ``agent_eval.core.dataset_io`` but adapted to the interaction-row schema
+# produced by ``simulate``/``interact`` (request/response/reference_data/...).
+_CAP_REFERENCE = "has_reference"
+_CAP_MULTI_TURN = "multi_turn"
+_CAP_SESSION_INPUTS = "has_session_inputs"
+_CAP_INTERMEDIATE_EVENTS = "has_intermediate_events"
+_CAP_RESPONSE = "has_response"
+
+
+def _interaction_row_capabilities(row: pd.Series) -> set:
+    """Return the capability tags a single interaction row supports.
+
+    The interaction shape is what ``simulate``/``interact`` write to the CSV
+    or JSONL the evaluator consumes — distinct from the unified dataset.jsonl
+    row shape, hence this small adapter.
+    """
+    caps: set = set()
+
+    ref = row.get("reference_data") if hasattr(row, "get") else None
+    if isinstance(ref, dict) and any(v for v in ref.values() if v not in (None, "", [])):
+        caps.add(_CAP_REFERENCE)
+
+    user_inputs = row.get("user_inputs") if hasattr(row, "get") else None
+    if isinstance(user_inputs, list) and len(user_inputs) > 1:
+        caps.add(_CAP_MULTI_TURN)
+    elif row.get("source_type") == "simulation":
+        # Simulations are inherently multi-turn even when the seed prompt is
+        # the only logged user_input.
+        caps.add(_CAP_MULTI_TURN)
+
+    if row.get("response"):
+        caps.add(_CAP_RESPONSE)
+    if row.get("app_name"):
+        caps.add(_CAP_SESSION_INPUTS)
+    if row.get("session_trace"):
+        caps.add(_CAP_INTERMEDIATE_EVENTS)
+    return caps
+
+
+def _required_capabilities(metric_info: Dict[str, Any]) -> set:
+    """Translate a metric definition's `requires_*` flags into capability tags."""
+    required: set = set()
+    if metric_info.get("requires_reference"):
+        required.add(_CAP_REFERENCE)
+    if metric_info.get("requires_multi_turn"):
+        required.add(_CAP_MULTI_TURN)
+    return required
 
 
 def configure_logging(debug: bool = False) -> None:
@@ -169,12 +223,16 @@ def run_single_metric_evaluation(
     Returns:
         Tuple of (parsed_results_df, metric_name, input_dataset_df)
     """
-    eval_dataset, metric_obj, metric_df, metric_name, client, retries, delay = task_args
+    eval_dataset, metric_obj, metric_df, metric_name, client, retries, delay, gcs_dest = task_args
+
+    eval_kwargs: Dict[str, Any] = {}
+    if gcs_dest:
+        eval_kwargs["config"] = types.EvaluateMethodConfig(dest=gcs_dest)
 
     for attempt in range(retries):
         try:
             logger.info(f"Starting evaluation: {metric_name} (Attempt {attempt + 1})")
-            result = client.evals.evaluate(dataset=eval_dataset, metrics=[metric_obj])
+            result = client.evals.evaluate(dataset=eval_dataset, metrics=[metric_obj], **eval_kwargs)
             parsed_df = parse_eval_result(result, metric_name, metric_df)
             logger.info(f"Finished evaluation: {metric_name}")
             # Return input dataset along with results for full traceability
@@ -185,6 +243,21 @@ def run_single_metric_evaluation(
                 time.sleep(delay * (2**attempt))
             else:
                 logger.critical(f"'{metric_name}' exhausted retries.")
+
+    # Fallback: if we passed a 'reference' column the SDK didn't accept,
+    # retry once without it so the metric still produces a result.
+    if "reference" in eval_dataset.columns:
+        try:
+            logger.warning(
+                "'%s': retrying without 'reference' column (SDK may not accept it for this metric)",
+                metric_name,
+            )
+            fallback_dataset = eval_dataset.drop(columns=["reference"])
+            result = client.evals.evaluate(dataset=fallback_dataset, metrics=[metric_obj], **eval_kwargs)
+            parsed_df = parse_eval_result(result, metric_name, metric_df)
+            return parsed_df, metric_name, fallback_dataset
+        except Exception as e:
+            logger.error(f"'{metric_name}' fallback also failed: {e}")
 
     return None, metric_name, None
 
@@ -568,33 +641,119 @@ class Evaluator:
                 if info.get("metric_type") == "deterministic":
                     continue
 
-                # Filter by applies_to (metric routing by source type)
-                applies_to = info.get("applies_to", "all")
-                if applies_to != "all" and "source_type" in agent_df.columns:
-                    source_map = {"scenarios": "simulation", "golden_dataset": "interaction"}
-                    required_source = source_map.get(applies_to)
-                    if required_source:
-                        source_mask = agent_df["source_type"] == required_source
-                        agent_df_filtered = agent_df[source_mask].copy()
-                        if agent_df_filtered.empty:
-                            skipped_metrics.append({"metric": metric_name, "reason": f"no {applies_to} data available"})
-                            logger.info("Skipping '%s' — no %s data available", metric_name, applies_to)
-                            continue
-                    else:
-                        agent_df_filtered = agent_df
+                # Per-row capability filter — replaces legacy `applies_to`
+                # routing. A metric runs on rows whose capabilities are a
+                # superset of what it requires (e.g. requires_reference → row
+                # must have non-empty reference_data).
+                required_caps = _required_capabilities(info)
+
+                # Backward compat: when a metric file still uses `applies_to`
+                # without the newer requires_* flags, translate it to the
+                # equivalent capability so existing user metric files keep
+                # working.
+                legacy_applies_to = info.get("applies_to", "all")
+                if not required_caps and legacy_applies_to == "golden_dataset":
+                    required_caps = {_CAP_REFERENCE}
+
+                if required_caps:
+                    capability_mask = agent_df.apply(
+                        lambda r: required_caps.issubset(_interaction_row_capabilities(r)),
+                        axis=1,
+                    )
+                    agent_df_filtered = agent_df[capability_mask].copy()
+                    if agent_df_filtered.empty:
+                        missing = ", ".join(sorted(required_caps))
+                        skipped_metrics.append({
+                            "metric": metric_name,
+                            "reason": f"no rows have required capabilities: {missing}",
+                        })
+                        logger.info(
+                            "Skipping '%s' — no rows have required capabilities: %s",
+                            metric_name, missing,
+                        )
+                        continue
                 else:
                     agent_df_filtered = agent_df
 
                 is_managed = info.get("is_managed", False)
 
-                # Use filtered original_df to match the applies_to filter
-                original_df_filtered = original_df.loc[agent_df_filtered.index] if applies_to != "all" else original_df
+                # Use filtered original_df to match the capability filter
+                original_df_filtered = (
+                    original_df.loc[agent_df_filtered.index] if required_caps else original_df
+                )
 
                 if is_managed:
                     m_name = info.get("managed_metric_name", "").upper()
                     if _is_api_predefined(m_name):
-                        # API Predefined: server-side evaluation with raw request/response
-                        eval_dataset = original_df_filtered[["request", "response"]].copy()
+                        needs_ref = info.get("requires_reference", False)
+                        ref_field = info.get("reference_field")  # optional override
+
+                        # Pick the right column to put in the SDK's `response` slot.
+                        # `response` is the wrapped API object; `final_response` is
+                        # plain text. For text-comparison metrics like
+                        # FINAL_RESPONSE_MATCH, we want the clean text on both sides.
+                        resp_field = info.get("response_field") or info.get("default_response_field")
+                        if resp_field and resp_field in original_df_filtered.columns:
+                            eval_dataset = original_df_filtered[["request"]].copy()
+                            eval_dataset["response"] = original_df_filtered[resp_field].astype(str)
+                            logger.debug(
+                                "'%s': using '%s' as response column for text comparison",
+                                metric_name, resp_field,
+                            )
+                        else:
+                            eval_dataset = original_df_filtered[["request", "response"]].copy()
+
+                        # Rename to SDK-canonical column name. Internal DataFrames
+                        # use `request` for legacy reasons; the SDK expects `prompt`.
+                        eval_dataset = eval_dataset.rename(columns={"request": "prompt"})
+
+                        if needs_ref and "reference_data" in original_df_filtered.columns:
+                            eval_dataset["reference"] = (
+                                original_df_filtered["reference_data"].apply(
+                                    lambda rd: extract_reference_text(rd, ref_field)
+                                )
+                            )
+                            non_empty = eval_dataset["reference"].astype(str).str.strip() != ""
+                            dropped = int((~non_empty).sum())
+                            eval_dataset = eval_dataset[non_empty].copy()
+
+                            if eval_dataset.empty:
+                                field_hint = (
+                                    f"`reference_data.{ref_field}`" if ref_field
+                                    else "any conventional `reference_data` field "
+                                         "(e.g. expected_response, expected_behavior, ground_truth)"
+                                )
+                                skipped_metrics.append({
+                                    "metric": metric_name,
+                                    "reason": (
+                                        f"requires reference_data; {field_hint} not populated "
+                                        f"in {len(original_df_filtered)} row(s)"
+                                    ),
+                                })
+                                logger.warning(
+                                    "Skipping '%s' — needs reference data but %s not found. "
+                                    "Edit eval/eval_data/golden_dataset.json to add expected values.",
+                                    metric_name, field_hint,
+                                )
+                                continue
+
+                            if dropped:
+                                logger.info(
+                                    "'%s': scoring %d row(s); skipped %d without reference",
+                                    metric_name, len(eval_dataset), dropped,
+                                )
+                        elif needs_ref:
+                            skipped_metrics.append({
+                                "metric": metric_name,
+                                "reason": "requires reference_data column; not present in dataset",
+                            })
+                            logger.warning(
+                                "Skipping '%s' — no reference_data column. Run `agent-eval interact` "
+                                "with a golden dataset that has reference values.",
+                                metric_name,
+                            )
+                            continue
+
                         logger.info(f"Using GEMINI format for API Predefined metric: {metric_name}")
                     else:
                         # GCS YAML: client-side LLM-as-judge, needs prompt/response columns
@@ -662,7 +821,8 @@ class Evaluator:
 
                 eval_tasks.append((
                     eval_dataset, metric_obj, agent_df, metric_name, self.client,
-                    CONFIG.MAX_RETRIES, CONFIG.RETRY_DELAY_SECONDS
+                    CONFIG.MAX_RETRIES, CONFIG.RETRY_DELAY_SECONDS,
+                    self.config.get("gcs_dest"),
                 ))
 
         # Run Parallel Execution

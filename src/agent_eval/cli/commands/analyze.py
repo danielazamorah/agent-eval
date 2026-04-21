@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 
+from agent_eval.cli._pacing import _continue
 from agent_eval.core.analyzer import Analyzer
 
 console = Console()
@@ -72,10 +73,10 @@ def _display_metrics_table(
 
     has_comparison = bool(delta_lookup)
 
-    # Determine table title
-    run_name = current_summary.get("experiment_id", "current")
+    # Determine table title — prefer user-friendly folder names over experiment IDs
+    run_name = (comparison_data or {}).get("current_run_name") or current_summary.get("experiment_id", "current")
     if has_comparison:
-        baseline_name = comparison_data.get("baseline_id", "baseline")
+        baseline_name = comparison_data.get("baseline_run_name") or comparison_data.get("baseline_id", "baseline")
         title = f"Evaluation Results: {run_name} vs {baseline_name}"
     else:
         title = f"Evaluation Results: {run_name}"
@@ -83,8 +84,8 @@ def _display_metrics_table(
     table = Table(title=title, border_style="blue", padding=(0, 2))
     table.add_column("Metric", style="bold")
     if has_comparison:
-        table.add_column("Baseline", justify="right")
-    table.add_column("Current", justify="right")
+        table.add_column(baseline_name, justify="right")
+    table.add_column(run_name if has_comparison else "Value", justify="right")
     if has_comparison:
         table.add_column("Change", justify="right")
 
@@ -281,6 +282,9 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
             analysis_result.get("comparison_data"),
             focus,
         )
+        # Anchor before the (potentially long) AI analysis renders, so the
+        # metrics table doesn't scroll off-screen unread.
+        _continue("Press Enter to read the AI analysis →", console=console)
 
     # ── Display the AI analysis ───────────────────────────────────────
     _display_analysis(results_dir)
@@ -301,8 +305,9 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
 
     comparison_info = ""
     if analysis_result and analysis_result.get("comparison_data"):
-        baseline_id = analysis_result["comparison_data"].get("baseline_id", "previous")
-        comparison_info = f"\n[bold]Compared to:[/]  {baseline_id}\n"
+        cmp = analysis_result["comparison_data"]
+        baseline_label = cmp.get("baseline_run_name") or cmp.get("baseline_id", "previous")
+        comparison_info = f"\n[bold]Compared to:[/]  {baseline_label}\n"
 
     console.print(Panel(
         f"[bold green]Analysis complete![/]\n"

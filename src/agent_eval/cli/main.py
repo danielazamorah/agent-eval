@@ -20,10 +20,15 @@ def _get_version() -> str:
 def _display_banner() -> None:
     version = _get_version()
     panel = Panel(
-        "Evaluate your ADK agents with confidence.",
-        title=f"agent-eval v{version}",
+        "[cyan]▄▀▄ █▀▀ █▀▀ █▄ █ ▀█▀   █▀▀ █ █ ▄▀▄ █  [/]\n"
+        "[cyan]█▀█ █ █ █▀▀ █ ▀█  █    █▀▀ ▀▄▀ █▀█ █  [/]\n"
+        "[cyan]▀ ▀ ▀▀▀ ▀▀▀ ▀  ▀  ▀    ▀▀▀  ▀  ▀ ▀ ▀▀▀[/]\n"
+        "\n"
+        "Hypothesize. Test. Validate.\n"
+        "[dim]Systematic evaluation for ADK agents.[/]",
+        title=f"[bold]agent-eval[/] v{version}",
         border_style="blue",
-        padding=(0, 2),
+        padding=(1, 2),
     )
     console.print(panel)
 
@@ -35,7 +40,19 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     ctx.exit()
 
 
-@click.group(help="Evaluation CLI for ADK agents.")
+class _OrderedGroup(click.Group):
+    """Click group that lists commands in registration order, not alphabetically.
+
+    The default ``Group.list_commands`` sorts alphabetically — that hides our
+    intended workflow ordering (init → import → simulate → ...). Overriding
+    here makes ``agent-eval --help`` read top-down as the docs do.
+    """
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        return list(self.commands.keys())
+
+
+@click.group(cls=_OrderedGroup, help="Evaluation CLI for ADK agents.")
 @click.option(
     "--version", "-v",
     is_flag=True,
@@ -56,19 +73,30 @@ from agent_eval.cli.commands.analyze import analyze  # noqa: E402
 from agent_eval.cli.commands.convert import convert  # noqa: E402
 from agent_eval.cli.commands.create_dataset import create_dataset  # noqa: E402
 from agent_eval.cli.commands.init import init  # noqa: E402
+from agent_eval.cli.commands.setup import setup  # noqa: E402
 from agent_eval.cli.commands.simulate import simulate  # noqa: E402
 from agent_eval.cli.commands.run import run  # noqa: E402
 from agent_eval.cli.commands.dashboard import dashboard  # noqa: E402
+from agent_eval.cli.commands.agent_engine import agent_engine  # noqa: E402
+from agent_eval.cli.commands.import_adk import import_adk  # noqa: E402
+from agent_eval.cli.commands.migrate import migrate  # noqa: E402
 
-cli.add_command(interact)
-cli.add_command(evaluate)
-cli.add_command(analyze)
-cli.add_command(convert)
-cli.add_command(create_dataset, name="create-dataset")
-cli.add_command(init)
-cli.add_command(simulate)
-cli.add_command(run)
-cli.add_command(dashboard)
+# Order matches the Vertex AI eval docs sidebar workflow so `agent-eval --help`
+# reads top-down as: set up → bring in data → generate traces → score →
+# (Path A shortcut) → view → orchestrate → utilities.
+cli.add_command(setup)                             # One-time GCP env preparation
+cli.add_command(init)                              # Tutorial / first-run scaffold
+cli.add_command(migrate)                           # Convert legacy eval/ → tests/eval/
+cli.add_command(import_adk, name="import")         # Prepare dataset (from existing ADK evalsets)
+cli.add_command(simulate)                          # Generate traces (multi-turn)
+cli.add_command(interact)                          # Generate traces (single-turn)
+cli.add_command(evaluate)                          # Run evaluation
+cli.add_command(agent_engine, name="agent-engine") # Run evaluation — Path A streamlined
+cli.add_command(analyze)                           # View / interpret results
+cli.add_command(dashboard)                         # View / interpret results (interactive)
+cli.add_command(run)                               # Full pipeline shortcut
+cli.add_command(convert)                           # Utility: ADK traces → JSONL
+cli.add_command(create_dataset, name="create-dataset")  # Utility: legacy dataset converter
 
 
 def main():

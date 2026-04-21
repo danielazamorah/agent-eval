@@ -143,13 +143,24 @@ class TestDiscoverManagedMetrics:
             if info["resolution"] == "gcs_yaml":
                 assert info["use_gemini_format"] is False, f"{key} should have use_gemini_format=False"
 
-    def test_multi_turn_metrics_apply_to_scenarios(self):
+    def test_multi_turn_metrics_have_requires_multi_turn_flag(self):
         from agent_eval.core.metric_discovery import discover_managed_metrics, _MULTI_TURN_METRICS
         metrics = discover_managed_metrics()
         for name in _MULTI_TURN_METRICS:
             key = name.lower()
             if key in metrics:
-                assert metrics[key]["applies_to"] == "scenarios", f"{key} should apply to scenarios"
+                assert metrics[key]["requires_multi_turn"] is True, (
+                    f"{key} should set requires_multi_turn=True"
+                )
+
+    def test_single_turn_metrics_do_not_require_multi_turn(self):
+        from agent_eval.core.metric_discovery import discover_managed_metrics, _MULTI_TURN_METRICS
+        metrics = discover_managed_metrics()
+        for key, info in metrics.items():
+            if info["managed_metric_name"] not in _MULTI_TURN_METRICS:
+                assert info["requires_multi_turn"] is False, (
+                    f"{key} should not require multi-turn"
+                )
 
     def test_all_entries_have_required_fields(self):
         from agent_eval.core.metric_discovery import discover_managed_metrics
@@ -161,7 +172,8 @@ class TestDiscoverManagedMetrics:
             assert "resolution" in info, f"{key} missing resolution"
             assert "use_gemini_format" in info, f"{key} missing use_gemini_format"
             assert "score_range" in info, f"{key} missing score_range"
-            assert "applies_to" in info, f"{key} missing applies_to"
+            assert "requires_reference" in info, f"{key} missing requires_reference"
+            assert "requires_multi_turn" in info, f"{key} missing requires_multi_turn"
 
 
 class TestGetMetricDefinitionEntry:

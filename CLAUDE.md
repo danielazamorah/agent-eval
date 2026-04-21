@@ -9,7 +9,7 @@
 `agent-eval` is an evaluation CLI for ADK agents. It acts as the glue between OpenTelemetry traces from ADK, Vertex AI Evaluation for LLM-as-judge metrics, and Gemini for analysis.
 
 **The evaluation cycle:**
-1. **Interact** — Generate agent traces (ADK User Sim for multi-turn, or DIY for single-turn/live agents)
+1. **Interact** — Generate agent traces. Either `agent-eval simulate` (UserSim, multi-turn) or `agent-eval interact` (DIY, single-turn) — both are forms of interacting with the agent, just different drivers.
 2. **Evaluate** — Score traces with deterministic metrics (latency, tokens, cost) + LLM-as-judge metrics (quality, accuracy)
 3. **Analyze** — Generate AI-powered root cause analysis
 
@@ -24,28 +24,27 @@
 
 ## Typical Project Structure
 
-When a user runs `agent-eval init`, it scaffolds an `eval/` folder:
+When a user runs `agent-eval init`, it scaffolds eval artifacts under `tests/eval/` (Path A — Agent Engine) and/or `eval/` (Path B — local ADK source, ADK-runtime files):
 
 ```
 my-agent/
-├── my_agent/                            # ADK agent source code
+├── my_agent/                                  # ADK agent source code
 │   ├── agent.py
 │   ├── tools/
 │   └── ...
-├── eval/                                # Created by `agent-eval init`
-│   ├── metrics/metric_definitions.json  # LLM-as-judge metric rubrics
-│   ├── scenarios/                       # User Sim scenarios + session input
-│   ├── eval_data/golden_dataset.json    # DIY test queries
-│   └── results/                         # Evaluation outputs
-│       ├── OPTIMIZATION_LOG.md          # Cumulative optimization comparison
-│       └── <timestamp>/
-│           ├── eval_summary.json        # Aggregated metrics (start here)
-│           ├── gemini_analysis.md       # AI root cause analysis
-│           ├── question_answer_log.md   # Per-question breakdown
-│           └── raw/                     # Traces, CSVs, prompts
+├── tests/eval/                                # Path A — unified SDK-aligned layout
+│   ├── dataset.jsonl                          # Unified rows (prompt / reference / conversation_history / session_inputs / expected_*)
+│   ├── metrics/metric_definitions.json        # LLM-as-judge metric rubrics
+│   └── results/                               # Evaluation outputs (eval_summary.json, gemini_analysis.md, ...)
+├── eval/                                      # Path B — kept for local ADK runtime (UserSim + DIY)
+│   ├── scenarios/                             # ADK User Sim scenarios + session input
+│   ├── eval_data/golden_dataset.json          # DIY test queries
+│   └── metrics/metric_definitions.json        # Same rubrics, read by `evaluate` if tests/eval/metrics/ is absent
 ├── pyproject.toml
 └── .env
 ```
+
+> **Migrating an old project?** Run `agent-eval migrate` to flatten `eval/scenarios/` + `eval/eval_data/golden_dataset.json` into `tests/eval/dataset.jsonl` (originals are copied to `tests/eval/.backup/<timestamp>/`).
 
 ---
 
@@ -53,14 +52,19 @@ my-agent/
 
 | Command | Purpose |
 |---------|---------|
-| `uv run agent-eval init` | Scaffold eval folder (with optional AI metric generation via `--ai-metrics`) |
+| `uv run agent-eval setup` | Walk gcloud auth, ADC, project + location, Vertex AI API enablement, autorater IAM (run once per shell) |
+| `uv run agent-eval init` | Scaffold eval files (with optional AI metric generation via `--ai-metrics`) |
+| `uv run agent-eval migrate` | Convert legacy `eval/scenarios/` + `golden_dataset.json` into the unified `tests/eval/dataset.jsonl` |
+| `uv run agent-eval import --from <evalset>.json` | Flatten an ADK `.evalset.json` file into `tests/eval/dataset.jsonl` |
 | `uv run agent-eval run` | Full pipeline: simulate + interact + evaluate + analyze |
 | `uv run agent-eval simulate` | Run ADK User Sim + convert traces (multi-turn) |
 | `uv run agent-eval interact` | Run queries against a live agent endpoint (single-turn) |
 | `uv run agent-eval evaluate` | Run deterministic + LLM-as-judge metrics (supports multiple `--interaction-file`) |
+| `uv run agent-eval agent-engine` | Path A — streamlined `create_evaluation_run()` against a deployed Agent Engine |
 | `uv run agent-eval analyze` | Generate AI-powered analysis reports |
 | `uv run agent-eval convert` | Convert ADK traces to evaluation format (used by simulate) |
 | `uv run agent-eval create-dataset` | Convert ADK test files to golden dataset format |
+| `uv run agent-eval dashboard` | Launch interactive Gradio dashboard for comparing runs |
 
 ---
 
@@ -75,6 +79,7 @@ my-agent/
 ### Debugging Evaluation Issues
 
 - **Use `--debug`** on any command (`run`, `simulate`, `interact`, `evaluate`, `analyze`) to see detailed logs from ADK, Vertex AI SDK, and other services. By default, third-party logs are suppressed to keep the CLI output clean — `--debug` opens the floodgates.
+- **Auth issues?** → Re-run `agent-eval init` — it verifies project ID, ADC, API enablement, and quota project automatically
 - Zero token usage → `app_name` in `session_input.json` doesn't match the agent module folder name
 - "conversation_history required" → Using `MULTI_TURN_*` metrics on a single-turn agent; use `GENERAL_QUALITY` instead
 - Empty metrics → Using `GOOGLE_API_KEY` instead of Vertex AI; set `GOOGLE_CLOUD_PROJECT` instead
@@ -82,13 +87,17 @@ my-agent/
 
 ### Creating Custom Metrics
 
-Metrics live in `eval/metrics/metric_definitions.json`. Users can create them in two ways:
+Metrics live in `tests/eval/metrics/metric_definitions.json` (Path A) or `eval/metrics/metric_definitions.json` (Path B / legacy fallback). Users can create them in two ways:
 
-1. **AI generation** (recommended): Run `uv run agent-eval init` and choose "Generate with AI" in Step 3. Gemini analyzes the agent's source code, existing eval files, and user-stated evaluation priorities to create tailored metrics with correct `dataset_mapping` constraints, plus recommendations for scenarios and test data. If eval files already exist, they are backed up to `eval/.backup/` before updating.
+1. **AI generation** (recommended): Run `agent-eval init` and choose "Generate with AI" in Step 3. Select managed metrics (Google's built-in rubrics), then optionally generate custom metrics with Gemini. Custom metrics complement managed ones — they're tailored to the agent's specific behaviors. Re-running `init` preserves existing metrics and pre-checks previous selections. If eval files already exist, they are backed up to `tests/eval/.backup/` (or `eval/.backup/`) before updating.
 
 2. **Manual creation**: Help users write LLM-as-judge metrics with:
    - **CRITICAL:** `dataset_mapping` keys can ONLY be `prompt`, `response`, `reference` — the Vertex AI SDK crashes with any other name. Combine multiple data sources into `reference` using the `template` + `source_columns` syntax.
-   - **`applies_to`** controls which data a metric runs on: `"all"` (default), `"scenarios"` (multi-turn from simulate — no reference data, evaluates conversation flow), or `"golden_dataset"` (single-turn from interact — has reference data, evaluates correctness). Use `"golden_dataset"` for metrics that need expected answers, `"scenarios"` for trajectory/conversation metrics, `"all"` for general quality/safety.
+   - **Per-row capability flags** control which rows a metric runs on (replaces the legacy `applies_to` field):
+     - `"requires_reference": true` → only score rows that have reference / expected data (e.g. correctness checks).
+     - `"requires_multi_turn": true` → only score rows whose `user_inputs` has more than one turn (e.g. trajectory / conversation metrics).
+     - Neither flag set → run on every row (general quality, safety, etc.).
+     The evaluator routes per row via `dataset_io.detect_capabilities` — it inspects the row's actual columns instead of trusting a per-metric tag, so mixed-capability datasets just work. Legacy `applies_to: golden_dataset` still maps to `requires_reference: true` for backward compatibility.
    - Clear scoring criteria (what each score level means)
    - `dataset_mapping` pointing to the right trace fields
    - `Score: [X]` format in the template for reliable parsing
@@ -97,14 +106,14 @@ Metrics live in `eval/metrics/metric_definitions.json`. Users can create them in
 
 | Signal | Metric to Check | Fix |
 |--------|-----------------|-----|
-| Agent invents capabilities | `capability_honesty` < 3.0 | Add `**KNOWN LIMITATIONS**` to tool docstrings |
-| Agent takes wrong paths | `trajectory_accuracy` < 3.0 | Isolate into specialized sub-agents |
-| Tools called with bad args | `tool_use_quality` < 3.0 | Add Pydantic schemas, stricter types |
-| High latency, bloated context | `prompt_tokens` > 10,000 | Compact stale tool outputs, offload to disk |
-| Agent fabricates data on failure | `pipeline_integrity` < 3.0 | Add circuit breaker checks |
-| Low cache hits | `cache_hit_rate` < 50% | Put static instructions in `global_instruction` |
+| Agent invents capabilities | custom: `capability_honesty` < 3.0 | Add `**KNOWN LIMITATIONS**` to tool docstrings |
+| Agent takes wrong paths | custom: `trajectory_accuracy` < 3.0 | Isolate into specialized sub-agents |
+| Tools called with bad args | managed: `TOOL_USE_QUALITY` < 3.0 | Add Pydantic schemas, stricter types |
+| High latency, bloated context | deterministic: `prompt_tokens` > 10,000 | Compact stale tool outputs, offload to disk |
+| Agent fabricates data on failure | custom: `pipeline_integrity` < 3.0 | Add circuit breaker checks |
+| Low cache hits | deterministic: `cache_hit_rate` < 50% | Put static instructions in `global_instruction` |
 
-> The `analyze` command includes ADK-specific design patterns in its Gemini prompt, so the AI analysis provides actionable recommendations with code examples based on these patterns. The patterns are in `src/agent_eval/core/adk_optimization_patterns.py`.
+> The `analyze` command includes ADK-specific design patterns in its Gemini prompt, enabling actionable recommendations mapped to the five Context Engineering Principles. The patterns are in `src/agent_eval/core/adk_optimization_patterns.py`.
 
 ---
 
@@ -173,5 +182,5 @@ Instructions:
 
 1. **Always use Vertex AI**, not API keys (evaluation won't work otherwise)
 2. **Clear eval_history** before each ADK User Sim run — `simulate` does this automatically; if running manually: `rm -rf <agent_module>/.adk/eval_history/*`
-3. **Use `--location global`** for Gemini 2.5+ models in the analyze command
+3. **Location is auto-configured** — Gemini 3+ models use `global` automatically via `get_location()` in config.py. Override with `--location` if needed
 4. **`app_name` must match the folder name** containing `agent.py`, not the agent's display name

@@ -94,8 +94,8 @@ Your task is to explain *what changed in the code* and *what was the impact on m
 
 {focus_section}
 
-**Baseline Run:** {baseline_id}
-**Current Run:** {current_id}
+**Baseline Run:** {baseline_run_name} (experiment: {baseline_id})
+**Current Run:** {current_run_name} (experiment: {current_id})
 
 ---
 
@@ -301,6 +301,8 @@ Format your entire response as a single Markdown document.
             focus_section=self._build_focus_section(),
             baseline_id=comparison_data.get("baseline_id", "unknown"),
             current_id=comparison_data.get("current_id", "unknown"),
+            baseline_run_name=comparison_data.get("baseline_run_name", comparison_data.get("baseline_id", "unknown")),
+            current_run_name=comparison_data.get("current_run_name", comparison_data.get("current_id", "unknown")),
             comparison_table=comparison_table,
             git_diff_section=git_diff_section,
             current_summary=current_summary,

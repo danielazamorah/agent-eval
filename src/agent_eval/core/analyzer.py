@@ -102,15 +102,26 @@ def _classify_direction(metric_name: str, pct_change: float) -> tuple[str, str]:
     return "regression", "🔴"
 
 
-def compute_comparison(baseline_summary: dict, current_summary: dict) -> dict:
+def compute_comparison(
+    baseline_summary: dict,
+    current_summary: dict,
+    baseline_run_name: str = "",
+    current_run_name: str = "",
+    agent_dir: str | None = None,
+) -> dict:
     """Compute metric deltas between two evaluation runs.
 
     Args:
         baseline_summary: eval_summary.json content from the baseline run.
         current_summary: eval_summary.json content from the current run.
+        baseline_run_name: Folder name of the baseline run (user-friendly label).
+        current_run_name: Folder name of the current run (user-friendly label).
+        agent_dir: If provided, scope git diff to this directory so only
+            agent code changes are captured (not framework/docs changes).
 
     Returns:
-        Dict with baseline/current IDs, git info, deltas list, and new/removed metrics.
+        Dict with baseline/current IDs, run names, git info, deltas list,
+        and new/removed metrics.
     """
     b_overall = baseline_summary.get("overall_summary", {})
     c_overall = current_summary.get("overall_summary", {})
@@ -199,15 +210,18 @@ def compute_comparison(baseline_summary: dict, current_summary: dict) -> dict:
             "score_range": score_range or None,
         })
 
-    # --- Git diff ---
+    # --- Git diff (scoped to agent directory if provided) ---
     b_git = baseline_summary.get("git_info", {})
     c_git = current_summary.get("git_info", {})
     git_diff = ""
     if b_git.get("commit") and c_git.get("commit") and b_git["commit"] != c_git["commit"]:
         try:
+            cmd = ["git", "diff", b_git["commit"], c_git["commit"]]
+            if agent_dir:
+                # Scope diff to agent directory only — ignore framework/docs changes
+                cmd += ["--", agent_dir]
             diff_result = subprocess.run(
-                ["git", "diff", b_git["commit"], c_git["commit"]],
-                capture_output=True, text=True, timeout=10,
+                cmd, capture_output=True, text=True, timeout=10,
             )
             if diff_result.returncode == 0 and diff_result.stdout:
                 git_diff = diff_result.stdout[:5000]
@@ -219,6 +233,8 @@ def compute_comparison(baseline_summary: dict, current_summary: dict) -> dict:
     return {
         "baseline_id": baseline_summary.get("experiment_id", "unknown"),
         "current_id": current_summary.get("experiment_id", "unknown"),
+        "baseline_run_name": baseline_run_name or baseline_summary.get("experiment_id", "unknown"),
+        "current_run_name": current_run_name or current_summary.get("experiment_id", "unknown"),
         "baseline_git": b_git,
         "current_git": c_git,
         "deltas": deltas,
@@ -230,7 +246,9 @@ def compute_comparison(baseline_summary: dict, current_summary: dict) -> dict:
 
 def format_comparison_table(comparison: dict) -> str:
     """Format comparison deltas as a markdown table."""
-    lines = ["| Metric | Baseline | Current | Delta | % Change | Status |",
+    baseline_label = comparison.get("baseline_run_name", "Baseline")
+    current_label = comparison.get("current_run_name", "Current")
+    lines = [f"| Metric | {baseline_label} | {current_label} | Delta | % Change | Status |",
              "|--------|----------|---------|-------|----------|--------|"]
     for d in comparison["deltas"]:
         b_str = f"{d['baseline']:.2f}" if isinstance(d["baseline"], float) else str(d["baseline"])
@@ -593,10 +611,12 @@ class Analyzer:
                 entry += f"**Focus:** {focus}\n"
             entry += "\n*Baseline run — no comparison available yet.*\n"
         else:
-            entry = f"\n\n## Iteration {iteration} — {run_folder.name} vs {comparison['baseline_id']}\n\n"
+            baseline_name = comparison.get("baseline_run_name", comparison["baseline_id"])
+            current_name = comparison.get("current_run_name", run_folder.name)
+            entry = f"\n\n## Iteration {iteration} — {current_name} vs {baseline_name}\n\n"
             entry += f"**Date:** {timestamp}\n"
-            entry += f"**Current Run:** {comparison['current_id']} (`{run_folder.name}`)\n"
-            entry += f"**Baseline Run:** {comparison['baseline_id']}\n"
+            entry += f"**Current Run:** {current_name}\n"
+            entry += f"**Baseline Run:** {baseline_name}\n"
 
             # Git info
             c_git = comparison.get("current_git", {})
@@ -871,12 +891,20 @@ class Analyzer:
 
         # 2. Find baseline for comparison
         comparison_data = None
+        agent_dir = self.config.get("agent_dir")
+
         if compare_to:
             # Explicit baseline
+            compare_to_path = Path(compare_to)
             logger.debug("Loading baseline from %s", compare_to)
-            baseline_summary = self._load_baseline_summary(Path(compare_to))
+            baseline_summary = self._load_baseline_summary(compare_to_path)
             if baseline_summary:
-                comparison_data = compute_comparison(baseline_summary, current_summary)
+                comparison_data = compute_comparison(
+                    baseline_summary, current_summary,
+                    baseline_run_name=compare_to_path.name,
+                    current_run_name=run_folder.name,
+                    agent_dir=agent_dir,
+                )
                 logger.debug("Comparison computed: %d metrics compared", len(comparison_data['deltas']))
             else:
                 logger.warning("Could not load baseline from %s", compare_to)
@@ -891,12 +919,17 @@ class Analyzer:
                 logger.debug("Auto-detected previous run: %s", previous_run.name)
                 baseline_summary = self._load_baseline_summary(previous_run)
                 if baseline_summary:
-                    comparison_data = compute_comparison(baseline_summary, current_summary)
+                    comparison_data = compute_comparison(
+                        baseline_summary, current_summary,
+                        baseline_run_name=previous_run.name,
+                        current_run_name=run_folder.name,
+                        agent_dir=agent_dir,
+                    )
                     logger.debug("Comparison computed: %d metrics compared", len(comparison_data['deltas']))
             else:
                 logger.debug("No previous run found (this is the baseline)")
 
-        # Check if comparison is meaningful (code or questions actually changed)
+        # Check if comparison is meaningful (agent code actually changed)
         skip_comparison_call = False
         if comparison_data:
             b_git = comparison_data.get("baseline_git", {})
@@ -906,13 +939,22 @@ class Analyzer:
                 and b_git["commit"] == c_git["commit"]
             )
             no_diff = not comparison_data.get("git_diff")
-            if same_commit and no_diff:
+            if same_commit or no_diff:
                 skip_comparison_call = True
-                logger.debug(
-                    "Same code (commit %s). Skipping comparison analysis — "
-                    "metric changes are due to LLM non-determinism.",
-                    c_git['commit'][:8],
-                )
+                if same_commit:
+                    logger.debug(
+                        "Same commit (%s). Skipping comparison analysis — "
+                        "metric changes are due to LLM non-determinism.",
+                        c_git['commit'][:8],
+                    )
+                else:
+                    logger.debug(
+                        "No agent code changes between commits %s..%s. "
+                        "Skipping comparison analysis — metric changes are "
+                        "due to LLM non-determinism, not code changes.",
+                        b_git.get('commit', '?')[:8],
+                        c_git.get('commit', '?')[:8],
+                    )
 
         # 3. Generate Gemini Analysis (Call 1 + optional Call 2)
         gemini_comparison_text = ""

@@ -82,7 +82,7 @@ def _display_metrics_summary(results_dir: str) -> None:
 
         if skipped:
             console.print(
-                f"  [dim]Note: {len(skipped)} metric(s) skipped (no matching data for their applies_to filter).[/]"
+                f"  [dim]Note: {len(skipped)} metric(s) skipped (no rows had the required capabilities — see logs).[/]"
             )
 
     # ── Key deterministic metrics ──────────────────────────────────────
@@ -121,11 +121,19 @@ def _display_metrics_summary(results_dir: str) -> None:
 @click.option("--input-label", default="manual", help="Label for this run (e.g. 'baseline').")
 @click.option("--test-description", default="Automated evaluation", help="Description of this evaluation run.")
 @click.option("--filter", "metric_filter", multiple=True, help="Metric filters (key:val).")
+@click.option("--gcs-dest", default=None,
+              help="GCS URI (gs://bucket/path/) to upload Vertex AI eval artifacts to. "
+                   "When set, evaluation runs through Vertex's managed pipeline and returns "
+                   "a dashboard URL alongside local scoring.")
 @click.option("--debug", is_flag=True, help="Show detailed logs from Vertex AI SDK and other services.")
-def evaluate(interaction_file, metrics_files, results_dir, input_label, test_description, metric_filter, debug):
+def evaluate(interaction_file, metrics_files, results_dir, input_label, test_description, metric_filter, gcs_dest, debug):
     """Run evaluation metrics on processed interaction data."""
     from agent_eval.core.evaluator import configure_logging
     configure_logging(debug=debug)
+
+    if gcs_dest and not gcs_dest.startswith("gs://"):
+        console.print(f"  [red]--gcs-dest must start with gs://[/] (got: {gcs_dest})")
+        sys.exit(1)
 
     console.print("\n[bold blue]Running Evaluation[/]")
     if len(interaction_file) > 1:
@@ -137,6 +145,7 @@ def evaluate(interaction_file, metrics_files, results_dir, input_label, test_des
         "metric_filters": None,
         "input_label": input_label,
         "test_description": test_description,
+        "gcs_dest": gcs_dest,
     }
 
     if metric_filter:
@@ -161,6 +170,11 @@ def evaluate(interaction_file, metrics_files, results_dir, input_label, test_des
 
         # ── Display metrics overview ───────────────────────────────────
         _display_metrics_summary(results_dir)
+
+        if gcs_dest:
+            console.print()
+            console.print(f"  [bold]Vertex AI managed pipeline:[/] artifacts uploaded to {gcs_dest}")
+            console.print("  [dim]Open the Vertex AI > Evaluations console to see the dashboard for this run.[/]")
 
         console.print()
         console.print(Panel(

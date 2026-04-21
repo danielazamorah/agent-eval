@@ -16,12 +16,11 @@ METRIC_TEMPLATES = {
         "is_managed": True,
         "managed_metric_name": "GENERAL_QUALITY",
         "use_gemini_format": True,
-        "applies_to": "all",
         "score_range": {"min": 0, "max": 1, "description": "Passing rate for quality rubrics"},
     },
     "trajectory_accuracy": {
         "metric_type": "llm",
-        "applies_to": "scenarios",
+        "requires_multi_turn": True,
         "score_range": {"min": 0, "max": 5, "description": "0=Wrong, 5=Perfect trajectory"},
         "dataset_mapping": {
             "prompt": {"source_column": "user_inputs"},
@@ -43,7 +42,6 @@ METRIC_TEMPLATES = {
     },
     "tool_use_quality": {
         "metric_type": "llm",
-        "applies_to": "all",
         "score_range": {"min": 0, "max": 5, "description": "0=Poor, 5=Excellent"},
         "dataset_mapping": {
             "prompt": {"source_column": "user_inputs"},
@@ -70,7 +68,6 @@ METRIC_TEMPLATES = {
         "is_managed": True,
         "managed_metric_name": "SAFETY",
         "use_gemini_format": True,
-        "applies_to": "all",
         "score_range": {"min": 0, "max": 1, "description": "Passing rate for safety rubrics"},
     },
 }
@@ -262,13 +259,17 @@ def _build_ai_golden_data(golden_recs: list, agent_name: str) -> dict:
         user_inputs = g.get("user_inputs", [])
         if not user_inputs and g.get("description"):
             user_inputs = [g["description"]]
+        ref = g.get("reference_data", {})
+        expected = ref.get("expected_behavior", "") if isinstance(ref, dict) else ""
+        if not expected:
+            expected = g.get("expected_behavior", g.get("description", ""))
         questions.append({
             "id": f"ai_generated_{i:03d}",
             "user_inputs": user_inputs,
             "agents_evaluated": [agent_name],
             "metadata": {"description": g.get("description", "")},
             "reference_data": {
-                "expected_behavior": g.get("expected_behavior", "")
+                "expected_behavior": expected
             },
         })
     return {"golden_questions": questions}
@@ -300,6 +301,151 @@ def _backup_existing_files(eval_dir: Path, mode: str) -> Path | None:
         shutil.copy2(f, dest)
 
     return backup_dir
+
+
+def scaffold_metrics_only(
+    target_dir: Path,
+    agent_name: str = "app",
+    metrics: list[str] | None = None,
+    custom_metric_definitions: dict | None = None,
+) -> None:
+    """Scaffold only ``tests/eval/metrics/metric_definitions.json`` (Path A use).
+
+    Path A doesn't need scenarios or golden datasets — ``agent-engine`` reads
+    ``tests/eval/dataset.jsonl`` directly and only needs the metric file to
+    know what to score against. Writes to the canonical unified layout.
+    """
+    eval_dir = target_dir / "tests" / "eval"
+    metric_defs = {"metrics": {}}
+
+    if custom_metric_definitions:
+        for key, defn in custom_metric_definitions.items():
+            if "agents" not in defn:
+                defn["agents"] = [agent_name]
+            metric_defs["metrics"][key] = defn
+    else:
+        if metrics is None:
+            metrics = ["general_quality", "tool_use_quality", "safety"]
+        for key in metrics:
+            if key in METRIC_TEMPLATES:
+                defn = dict(METRIC_TEMPLATES[key])
+                if "agents" not in defn:
+                    defn["agents"] = [agent_name]
+                metric_defs["metrics"][key] = defn
+
+    (eval_dir / "metrics").mkdir(parents=True, exist_ok=True)
+    (eval_dir / "results").mkdir(parents=True, exist_ok=True)
+    _write_if_missing(eval_dir / "results" / ".gitkeep", "")
+
+    metrics_path = eval_dir / "metrics" / "metric_definitions.json"
+    if metrics_path.exists() and custom_metric_definitions:
+        backup = _backup_existing_files(eval_dir, mode="dataset-only")
+        if backup:
+            console.print(f"  [dim]Previous metrics backed up to tests/eval/.backup/[/]")
+    if metrics_path.exists() and not custom_metric_definitions:
+        console.print(f"  [yellow]kept[/]     {eval_dir}/metrics/metric_definitions.json")
+    else:
+        metrics_path.write_text(json.dumps(metric_defs, indent=2) + "\n")
+        console.print(f"  [green]created[/]  {eval_dir}/metrics/metric_definitions.json")
+    console.print(f"  [green]created[/]  {eval_dir}/results/.gitkeep")
+
+
+def _rows_from_recommendations(
+    recommendations: dict | None,
+    session_inputs: dict,
+) -> list[dict]:
+    """Convert Gemini's recommendations dict into unified dataset.jsonl rows.
+
+    Maps the same shape that ``_build_ai_scenarios`` / ``_build_ai_golden_data``
+    produce for the legacy files, but emits canonical SDK columns instead:
+    - ``starting_prompt`` → ``prompt``; ``conversation_plan`` kept verbatim
+    - ``user_inputs[-1]`` → ``prompt``; earlier turns → ``conversation_history``
+    - ``reference_data.expected_behavior`` → ``reference``; other
+      ``reference_data.*`` keys flatten to top-level ``expected_*`` columns
+    Every row gets the supplied ``session_inputs``.
+    """
+    rows: list[dict] = []
+    if not recommendations:
+        return rows
+
+    for scen in recommendations.get("scenarios") or []:
+        prompt = scen.get("starting_prompt") or scen.get("description") or ""
+        if not prompt:
+            continue
+        row: dict = {"prompt": prompt, "session_inputs": session_inputs}
+        plan = scen.get("conversation_plan")
+        if plan:
+            row["conversation_plan"] = plan
+        rows.append(row)
+
+    for i, g in enumerate(recommendations.get("golden_data") or [], 1):
+        user_inputs = g.get("user_inputs") or []
+        if not user_inputs and g.get("description"):
+            user_inputs = [g["description"]]
+        if not user_inputs:
+            continue
+        row = {"prompt": user_inputs[-1], "session_inputs": session_inputs}
+        if len(user_inputs) > 1:
+            row["conversation_history"] = [
+                {"role": "user", "parts": [{"text": t}]} for t in user_inputs[:-1]
+            ]
+        ref_data = g.get("reference_data") or {}
+        for key, value in ref_data.items():
+            if not value:
+                continue
+            if key == "expected_behavior":
+                row["reference"] = value
+            else:
+                row[key] = value
+        if g.get("id"):
+            row["id"] = g["id"]
+        else:
+            row["id"] = f"ai_generated_{i:03d}"
+        rows.append(row)
+
+    return rows
+
+
+def scaffold_dataset_jsonl(
+    target_dir: Path,
+    agent_name: str = "app",
+    *,
+    recommendations: dict | None = None,
+) -> None:
+    """Scaffold ``tests/eval/dataset.jsonl`` for Path A (Agent Engine) usage.
+
+    When ``recommendations`` carries Gemini-generated ``scenarios`` and/or
+    ``golden_data``, those are converted into rows so Path A evaluates against
+    the user's actual agent (not generic "Hello" prompts) — the existing file
+    is backed up and replaced so re-running ``init --ai-metrics`` actually
+    refreshes content. Without recommendations, an existing file is preserved
+    and only fresh projects get the 2-row starter.
+    """
+    dataset_path = target_dir / "tests" / "eval" / "dataset.jsonl"
+
+    session_inputs = {"app_name": agent_name, "user_id": "eval_user", "state": {}}
+    ai_rows = _rows_from_recommendations(recommendations, session_inputs)
+
+    if dataset_path.exists() and not ai_rows:
+        console.print(f"  [yellow]kept[/]     {dataset_path}")
+        return
+
+    if dataset_path.exists() and ai_rows:
+        backup_root = target_dir / "tests" / "eval" / ".backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_root.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dataset_path, backup_root / "dataset.jsonl")
+        console.print(f"  [dim]Previous dataset backed up to {backup_root}[/]")
+
+    rows = ai_rows or [
+        {"prompt": "Hello, what can you help me with?", "session_inputs": session_inputs},
+        {"prompt": "Walk me through one of your most common tasks.", "session_inputs": session_inputs},
+    ]
+
+    dataset_path.parent.mkdir(parents=True, exist_ok=True)
+    with dataset_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    console.print(f"  [green]created[/]  {dataset_path} [dim]({len(rows)} rows)[/]")
 
 
 def _write_if_missing(path: Path, content: str) -> None:

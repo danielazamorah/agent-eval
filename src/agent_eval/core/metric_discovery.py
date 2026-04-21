@@ -96,6 +96,32 @@ _MULTI_TURN_METRICS = {
 # Metrics not useful for typical agent evaluation
 _EXCLUDED_METRICS = {"GECKO_TEXT2IMAGE", "GECKO_TEXT2VIDEO"}
 
+# Text-comparison metrics that need plain text on both sides (not the wrapped
+# API response object). Derived dynamically from the family classifier — only
+# `final_response_match_v2` falls into this category today, but using the
+# classifier means any future text-comparison metric is handled automatically.
+def requires_reference(managed_metric_name: str) -> bool:
+    """Whether a managed metric needs reference data to score meaningfully.
+
+    Delegates to ``metric_families.reference_requirement``. Treats both
+    ``required`` (computation/translation: SDK raises ValueError) and
+    ``expected`` (text-comparison rubrics) as needing reference.
+    """
+    from agent_eval.core import metric_families
+    return metric_families.reference_requirement(managed_metric_name) in ("required", "expected")
+
+
+def default_response_field(managed_metric_name: str) -> Optional[str]:
+    """Preferred response-side column for a managed metric, if not the default.
+
+    Returns ``"final_response"`` for text-comparison metrics (need plain text on
+    both sides), else ``None`` (use the wrapped API ``response`` column).
+    """
+    from agent_eval.core import metric_families
+    if metric_families.reference_requirement(managed_metric_name) == "expected":
+        return "final_response"
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Core discovery functions
@@ -181,7 +207,9 @@ def discover_managed_metrics(exclude_embedding: bool = True) -> Dict[str, Dict[s
             "score_range": _SCORE_RANGES.get(
                 name_upper, {"min": 0, "max": 1, "type": "unknown"}
             ),
-            "applies_to": "scenarios" if is_multi_turn else "all",
+            "requires_reference": requires_reference(name_upper),
+            "requires_multi_turn": is_multi_turn,
+            "default_response_field": default_response_field(name_upper),
         }
 
         if not api_pred and name_upper in _GCS_PLACEHOLDERS:
@@ -191,7 +219,7 @@ def discover_managed_metrics(exclude_embedding: bool = True) -> Dict[str, Dict[s
 
     api_count = sum(1 for m in metrics.values() if m["resolution"] == "api_predefined")
     gcs_count = sum(1 for m in metrics.values() if m["resolution"] == "gcs_yaml")
-    logger.info(
+    logger.debug(
         "Discovered %d managed metrics (%d API predefined, %d GCS YAML)",
         len(metrics), api_count, gcs_count,
     )
@@ -325,7 +353,7 @@ def format_metrics_for_prompt(metrics: Optional[Dict[str, Dict]] = None) -> str:
         "### Server-Side Metrics (API Predefined)",
         "Evaluated server-side using raw request/response Content objects.",
         "",
-        f"{'Name':<35} {'Score':<15} {'Applies To':<12} Description",
+        f"{'Name':<35} {'Score':<15} {'Runs On':<14} Description",
         "-" * 105,
     ]
 
@@ -333,9 +361,10 @@ def format_metrics_for_prompt(metrics: Optional[Dict[str, Dict]] = None) -> str:
         info = api_predefined[name]
         sr = info.get("score_range", {})
         score_str = f"{sr.get('min', '?')}-{sr.get('max', '?')} ({sr.get('type', '?')})"
+        runs_on = "multi-turn" if info.get("requires_multi_turn") else "any row"
         lines.append(
             f"{info['managed_metric_name']:<35} {score_str:<15} "
-            f"{info['applies_to']:<12} {info['description'][:50]}"
+            f"{runs_on:<14} {info['description'][:50]}"
         )
 
     lines += [
@@ -344,7 +373,7 @@ def format_metrics_for_prompt(metrics: Optional[Dict[str, Dict]] = None) -> str:
         "Evaluated client-side; prompt templates are downloaded from GCS.",
         "These need standard prompt/response columns (NOT raw request/response).",
         "",
-        f"{'Name':<35} {'Score':<15} {'Applies To':<12} Description",
+        f"{'Name':<35} {'Score':<15} {'Runs On':<14} Description",
         "-" * 105,
     ]
 
@@ -354,9 +383,10 @@ def format_metrics_for_prompt(metrics: Optional[Dict[str, Dict]] = None) -> str:
         score_str = f"{sr.get('min', '?')}-{sr.get('max', '?')} ({sr.get('type', '?')})"
         placeholders = info.get("template_placeholders", [])
         ph_str = f" [needs: {', '.join(placeholders)}]" if placeholders else ""
+        runs_on = "multi-turn" if info.get("requires_multi_turn") else "any row"
         lines.append(
             f"{info['managed_metric_name']:<35} {score_str:<15} "
-            f"{info['applies_to']:<12} {info['description'][:40]}{ph_str}"
+            f"{runs_on:<14} {info['description'][:40]}{ph_str}"
         )
 
     return "\n".join(lines)
@@ -422,8 +452,13 @@ def get_metric_definition_entry(metric_key: str, metrics: Optional[Dict] = None)
         "is_managed": True,
         "managed_metric_name": info["managed_metric_name"],
         "use_gemini_format": info["use_gemini_format"],
-        "applies_to": info["applies_to"],
         "score_range": info["score_range"],
+        "requires_reference": info.get("requires_reference", False),
+        "requires_multi_turn": info.get("requires_multi_turn", False),
     }
+
+    default_resp = info.get("default_response_field")
+    if default_resp:
+        entry["default_response_field"] = default_resp
 
     return entry

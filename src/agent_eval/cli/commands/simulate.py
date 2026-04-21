@@ -13,6 +13,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
+from agent_eval.cli._pacing import _continue
+
 console = Console()
 
 # Base args for running ADK commands in the agent's project context.
@@ -440,6 +442,7 @@ def simulate(agent_dir, eval_dir, run_id, debug):
         border_style="blue",
         padding=(1, 2),
     ))
+    _continue("Press Enter to start the simulation →", console=console)
 
     # ── Execute steps ───────────────────────────────────────────────────────
 
