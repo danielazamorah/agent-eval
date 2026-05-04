@@ -8,12 +8,19 @@ dependencies = [
     "rich>=13.0.0",
     "pandas>=2.0.0",
     "requests>=2.31.0",
-    "google-cloud-aiplatform[evaluation,agent-engines]>=1.132.0",
+    "google-cloud-aiplatform[evaluation,agent-engines]>=1.132.0,<1.140.0",
     "db-dtypes>=1.4.2,<2.0.0",
     "google-cloud-bigquery>=3.25.0",
     "google-adk>=1.22.0",
     "tqdm>=4.66.0",
+    "questionary>=2.0.0",
     "pydantic-settings>=2.12.0",
+]
+
+[project.optional-dependencies]
+dashboard = [
+    "gradio>=6.3.0",
+    "plotly>=6.5.2",
 ]
 
 [project.scripts]
@@ -35,3 +42,7 @@ dev = [
     "pytest-cov>=7.0.0",
     "ruff>=0.14.11",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["my-agent", "agents", ".venv", ".backup", "build", "dist"]

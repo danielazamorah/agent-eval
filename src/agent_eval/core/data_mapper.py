@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -9,7 +10,12 @@ logger = logging.getLogger("agent_eval")
 
 
 def robust_json_loads(x: Any) -> Optional[Union[Dict, List, str]]:
-    """Safely parse a JSON string, returning None for invalid or empty inputs."""
+    """Safely parse a JSON string, returning None for invalid or empty inputs.
+
+    Falls back on ``ast.literal_eval`` for Python-repr forms that survive a
+    CSV roundtrip (pandas writes ``{'k': 'v'}`` with single quotes; json
+    rejects those but literal_eval accepts).
+    """
     if x is None:
         return None
     if isinstance(x, (dict, list)):
@@ -19,7 +25,88 @@ def robust_json_loads(x: Any) -> Optional[Union[Dict, List, str]]:
     try:
         return json.loads(x)
     except (json.JSONDecodeError, TypeError):
-        return x
+        pass
+    try:
+        parsed = ast.literal_eval(x)
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    except (ValueError, SyntaxError, MemoryError):
+        pass
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Reference resolution
+# ---------------------------------------------------------------------------
+
+# Conventional field names for the "expected" output, ordered by how
+# strongly each one signals the canonical reference. Add domain-specific
+# names here as new agent patterns appear.
+_REFERENCE_FIELD_PRIORITY: List[str] = [
+    "expected_response",
+    "expected_behavior",
+    "expected_output",
+    "expected_answer",
+    "ground_truth",
+    "reference",
+    "gold_response",
+]
+
+
+def _stringify_reference_value(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        try:
+            return json.dumps(val, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(val)
+    return str(val)
+
+
+def extract_reference_text(
+    reference_data: Any,
+    preferred_field: Optional[str] = None,
+) -> str:
+    """Resolve a reference string from a reference_data dict.
+
+    Lookup order:
+      1. The explicit `preferred_field` from the metric's `reference_field` setting
+      2. Any field in `_REFERENCE_FIELD_PRIORITY` that has a non-empty value
+      3. Concatenate all populated string-like fields as `key: value` pairs
+         so the judge model still has SOMETHING to compare against
+
+    The dict-fallback (step 3) is what makes this resilient — users can put
+    arbitrary domain-specific fields in `reference_data` (e.g. `expected_docs`,
+    `expected_tool_calls`, `expected_citations`) and they will still reach
+    the metric judge.
+    """
+    if not isinstance(reference_data, dict) or not reference_data:
+        return ""
+
+    if preferred_field:
+        val = reference_data.get(preferred_field)
+        text = _stringify_reference_value(val)
+        if text.strip():
+            return text
+
+    for field in _REFERENCE_FIELD_PRIORITY:
+        val = reference_data.get(field)
+        text = _stringify_reference_value(val)
+        if text.strip():
+            return text
+
+    parts: List[str] = []
+    for k, v in reference_data.items():
+        text = _stringify_reference_value(v)
+        if text.strip():
+            parts.append(f"{k}: {text}")
+    return "\n".join(parts)
+
+
+def reference_field_candidates() -> List[str]:
+    """Return the conventional reference field names (read-only copy)."""
+    return list(_REFERENCE_FIELD_PRIORITY)
 
 
 def convert_interactions_to_events(

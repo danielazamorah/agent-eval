@@ -176,9 +176,22 @@ def synthesize_trace_from_events(
     return spans
 
 class AdkHistoryConverter:
-    def __init__(self, agent_dir: str, questions_file: Optional[str] = None):
+    def __init__(
+        self,
+        agent_dir: str,
+        questions_file: Optional[str] = None,
+        prompt_to_reference: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         self.agent_dir = agent_dir
         self.golden_map = self._load_golden_map(questions_file) if questions_file else {}
+        # ADK auto-assigns its own `eval_id` per case (a random hex like
+        # `d80d2c8b`) — so the golden_map (keyed by our `id`) won't match
+        # sim traces. The prompt_to_reference fallback is keyed by the
+        # scenario's `starting_prompt` (which IS preserved verbatim as the
+        # first user message in the trace), so multi-turn rows with
+        # reference_data flow through. Built by run.py from dataset.jsonl
+        # before invoking the converter.
+        self.prompt_to_reference: Dict[str, Dict[str, Any]] = prompt_to_reference or {}
 
     def _load_golden_map(self, filepath: str) -> Dict[str, Dict[str, Any]]:
         """Loads Golden Dataset to merge reference data based on ID."""
@@ -193,6 +206,17 @@ class AdkHistoryConverter:
         except Exception as e:
             logger.warning("Could not load golden dataset: %s", e)
         return mapping
+
+    def _resolve_reference_data(self, eval_id: str, user_inputs: List[str]) -> Dict[str, Any]:
+        """Try the golden_map (keyed by row id) first; fall back to
+        prompt_to_reference (keyed by the scenario's starting_prompt) so
+        sim traces inherit reference_data from the source dataset row."""
+        golden_q = self.golden_map.get(eval_id, {})
+        if golden_q.get("reference_data"):
+            return golden_q["reference_data"]
+        if user_inputs and user_inputs[0] in self.prompt_to_reference:
+            return self.prompt_to_reference[user_inputs[0]]
+        return {}
 
     def process_file(self, file_path: str) -> List[Dict[str, Any]]:
         data = robust_json_load(file_path)
@@ -363,9 +387,12 @@ class AdkHistoryConverter:
                     text = "".join([p.get("text", "") for p in parts])
                     if text: user_inputs.append(text)
 
-            # 6. Merge with Golden Data (if available)
+            # 6. Merge with reference data — try the id-keyed golden_map
+            # first (legacy questions_file), fall back to the prompt-keyed
+            # map (sim path: ADK assigns its own eval_id, so we join by
+            # the trace's first user message back to the source dataset row).
+            reference_data = self._resolve_reference_data(eval_id, user_inputs)
             golden_q = self.golden_map.get(eval_id, {})
-            reference_data = golden_q.get("reference_data", {})
             question_metadata = golden_q.get("metadata", {})
 
             # 7. Build contents for Gemini batch format (multi-turn conversations)
@@ -565,6 +592,9 @@ class AdkHistoryConverter:
         }
 
         golden_q = self.golden_map.get(eval_id, {})
+        # Same per-row resolution as the legacy format above — try id-keyed
+        # golden_map first, fall back to prompt-keyed map (sim path).
+        resolved_ref = self._resolve_reference_data(eval_id, user_inputs)
 
         row = {
             "request": {"contents": contents},
@@ -582,7 +612,7 @@ class AdkHistoryConverter:
             "question_metadata": golden_q.get("metadata", {}),
             "interaction_datetime": datetime.now().isoformat(),
             "USER": os.environ.get("USER", "simulator"),
-            "reference_data": golden_q.get("reference_data", {}),
+            "reference_data": resolved_ref,
             "missing_information": {"boolean": False},
             "final_session_state": {},
             "session_trace": synthetic_trace,

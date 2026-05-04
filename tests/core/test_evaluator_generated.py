@@ -128,12 +128,14 @@ class TestEvaluator(unittest.TestCase):
             for record in input_data:
                 f.write(json.dumps(record) + "\n")
         
-        # Mock Metrics
+        # Mock Metrics — canonical schema (kind: custom_llm_judge with criteria + rating_scores)
         mock_load_metrics.return_value = {
             "test_metric": {
-                "metric_type": "llm",
+                "kind": "custom_llm_judge",
                 "agents": ["agent1"],
-                "template": "test prompt"
+                "instruction": "Test instruction",
+                "criteria": {"only": "test criterion"},
+                "rating_scores": {"1": "Pass", "0": "Fail"},
             }
         }
         
@@ -141,8 +143,8 @@ class TestEvaluator(unittest.TestCase):
         mock_future = MagicMock()
         mock_parsed_df = pd.DataFrame([{"original_index": 0, "test_metric/score": 5.0}])
         mock_input_df = pd.DataFrame(input_data)
-        # return (parsed_results_df, metric_name, input_dataset_df)
-        mock_future.result.return_value = (mock_parsed_df, "test_metric", mock_input_df)
+        # return (parsed_results_df, metric_name, input_dataset_df, error_info)
+        mock_future.result.return_value = (mock_parsed_df, "test_metric", mock_input_df, None)
 
         # Setup Executor Mock
         mock_executor_instance = mock_executor_cls.return_value.__enter__.return_value

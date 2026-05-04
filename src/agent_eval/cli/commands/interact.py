@@ -12,6 +12,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
+from agent_eval.cli._pacing import _continue
 from agent_eval.core.interactions import InteractionRunner
 from agent_eval.core.processor import InteractionProcessor
 from agent_eval.core.converters import write_jsonl
@@ -49,8 +50,8 @@ def _prompt_for_config(agent_dir, app_name, questions_file, base_url, results_di
         console.print()
         console.print(Panel(
             "[bold]Point to your agent module[/] — the folder containing agent.py.\n\n"
-            "[dim]agent-eval will look for eval/ files (golden dataset, metrics)\n"
-            "relative to this directory.[/]",
+            "[dim]agent-eval will look for tests/eval/dataset.jsonl + tests/eval/metrics/\n"
+            "relative to its project root (the nearest pyproject.toml).[/]",
             title="[bold]Agent Directory[/]",
             border_style="blue",
             padding=(1, 2),
@@ -81,9 +82,9 @@ def _prompt_for_config(agent_dir, app_name, questions_file, base_url, results_di
 
         console.print()
         console.print(Panel(
-            "[bold]Path to your golden dataset[/] — a JSON file with test queries.\n\n"
-            "[dim]Each entry has a question and optional reference data for scoring.\n"
-            "Created by `agent-eval init` at eval/eval_data/golden_dataset.json.[/]",
+            "[bold]Path to your test queries.[/]\n\n"
+            "[dim]Defaults to the unified tests/eval/dataset.jsonl scaffolded by\n"
+            "`agent-eval init`. Single-turn rows are auto-filtered for interact.[/]",
             title="[bold]Questions File[/]",
             border_style="blue",
             padding=(1, 2),
@@ -122,7 +123,7 @@ def _prompt_for_config(agent_dir, app_name, questions_file, base_url, results_di
         console.print(Panel(
             "[bold]Give this run a name[/] so you can easily find it later.\n\n"
             "Examples: [cyan]baseline[/], [cyan]v2-tool-hardening[/], [cyan]cache-optimization[/]\n\n"
-            "[dim]Results will be saved to eval/results/<run-id>/.\n"
+            "[dim]Results will be saved to tests/eval/results/<run-id>/.\n"
             "Press Enter to use an auto-generated timestamp instead.[/]",
             title="[bold]Run ID[/]",
             border_style="blue",
@@ -196,6 +197,7 @@ def interact(agent_dir, app_name, questions_file, base_url, user_id, results_dir
         border_style="blue",
         padding=(1, 2),
     ))
+    _continue("Press Enter to start interacting →", console=console)
 
     # ── Build config ───────────────────────────────────────────────────────
 
@@ -306,14 +308,14 @@ def interact(agent_dir, app_name, questions_file, base_url, user_id, results_dir
     console.print()
     console.print("[bold]1.[/] Run deterministic + LLM-as-judge metrics:")
     console.print()
-    console.print(f"uv run agent-eval evaluate \\")
+    console.print(f"agent-eval evaluate \\")
     console.print(f"  --interaction-file {rel_output} \\")
     console.print(f"  --metrics-files {rel_metrics} \\")
     console.print(f"  --results-dir {rel_run}")
     console.print()
     console.print("[bold]2.[/] Generate AI-powered analysis:")
     console.print()
-    console.print(f"uv run agent-eval analyze \\")
+    console.print(f"agent-eval analyze \\")
     console.print(f"  --results-dir {rel_run} \\")
     console.print(f"  --agent-dir {rel_agent}")
     console.print()

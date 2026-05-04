@@ -83,15 +83,25 @@ def test_init_creates_eval_structure():
         ])
         assert result.exit_code == 0
 
-        eval_dir = Path(tmpdir) / "eval"
+        # Phase D: unified layout at <project_root>/tests/eval/. No more
+        # eval/scenarios/ or eval/eval_data/ split — multi-turn rows live
+        # in dataset.jsonl and simulate.py projects them at runtime.
+        eval_dir = Path(tmpdir) / "tests" / "eval"
         assert (eval_dir / "metrics" / "metric_definitions.json").exists()
-        assert (eval_dir / "scenarios" / "session_input.json").exists()
-        assert (eval_dir / "scenarios" / "conversation_scenarios.json").exists()
-        assert (eval_dir / "eval_data" / "golden_dataset.json").exists()
+        assert (eval_dir / "dataset.jsonl").exists()
 
-        # Verify agent name is injected
-        session = json.loads((eval_dir / "scenarios" / "session_input.json").read_text())
-        assert session["app_name"] == "test_agent"
+        # Session inputs are now embedded per-row in dataset.jsonl, not
+        # in a separate session_input.json file.
+        rows = [
+            json.loads(line)
+            for line in (eval_dir / "dataset.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        assert rows, "scaffold must seed at least one starter row"
+        first_session = next(
+            (r["session_inputs"] for r in rows if r.get("session_inputs")), None
+        )
+        assert first_session is not None and first_session["app_name"] == "test_agent"
 
         metrics = json.loads((eval_dir / "metrics" / "metric_definitions.json").read_text())
         assert "general_quality" in metrics["metrics"]

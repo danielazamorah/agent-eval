@@ -187,7 +187,7 @@ celerybeat.pid
 my_env.tfvars
 .saved_chats
 .requirements.txt
-my-agent/
+agents/
 
 # Evaluation Results
 evaluation/results/
@@ -197,3 +197,9 @@ retail-ai-location-strategy/dev_log.txt
 gitingest.txt
 .gitignore
 types.txt
+
+# Local-only
+
+.claude/
+.gemini/
+reset_auth.md
