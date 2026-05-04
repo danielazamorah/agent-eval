@@ -33,25 +33,29 @@ _PLACEHOLDER_RESOURCE_VALUES = {"None", "", None}
 class PathDetection:
     """Result of probing a working directory for an execution path.
 
-    The ``path`` field still reports the **primary** detection (A wins over B
-    when both are present) so existing callers keep working. New callers should
-    inspect ``has_both()`` and ``local_agents`` to know that Path B is *also*
-    available alongside Path A — the two paths are complementary, not
-    exclusive.
+    The ``path`` field still reports the **primary** detection (deployed
+    Agent Engine wins over local source when both are present) so existing
+    callers keep working. New callers should inspect ``has_both()`` and
+    ``local_agents`` to know that local source is *also* available alongside
+    the deployment — the two surfaces are complementary, not exclusive.
+
+    Note: ``path`` retains the legacy "A"/"B" enum values for now. They are
+    INTERNAL-ONLY identifiers — never surface "Path A" or "Path B" in
+    user-facing output (CLAUDE.md hard rule #10).
     """
 
-    path: str  # "A", "B", or "unknown"
+    path: str  # "A" (deployed Agent Engine) | "B" (local source) | "unknown"
     evidence: str = ""
     agent_engine_resource: Optional[str] = None
     local_agents: List[Path] = field(default_factory=list)
 
     def has_both(self) -> bool:
-        """True when both Path A (Agent Engine) and Path B (local agent) are available."""
+        """True when both a deployed Agent Engine AND a local agent are available."""
         return self.agent_engine_resource is not None and bool(self.local_agents)
 
 
 # ---------------------------------------------------------------------------
-# Path A signals — Agent Engine deployment
+# Deployed Agent Engine signals
 # ---------------------------------------------------------------------------
 
 def _resource_from_metadata_file(path: Path) -> Optional[str]:
@@ -125,7 +129,7 @@ def _detect_agent_engine(cwd: Path) -> Optional[PathDetection]:
 
 
 # ---------------------------------------------------------------------------
-# Path B signals — local ADK agent
+# Local ADK agent signals
 # ---------------------------------------------------------------------------
 
 def _find_local_agents(cwd: Path) -> List[Path]:

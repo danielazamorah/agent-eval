@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 from typing import Any, Dict, List, Optional, Union
@@ -9,7 +10,12 @@ logger = logging.getLogger("agent_eval")
 
 
 def robust_json_loads(x: Any) -> Optional[Union[Dict, List, str]]:
-    """Safely parse a JSON string, returning None for invalid or empty inputs."""
+    """Safely parse a JSON string, returning None for invalid or empty inputs.
+
+    Falls back on ``ast.literal_eval`` for Python-repr forms that survive a
+    CSV roundtrip (pandas writes ``{'k': 'v'}`` with single quotes; json
+    rejects those but literal_eval accepts).
+    """
     if x is None:
         return None
     if isinstance(x, (dict, list)):
@@ -19,7 +25,14 @@ def robust_json_loads(x: Any) -> Optional[Union[Dict, List, str]]:
     try:
         return json.loads(x)
     except (json.JSONDecodeError, TypeError):
-        return x
+        pass
+    try:
+        parsed = ast.literal_eval(x)
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    except (ValueError, SyntaxError, MemoryError):
+        pass
+    return x
 
 
 # ---------------------------------------------------------------------------

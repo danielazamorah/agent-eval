@@ -120,17 +120,35 @@ def remote_code(name: str, code_snippet: str):
     return vt.Metric(name=name, remote_custom_function=code_snippet)
 
 
+def computation(name: str, metric_name: str):
+    """Wrap a built-in computation metric as ``types.Metric``.
+
+    Per docs/determine-eval, ``types.Metric(name='bleu' | 'rouge_l' |
+    'exact_match' | 'tool_*' | ...)`` — the SDK dispatches by name. The set
+    of valid ``metric_name`` values is introspected from
+    ``metric_families._supported_computation()``; we don't hardcode here.
+
+    ``name`` is what users see in the result table (their friendly name);
+    ``metric_name`` is what the SDK computes.
+    """
+    vt = _vt()
+    return vt.Metric(name=name or metric_name, metric_name=metric_name)
+
+
 # ---------------------------------------------------------------------------
 # Schema-driven dispatch
 # ---------------------------------------------------------------------------
 
-_KNOWN_KINDS = frozenset({
-    "managed",
-    "parametrized_managed",
-    "custom_llm_judge",
-    "python_function",
-    "remote_code",
-})
+# Single source of truth — see ``core/metric_schema.py``.
+from agent_eval.core.metric_schema import (  # noqa: E402
+    ALL_KINDS as _KNOWN_KINDS,
+    KIND_MANAGED,
+    KIND_PARAMETRIZED_MANAGED,
+    KIND_CUSTOM_LLM_JUDGE,
+    KIND_COMPUTATION,
+    KIND_PYTHON_FUNCTION,
+    KIND_REMOTE_CODE,
+)
 
 
 def _load_python_callable(module_path: str | Path, function: str) -> Callable:
@@ -152,7 +170,16 @@ def _load_python_callable(module_path: str | Path, function: str) -> Callable:
 
 
 def build_metric(name: str, spec: Dict[str, Any], *, base_dir: Path | None = None):
-    """Build a single SDK metric object from a unified-schema entry."""
+    """Build a single SDK metric object from a canonical-schema entry.
+
+    Six supported ``kind`` values, mirroring the docs at
+    https://cloud.google.com/vertex-ai/generative-ai/docs/models/determine-eval
+
+    Raises ``ValueError`` if ``kind`` is missing/unknown or the per-kind
+    required fields aren't present. There is no back-compat for our previous
+    internal ``template`` + ``score_range`` shape — the canonical schema is the
+    only accepted form.
+    """
     kind = (spec.get("kind") or "").lower()
     if kind not in _KNOWN_KINDS:
         raise ValueError(
@@ -160,7 +187,7 @@ def build_metric(name: str, spec: Dict[str, Any], *, base_dir: Path | None = Non
             f"Expected one of {sorted(_KNOWN_KINDS)}, got {kind!r}."
         )
 
-    if kind in ("managed", "parametrized_managed"):
+    if kind in (KIND_MANAGED, KIND_PARAMETRIZED_MANAGED):
         base = spec.get("base", name)
         return parametrized_managed(
             base=base,
@@ -169,7 +196,7 @@ def build_metric(name: str, spec: Dict[str, Any], *, base_dir: Path | None = Non
             rubric_groups=spec.get("rubric_groups"),
         )
 
-    if kind == "custom_llm_judge":
+    if kind == KIND_CUSTOM_LLM_JUDGE:
         criteria = spec.get("criteria")
         rating_scores = spec.get("rating_scores")
         if not criteria or not rating_scores:
@@ -184,7 +211,16 @@ def build_metric(name: str, spec: Dict[str, Any], *, base_dir: Path | None = Non
             instruction=spec.get("instruction"),
         )
 
-    if kind == "python_function":
+    if kind == KIND_COMPUTATION:
+        metric_name = spec.get("metric_name")
+        if not metric_name:
+            raise ValueError(
+                f"Metric '{name}' (computation): 'metric_name' is required "
+                f"(e.g. 'bleu', 'rouge_l', 'exact_match'). The SDK dispatches by name."
+            )
+        return computation(name, metric_name)
+
+    if kind == KIND_PYTHON_FUNCTION:
         module = spec.get("module")
         function = spec.get("function")
         if not module or not function:
@@ -197,7 +233,7 @@ def build_metric(name: str, spec: Dict[str, Any], *, base_dir: Path | None = Non
         fn = _load_python_callable(module_path, function)
         return python_function(name, fn)
 
-    if kind == "remote_code":
+    if kind == KIND_REMOTE_CODE:
         code = spec.get("code_snippet")
         if not code:
             raise ValueError(
@@ -229,7 +265,7 @@ def build_all(
 
 
 # ---------------------------------------------------------------------------
-# Path A bridge — wrap any built metric for create_evaluation_run
+# Agent Engine bridge — wrap any built metric for create_evaluation_run
 # ---------------------------------------------------------------------------
 
 def to_evaluation_run_metric(metric: Any):
@@ -275,8 +311,9 @@ def to_evaluation_run_metric(metric: Any):
             ),
         )
 
-    # Bare Metric with custom_function: in-process only; not supported in
-    # streamlined Path A. Caller must convert it to remote_code or skip.
+    # Bare Metric with custom_function: in-process only; not supported by
+    # the streamlined `agent-engine` runner. Caller must convert it to
+    # remote_code or skip.
     if isinstance(metric, vt.Metric) and getattr(metric, "custom_function", None):
         raise ValueError(
             f"Metric '{metric.name}' is a local Python function and cannot run "

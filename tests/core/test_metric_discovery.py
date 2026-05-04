@@ -129,19 +129,21 @@ class TestDiscoverManagedMetrics:
         # But our mock doesn't have GECKO, so all 20 non-_ attrs are LazyLoadedPrebuiltMetric
         assert len(metrics) >= 16
 
-    def test_api_predefined_metrics_have_use_gemini_true(self):
+    def test_api_predefined_metrics_carry_resolution(self):
+        # `resolution` is agent-eval discovery metadata that distinguishes the
+        # two server-side resolution paths (api_predefined vs gcs_yaml).
+        # Post-canonical-schema, the legacy `use_gemini_format` boolean is gone —
+        # the kind+base IS the SDK contract.
         from agent_eval.core.metric_discovery import discover_managed_metrics
         metrics = discover_managed_metrics()
-        for key, info in metrics.items():
-            if info["resolution"] == "api_predefined":
-                assert info["use_gemini_format"] is True, f"{key} should have use_gemini_format=True"
+        api = [info for info in metrics.values() if info["resolution"] == "api_predefined"]
+        assert api, "expected at least one api_predefined metric in the catalog"
 
-    def test_gcs_yaml_metrics_have_use_gemini_false(self):
+    def test_gcs_yaml_metrics_carry_resolution(self):
         from agent_eval.core.metric_discovery import discover_managed_metrics
         metrics = discover_managed_metrics()
-        for key, info in metrics.items():
-            if info["resolution"] == "gcs_yaml":
-                assert info["use_gemini_format"] is False, f"{key} should have use_gemini_format=False"
+        gcs = [info for info in metrics.values() if info["resolution"] == "gcs_yaml"]
+        assert gcs, "expected at least one gcs_yaml metric in the catalog"
 
     def test_multi_turn_metrics_have_requires_multi_turn_flag(self):
         from agent_eval.core.metric_discovery import discover_managed_metrics, _MULTI_TURN_METRICS
@@ -157,20 +159,21 @@ class TestDiscoverManagedMetrics:
         from agent_eval.core.metric_discovery import discover_managed_metrics, _MULTI_TURN_METRICS
         metrics = discover_managed_metrics()
         for key, info in metrics.items():
-            if info["managed_metric_name"] not in _MULTI_TURN_METRICS:
+            if info["base"] not in _MULTI_TURN_METRICS:
                 assert info["requires_multi_turn"] is False, (
                     f"{key} should not require multi-turn"
                 )
 
     def test_all_entries_have_required_fields(self):
+        # Canonical schema: every discovered metric is a `kind: managed` entry
+        # with `base` (the SDK metric name). `score_range` / `requires_*` are
+        # agent-eval discovery metadata carried alongside.
         from agent_eval.core.metric_discovery import discover_managed_metrics
         metrics = discover_managed_metrics()
         for key, info in metrics.items():
-            assert "managed_metric_name" in info, f"{key} missing managed_metric_name"
-            assert "metric_type" in info, f"{key} missing metric_type"
-            assert "is_managed" in info, f"{key} missing is_managed"
+            assert info.get("kind") == "managed", f"{key} should be kind=managed"
+            assert "base" in info, f"{key} missing base"
             assert "resolution" in info, f"{key} missing resolution"
-            assert "use_gemini_format" in info, f"{key} missing use_gemini_format"
             assert "score_range" in info, f"{key} missing score_range"
             assert "requires_reference" in info, f"{key} missing requires_reference"
             assert "requires_multi_turn" in info, f"{key} missing requires_multi_turn"
@@ -183,9 +186,8 @@ class TestGetMetricDefinitionEntry:
         from agent_eval.core.metric_discovery import get_metric_definition_entry
         entry = get_metric_definition_entry("general_quality")
         assert entry is not None
-        assert entry["is_managed"] is True
-        assert entry["managed_metric_name"] == "GENERAL_QUALITY"
-        assert entry["use_gemini_format"] is True
+        assert entry["kind"] == "managed"
+        assert entry["base"] == "GENERAL_QUALITY"
 
     def test_returns_none_for_unknown_metric(self):
         from agent_eval.core.metric_discovery import get_metric_definition_entry
@@ -193,16 +195,18 @@ class TestGetMetricDefinitionEntry:
         assert entry is None
 
     def test_gcs_metric_has_correct_format(self):
+        # GCS-resolved metrics still emit canonical kind=managed; the resolution
+        # path is internal discovery metadata (not part of the SDK schema).
         from agent_eval.core.metric_discovery import get_metric_definition_entry
         entry = get_metric_definition_entry("coherence")
         assert entry is not None
-        assert entry["use_gemini_format"] is False
+        assert entry["kind"] == "managed"
 
     def test_case_insensitive(self):
         from agent_eval.core.metric_discovery import get_metric_definition_entry
         entry = get_metric_definition_entry("SAFETY")
         assert entry is not None
-        assert entry["managed_metric_name"] == "SAFETY"
+        assert entry["base"] == "SAFETY"
 
 
 class TestFormatting:
@@ -220,12 +224,12 @@ class TestFormatting:
         text = format_metrics_for_prompt(metrics)
         # Check at least one API predefined and one GCS YAML are present
         has_api = any(
-            info["managed_metric_name"] in text
+            info["base"] in text
             for info in metrics.values()
             if info["resolution"] == "api_predefined"
         )
         has_gcs = any(
-            info["managed_metric_name"] in text
+            info["base"] in text
             for info in metrics.values()
             if info["resolution"] == "gcs_yaml"
         )

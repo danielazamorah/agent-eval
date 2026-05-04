@@ -11,14 +11,90 @@ from agent_eval.core.agent_client import AgentClient
 logger = logging.getLogger("agent_eval.interactions")
 
 def get_golden_questions(filepath: str) -> List[Dict[str, Any]]:
-    """Loads questions from a JSON file."""
+    """Loads single-turn questions from either the unified ``dataset.jsonl``
+    or a legacy ``golden_dataset.json``.
+
+    Unified ``dataset.jsonl`` is the new source of truth (one file across
+    all paths — interact, simulate, agent-engine). Multi-turn rows are
+    skipped because ``interact`` is single-turn DIY; multi-turn rows belong
+    to ``simulate``. Legacy ``golden_dataset.json`` keeps loading until a
+    project migrates.
+    """
+    p = filepath if isinstance(filepath, str) else str(filepath)
+    if p.endswith(".jsonl"):
+        from agent_eval.core.dataset_io import read_dataset, is_single_turn
+        try:
+            rows = read_dataset(p)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Dataset file not found at '{p}'")
+        questions: List[Dict[str, Any]] = []
+        skipped_multi_turn = 0
+        for i, row in enumerate(rows):
+            if not is_single_turn(row):
+                skipped_multi_turn += 1
+                continue
+            questions.append(_unified_row_to_question(row, default_id=f"row_{i:03d}"))
+        if skipped_multi_turn:
+            logger.info(
+                "interact: skipping %d multi-turn row(s) — those are scored "
+                "by `agent-eval simulate`. Use single-turn rows for interact.",
+                skipped_multi_turn,
+            )
+        return questions
+
     try:
-        with open(filepath) as f:
+        with open(p) as f:
             data = json.load(f)
-            # Support both 'questions' (consolidated) and 'golden_questions' (source)
+            # Legacy: support both 'questions' (consolidated) and 'golden_questions' (source)
             return data.get("questions") or data.get("golden_questions", [])
     except FileNotFoundError:
-        raise FileNotFoundError(f"Questions file not found at '{filepath}'")
+        raise FileNotFoundError(f"Questions file not found at '{p}'")
+
+
+def _unified_row_to_question(row: Dict[str, Any], *, default_id: str) -> Dict[str, Any]:
+    """Adapt a unified ``dataset.jsonl`` row to the legacy ``question_data``
+    shape ``process_single_question`` consumes (``user_inputs``, ``id``,
+    ``metadata``, ``reference_data``, ``agents_evaluated``).
+
+    Bridges the unified-source-of-truth refactor without disturbing the
+    rest of the interact pipeline. Once the pipeline natively understands
+    unified rows, this adapter goes away.
+    """
+    prompt = row.get("prompt") or ""
+    user_inputs = [prompt] if prompt else []
+
+    metadata = dict(row.get("metadata") or {})
+
+    # Rebuild reference_data, preserving the canonical nested shape from
+    # dataset.jsonl. Three input shapes are supported:
+    #   1. NESTED (canonical):  row["reference_data"] = {expected_behavior: ..., expected_facts: ...}
+    #   2. TOP-LEVEL (legacy):  row["expected_response"], row["expected_facts"], ...
+    #   3. STRING (legacy):     row["reference"] = "..."  → expected_response
+    # Without this merge, custom_llm_judge metrics that rely on per-row
+    # reference fields (e.g. dataset_mapping.reference.source_column =
+    # "reference_data:expected_facts") silently get every row skipped at
+    # evaluate time.
+    reference_data: Dict[str, Any] = {}
+    nested_ref = row.get("reference_data")
+    if isinstance(nested_ref, dict):
+        reference_data.update({
+            k: v for k, v in nested_ref.items()
+            if v not in (None, "", [])
+        })
+    if row.get("reference"):
+        reference_data.setdefault("expected_response", row["reference"])
+    for k, v in row.items():
+        if k.startswith("expected_") and v not in (None, "", []):
+            reference_data[k] = v
+    agents_evaluated = metadata.pop("agents_evaluated", None) or row.get("agents_evaluated", [])
+
+    return {
+        "id": row.get("id") or default_id,
+        "user_inputs": user_inputs,
+        "metadata": metadata,
+        "reference_data": reference_data,
+        "agents_evaluated": agents_evaluated,
+    }
 
 def filter_questions_by_metadata(questions: List[Dict[str, Any]], filters: Dict[str, List[str]]) -> List[Dict[str, Any]]:
     """Filters questions based on metadata key-value pairs."""
@@ -80,7 +156,12 @@ async def process_single_question(
     Runs a single question against the agent.
     """
     user_inputs = question_data["user_inputs"]
-    agents_evaluated = question_data.get("agents_evaluated", [])
+    # Default `agents_evaluated` to the app we just hit. The unified
+    # dataset.jsonl row schema does not carry this field, but the evaluator's
+    # per-agent mask drops rows where it is empty — leaving us with a half
+    # populated frame the Vertex SDK then crashes on. Mirrors what the sim
+    # converter does in core/converters.py.
+    agents_evaluated = question_data.get("agents_evaluated") or [agent_client.app_name]
     question_id = question_data["id"]
     question_metadata = question_data.get("metadata", {})
     reference_data = question_data.get("reference_data", {})

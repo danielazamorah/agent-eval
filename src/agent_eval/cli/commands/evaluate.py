@@ -43,24 +43,36 @@ def _display_metrics_summary(results_dir: str) -> None:
             min_val = sr.get("min", 0)
             range_str = f"{min_val}–{max_val}"
 
-            # Color based on how good the score is relative to range
+            # Color based on how good the score is relative to range. Indicators
+            # are intentionally neutral — a low score may mean the agent really
+            # is failing this rubric (the most useful signal), or the rubric
+            # itself is mis-targeted; the analyzer's AI report disambiguates.
             ratio = (avg - min_val) / (max_val - min_val) if max_val > min_val else 0
             if ratio >= 0.7:
                 color = "green"
-                indicator = "OK"
+                indicator = "Pass"
             elif ratio >= 0.4:
                 color = "yellow"
-                indicator = "Review"
+                indicator = "Mixed"
             else:
                 color = "red"
-                indicator = "Check mapping"
+                indicator = "Low"
 
             table.add_row(name, f"[{color}]{avg:.1f}[/]", range_str, f"[{color}]{indicator}[/]")
 
-        # Show metrics that failed all retries
+        # Show metrics that failed all retries. Tolerate both legacy
+        # str entries and the dict shape carrying real exception info.
         failed = overall.get("failed_metrics", [])
-        for name in failed:
-            table.add_row(name, "[red]FAILED[/]", "—", "[red]Retry later[/]")
+        failed_dicts: list[dict] = []
+        for entry in failed:
+            if isinstance(entry, dict):
+                failed_dicts.append(entry)
+            else:
+                failed_dicts.append({"metric": str(entry)})
+        for entry in failed_dicts:
+            m_name = entry.get("metric", "?")
+            note = entry.get("exception_type") or "Failed"
+            table.add_row(m_name, "[red]FAILED[/]", "—", f"[red]{note}[/]")
 
         # Show metrics that were skipped by design (dimmed)
         skipped = overall.get("skipped_metrics", [])
@@ -72,12 +84,26 @@ def _display_metrics_summary(results_dir: str) -> None:
         console.print()
         console.print(table)
 
-        if failed:
+        if failed_dicts:
+            # Group by exception_type so a fleet of identical failures
+            # collapses into one explanatory line. Show real causes — the
+            # old "API rate limits" copy was a lie that bit the customer
+            # demo on 2026-04-23 (the actual cause was a pydantic schema
+            # rejection, not a 429).
+            by_type: dict[str, list[dict]] = {}
+            for e in failed_dicts:
+                by_type.setdefault(e.get("exception_type") or "Unknown", []).append(e)
             console.print(
-                f"  [yellow]Warning:[/] {len(failed)} metric(s) failed due to API rate limits."
+                f"  [yellow]Warning:[/] {len(failed_dicts)} metric(s) failed:"
             )
+            for exc_type, group in by_type.items():
+                names = ", ".join(g["metric"] for g in group)
+                sample_msg = next((g.get("message", "") for g in group if g.get("message")), "")
+                console.print(f"    [red]{exc_type}[/] in {names}")
+                if sample_msg:
+                    console.print(f"      [dim]{sample_msg}[/]")
             console.print(
-                "  [dim]Try again later or reduce the number of metrics/eval cases.[/]"
+                "  [dim]Full exception text in eval_summary.json (overall_summary.failed_metrics).[/]"
             )
 
         if skipped:
@@ -92,14 +118,17 @@ def _display_metrics_summary(results_dir: str) -> None:
         table.add_column("Metric", style="bold")
         table.add_column("Avg Value", justify="right")
 
-        # Pick the most useful metrics to show
+        # Pick the most useful metrics to show. Latency labels are explicit:
+        # "Wall-clock latency" is the elapsed time the user waits; "Sum of LLM
+        # call durations" is additive across parallel sub-agent calls — it can
+        # exceed wall-clock when sub-agents run concurrently. Same for tools.
         highlights = [
             ("Total tokens", "token_usage.total_tokens", "{:.0f}"),
             ("Prompt tokens", "token_usage.prompt_tokens", "{:.0f}"),
             ("Completion tokens", "token_usage.completion_tokens", "{:.0f}"),
             ("Estimated cost", "token_usage.estimated_cost_usd", "${:.4f}"),
-            ("Total latency", "latency_metrics.total_latency_seconds", "{:.2f}s"),
-            ("LLM latency", "latency_metrics.llm_latency_seconds", "{:.2f}s"),
+            ("Wall-clock latency", "latency_metrics.total_latency_seconds", "{:.2f}s"),
+            ("Σ LLM call durations", "latency_metrics.llm_latency_seconds", "{:.2f}s"),
             ("Cache hit rate", "cache_efficiency.cache_hit_rate", "{:.0%}"),
             ("Tool calls", "tool_utilization.total_tool_calls", "{:.0f}"),
             ("Tool success rate", "tool_success_rate.tool_success_rate", "{:.0%}"),
@@ -112,6 +141,11 @@ def _display_metrics_summary(results_dir: str) -> None:
 
         console.print()
         console.print(table)
+        # One-line legend so the "Σ LLM > Wall-clock" surprise is explained.
+        console.print(
+            "  [dim]Σ LLM call durations is additive across parallel sub-agent "
+            "calls — it can exceed wall-clock latency.[/]"
+        )
 
 
 @click.command()
@@ -196,7 +230,7 @@ def evaluate(interaction_file, metrics_files, results_dir, input_label, test_des
         console.print()
         console.print("[bold]Next step — copy and paste:[/]")
         console.print()
-        console.print(f"uv run agent-eval analyze \\")
+        console.print(f"agent-eval analyze \\")
         console.print(f"  --results-dir {rel_results}")
         console.print()
 

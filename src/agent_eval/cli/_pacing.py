@@ -53,6 +53,10 @@ def _continue(
     ``message`` is shown as the prompt label — keep it short and forward-looking
     ("Next: dataset columns →") so it doubles as a pointer to what comes next.
 
+    If ``message`` doesn't already mention "Enter", an explicit
+    ``· press Enter ↵`` hint is appended. Reported by Dani 2026-04-25
+    after a customer froze on a "Next: …" anchor not knowing to press Enter.
+
     When ``AGENT_EVAL_NO_PAUSES=1``, falls back to a silent ``_pause(_PAUSE_LONG)``
     so scripted / CI runs don't deadlock.
     """
@@ -61,7 +65,8 @@ def _continue(
         return
     if console is not None:
         console.print()
-    questionary.press_any_key_to_continue(message).ask()
+    label = message if "enter" in message.lower() else f"{message}  · press Enter ↵"
+    questionary.press_any_key_to_continue(label).ask()
 
 
 @contextmanager

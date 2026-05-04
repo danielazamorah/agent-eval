@@ -1,8 +1,9 @@
 """Runtime discovery of managed metrics and ADK evaluation knowledge.
 
-Replaces the static managed_metrics_catalog.json with dynamic discovery
-from the installed Vertex AI SDK and ADK packages. This module is the
-single source of truth for what metrics are available.
+Single source of truth for what metrics are available — introspects the
+installed Vertex AI SDK and ADK packages directly. (A static
+``managed_metrics_catalog.json`` predated this module; deleted 2026-05-01
+during the canonical-schema sweep — runtime discovery has fully replaced it.)
 """
 
 import inspect
@@ -197,12 +198,15 @@ def discover_managed_metrics(exclude_embedding: bool = True) -> Dict[str, Dict[s
         resolution = "api_predefined" if api_pred else "gcs_yaml"
         is_multi_turn = name_upper in _MULTI_TURN_METRICS
 
+        # Canonical schema (per core/metric_schema.py): kind="managed" + base.
+        # The remaining fields (resolution, description, score_range, requires_*,
+        # default_response_field) are agent-eval discovery metadata used by the
+        # picker UI and the per-row routing — NOT part of the SDK metric
+        # construction. They live alongside `kind`/`base` as agent-eval extras.
         entry: Dict[str, Any] = {
-            "managed_metric_name": name_upper,
-            "metric_type": "llm",
-            "is_managed": True,
+            "kind": "managed",
+            "base": name_upper,
             "resolution": resolution,
-            "use_gemini_format": api_pred,
             "description": _METRIC_DESCRIPTIONS.get(name_upper, ""),
             "score_range": _SCORE_RANGES.get(
                 name_upper, {"min": 0, "max": 1, "type": "unknown"}
@@ -363,7 +367,7 @@ def format_metrics_for_prompt(metrics: Optional[Dict[str, Dict]] = None) -> str:
         score_str = f"{sr.get('min', '?')}-{sr.get('max', '?')} ({sr.get('type', '?')})"
         runs_on = "multi-turn" if info.get("requires_multi_turn") else "any row"
         lines.append(
-            f"{info['managed_metric_name']:<35} {score_str:<15} "
+            f"{info['base']:<35} {score_str:<15} "
             f"{runs_on:<14} {info['description'][:50]}"
         )
 
@@ -385,7 +389,7 @@ def format_metrics_for_prompt(metrics: Optional[Dict[str, Dict]] = None) -> str:
         ph_str = f" [needs: {', '.join(placeholders)}]" if placeholders else ""
         runs_on = "multi-turn" if info.get("requires_multi_turn") else "any row"
         lines.append(
-            f"{info['managed_metric_name']:<35} {score_str:<15} "
+            f"{info['base']:<35} {score_str:<15} "
             f"{runs_on:<14} {info['description'][:40]}{ph_str}"
         )
 
@@ -447,16 +451,18 @@ def get_metric_definition_entry(metric_key: str, metrics: Optional[Dict] = None)
     if not info:
         return None
 
+    # Canonical schema (per core/metric_schema.py): kind="managed" + base.
+    # We carry forward the discovery metadata (score_range / requires_* /
+    # default_response_field) because the evaluator and picker still consume
+    # those — they're not part of the SDK metric construction.
     entry = {
-        "metric_type": "llm",
-        "is_managed": True,
-        "managed_metric_name": info["managed_metric_name"],
-        "use_gemini_format": info["use_gemini_format"],
-        "score_range": info["score_range"],
+        "kind": "managed",
+        "base": info["base"],
         "requires_reference": info.get("requires_reference", False),
         "requires_multi_turn": info.get("requires_multi_turn", False),
     }
-
+    if info.get("score_range"):
+        entry["score_range"] = info["score_range"]
     default_resp = info.get("default_response_field")
     if default_resp:
         entry["default_response_field"] = default_resp

@@ -80,10 +80,12 @@ from agent_eval.cli.commands.dashboard import dashboard  # noqa: E402
 from agent_eval.cli.commands.agent_engine import agent_engine  # noqa: E402
 from agent_eval.cli.commands.import_adk import import_adk  # noqa: E402
 from agent_eval.cli.commands.migrate import migrate  # noqa: E402
+from agent_eval.cli.commands.stories import stories  # noqa: E402
+from agent_eval.cli.commands.report import report  # noqa: E402
 
 # Order matches the Vertex AI eval docs sidebar workflow so `agent-eval --help`
 # reads top-down as: set up → bring in data → generate traces → score →
-# (Path A shortcut) → view → orchestrate → utilities.
+# (Agent Engine streamlined shortcut) → view → orchestrate → utilities.
 cli.add_command(setup)                             # One-time GCP env preparation
 cli.add_command(init)                              # Tutorial / first-run scaffold
 cli.add_command(migrate)                           # Convert legacy eval/ → tests/eval/
@@ -91,12 +93,14 @@ cli.add_command(import_adk, name="import")         # Prepare dataset (from exist
 cli.add_command(simulate)                          # Generate traces (multi-turn)
 cli.add_command(interact)                          # Generate traces (single-turn)
 cli.add_command(evaluate)                          # Run evaluation
-cli.add_command(agent_engine, name="agent-engine") # Run evaluation — Path A streamlined
+cli.add_command(agent_engine, name="agent-engine") # Streamlined eval against deployed Agent Engine
 cli.add_command(analyze)                           # View / interpret results
+cli.add_command(report)                            # Open the HTML report in a browser
 cli.add_command(dashboard)                         # View / interpret results (interactive)
 cli.add_command(run)                               # Full pipeline shortcut
 cli.add_command(convert)                           # Utility: ADK traces → JSONL
 cli.add_command(create_dataset, name="create-dataset")  # Utility: legacy dataset converter
+cli.add_command(stories)                           # Utility: browse the wait-time story library
 
 
 def main():

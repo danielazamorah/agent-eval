@@ -10,7 +10,7 @@ console = Console()
 
 @click.command()
 @click.option("--results-dir", required=True,
-              help="Path to the results directory containing run sub-folders (e.g., eval/results/).")
+              help="Path to the results directory containing run sub-folders (e.g., tests/eval/results/).")
 @click.option("--port", default=7860, type=int,
               help="Port for the dashboard server (default: 7860).")
 @click.option("--share", is_flag=True,
@@ -33,9 +33,9 @@ def dashboard(results_dir, port, share):
 
     \b
     Examples:
-      uv run agent-eval dashboard --results-dir eval/results/
-      uv run agent-eval dashboard --results-dir eval/results/ --port 8080
-      uv run agent-eval dashboard --results-dir eval/results/ --share
+      agent-eval dashboard --results-dir tests/eval/results/
+      agent-eval dashboard --results-dir tests/eval/results/ --port 8080
+      agent-eval dashboard --results-dir tests/eval/results/ --share
     """
     try:
         from agent_eval.dashboard.app import launch

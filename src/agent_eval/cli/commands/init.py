@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import click
 import questionary
@@ -16,8 +18,556 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from agent_eval.cli._pacing import _PAUSE_LONG, _PAUSE_SHORT, _continue, _pause, styled_pager
+from agent_eval.cli._pacing import _PAUSE_LONG, _PAUSE_SHORT, _continue, _pause, _pauses_disabled, styled_pager
 from agent_eval.core.scaffold import scaffold_eval_structure
+from agent_eval.core.metric_schema import is_managed_entry, managed_base_name
+
+
+# ---------------------------------------------------------------------------
+# Iterative review (Phase D4): show generated artifact → explain → wait →
+# detect manual edits → diff → carry edited content into downstream steps.
+# Customer feedback 2026-04-25: "the init experience shouldn't be waiting
+# for the end to generate all the files, it should include the user more,
+# … explain what every part of that file means … so that the user can
+# correct if needed."
+# ---------------------------------------------------------------------------
+
+def _hash_file(path: Path) -> str:
+    """SHA-256 of the file bytes — used to detect manual edits between
+    when we showed the file and when the user pressed Enter to continue."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _parse_artifact(path: Path) -> Any:
+    """Parse the artifact file. JSON for .json, JSONL for .jsonl, raw text otherwise."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix == ".json":
+        return json.loads(text)
+    if path.suffix == ".jsonl":
+        rows = []
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise json.JSONDecodeError(
+                    f"line {lineno}: {exc.msg}", line, exc.pos,
+                )
+        return rows
+    return text
+
+
+def _summarize_diff(before: Any, after: Any) -> List[str]:
+    """Render a short human-readable diff for the artifact. Limited to
+    common shapes (dict-of-metrics for metric_definitions; list-of-rows
+    for dataset.jsonl). Returns a list of bullet lines."""
+    lines: List[str] = []
+
+    if isinstance(before, dict) and isinstance(after, dict):
+        b_metrics = (before.get("metrics") or {}) if "metrics" in before else before
+        a_metrics = (after.get("metrics") or {}) if "metrics" in after else after
+        if isinstance(b_metrics, dict) and isinstance(a_metrics, dict):
+            removed = sorted(set(b_metrics) - set(a_metrics))
+            added = sorted(set(a_metrics) - set(b_metrics))
+            modified = sorted(
+                k for k in (set(b_metrics) & set(a_metrics))
+                if b_metrics.get(k) != a_metrics.get(k)
+            )
+            for name in added:
+                lines.append(f"[green]+ added[/]    {name}")
+            for name in removed:
+                lines.append(f"[red]− removed[/]  {name}")
+            for name in modified:
+                lines.append(f"[yellow]~ updated[/]  {name}")
+
+    if isinstance(before, list) and isinstance(after, list):
+        delta = len(after) - len(before)
+        if delta > 0:
+            lines.append(f"[green]+ added[/]    {delta} row(s) (now {len(after)} total)")
+        elif delta < 0:
+            lines.append(f"[red]− removed[/]  {-delta} row(s) (now {len(after)} total)")
+        else:
+            lines.append(f"[yellow]~ same row count[/] ({len(after)}); content edited")
+
+    if not lines:
+        lines.append(f"[yellow]~ file changed[/] (couldn't structurally diff)")
+
+    return lines
+
+
+def _review_artifact(
+    path: Path,
+    *,
+    explanation: Callable[[], None],
+    title: str,
+    auto_approve: bool,
+) -> Tuple[bool, Optional[Any]]:
+    """Show ``path``, run ``explanation()``, wait, detect edits, parse + diff.
+
+    Returns ``(was_edited, parsed_content)``. When ``was_edited`` is True
+    the caller MUST replace its in-memory model with ``parsed_content`` so
+    downstream steps see the user's edits. When False, ``parsed_content``
+    is None — caller keeps using its existing in-memory model.
+    """
+    if auto_approve or not path.exists():
+        return False, None
+
+    pre_hash = _hash_file(path)
+
+    console.print()
+    console.print(f"  [bold]Take a look — {title}:[/]")
+    console.print(f"    [cyan]{path}[/]")
+    console.print()
+    explanation()
+    console.print()
+    _continue(
+        f"Open the file, edit anything that doesn't fit. When you're done, continue →",
+        console=console,
+    )
+
+    if not path.exists():
+        # User deleted the file mid-review
+        console.print(f"  [yellow]![/] {path.name} no longer exists; restoring not implemented yet.")
+        return False, None
+
+    post_hash = _hash_file(path)
+    if pre_hash == post_hash:
+        console.print(f"  [dim]No edits — continuing with the generated version.[/]")
+        snap = path.with_suffix(path.suffix + ".gen")
+        if snap.exists():
+            try:
+                snap.unlink()
+            except OSError:
+                pass
+        return False, None
+
+    # Try to re-parse the user's edits.
+    try:
+        parsed = _parse_artifact(path)
+    except json.JSONDecodeError as exc:
+        console.print(
+            f"  [red]Couldn't re-parse {path.name}:[/] {exc.msg} (at offset {exc.pos})\n"
+            f"  [dim]Fix the file and re-run `agent-eval init`, or restore the AI version "
+            f"from a backup under tests/eval/.backup/.[/]"
+        )
+        raise click.Abort()
+
+    # Diff against the generated version, then clean up the snapshot so it
+    # doesn't litter the user's tests/eval/ directory.
+    snapshot_path = path.with_suffix(path.suffix + ".gen")
+    try:
+        before = _parse_artifact(snapshot_path)
+    except FileNotFoundError:
+        before = None
+    if before is not None:
+        diff_lines = _summarize_diff(before, parsed)
+        console.print(f"  [green]✓ Picked up your edits to {path.name}:[/]")
+        for line in diff_lines:
+            console.print(f"      {line}")
+    else:
+        console.print(f"  [green]✓ Picked up your edits to {path.name}.[/]")
+
+    if snapshot_path.exists():
+        try:
+            snapshot_path.unlink()
+        except OSError:
+            pass
+
+    return True, parsed
+
+
+def _save_generated_snapshot(path: Path) -> None:
+    """Save a sibling ``.gen`` snapshot before showing the file to the user.
+
+    Used by ``_review_artifact`` to compute a diff against the AI baseline.
+    Cleaned up after the review completes (success or skip-without-edit).
+    """
+    snapshot = path.with_suffix(path.suffix + ".gen")
+    snapshot.write_bytes(path.read_bytes())
+
+
+# ── Metric review pause: editing guide + validation gate ────────────────────
+#
+# When ``init`` materializes ``metric_definitions.json`` between Call 2 (metric
+# generation) and Call 3 (test data generation), it pauses for the user to
+# review/edit the file. The functions below render the in-CLI editing guide
+# (no JSON noise — kept out of the file itself), validate the user's edits
+# against the canonical schema, and extract the reference-data field names
+# the next step needs to know about.
+
+def _render_metric_review_guide(
+    custom_metrics: Dict[str, Any],
+    rationale: str,
+    metrics_path: Path,
+) -> None:
+    """Show the user what's in the file + what they can/can't edit.
+
+    Called by ``_review_artifact`` as its ``explanation`` callback during
+    the metrics review pause. Stays in the CLI — never embedded in the
+    file itself, so the user's metric_definitions.json stays clean.
+    """
+    from agent_eval.core.metric_schema import is_managed_entry, managed_base_name
+
+    n = len(custom_metrics)
+    plural = "metric" if n == 1 else "metrics"
+    console.print(
+        f"  [bold]{n} {plural}[/] will score every row in your dataset.jsonl."
+    )
+
+    # Compact per-metric summary so the user knows what each entry does.
+    summary = Table(show_header=False, box=None, padding=(0, 2), show_edge=False)
+    summary.add_column(style="bold cyan", min_width=24)
+    summary.add_column(style="dim")
+    for name, defn in custom_metrics.items():
+        if is_managed_entry(defn):
+            base = managed_base_name(defn) or "?"
+            summary.add_row(name, f"managed · base: {base}")
+        elif defn.get("kind") == "custom_llm_judge":
+            n_crit = len(defn.get("criteria") or {})
+            scores = sorted((defn.get("rating_scores") or {}).keys())
+            scale = "binary 0/1" if scores == ["0", "1"] else f"scale {scores[0]}-{scores[-1]}" if scores else "?"
+            tags = []
+            if defn.get("requires_reference"):
+                tags.append("reference rows")
+            if defn.get("requires_multi_turn"):
+                tags.append("multi-turn rows")
+            tag_str = f" · {' · '.join(tags)}" if tags else ""
+            summary.add_row(name, f"custom · {n_crit} criteria · {scale}{tag_str}")
+        else:
+            summary.add_row(name, f"kind: {defn.get('kind', '?')}")
+    console.print(summary)
+
+    if rationale:
+        console.print()
+        console.print("  [bold]Why these metrics[/] [dim](Gemini's reasoning):[/]")
+        for line in rationale.strip().splitlines():
+            console.print(f"    [dim]│[/] {line}")
+
+    console.print()
+    console.print("  [bold]What you can edit freely[/]")
+    console.print("    [green]✓[/] Add or remove entries under [cyan]metrics[/]")
+    console.print("    [green]✓[/] For [cyan]custom_llm_judge[/] metrics — edit [cyan]instruction[/], [cyan]criteria[/], [cyan]rating_scores[/]")
+    console.print("        [dim italic](keep [cyan]rating_scores[/] [dim italic]binary[/] [cyan]{\"1\":\"Pass…\",\"0\":\"Fail…\"}[/] [dim italic]for reliable scoring)[/]")
+    console.print("    [green]✓[/] Toggle [cyan]requires_reference: true[/] / [cyan]requires_multi_turn: true[/]")
+    console.print("    [green]✓[/] Tweak [cyan]dataset_mapping[/] to point at different source columns")
+    console.print()
+    console.print("  [bold]What you must keep[/]")
+    console.print("    [red]✗[/] Don't drop [cyan]kind[/] — it tells the evaluator how to build the SDK metric")
+    console.print("    [red]✗[/] For [cyan]managed[/] — [cyan]base[/] must be a valid Vertex SDK metric name (uppercase)")
+    console.print("    [red]✗[/] For [cyan]custom_llm_judge[/] — [cyan]criteria[/] + [cyan]rating_scores[/] are required")
+    console.print()
+    console.print("  [bold]What happens next[/]")
+    console.print(
+        "    [dim]>[/] When you continue, we'll generate a [cyan]dataset.jsonl[/] [bold]designed to[/]"
+    )
+    console.print(
+        "    [dim]>[/] [bold]exercise these metrics[/] — every test row will be relevant to what's here."
+    )
+    console.print(
+        "    [dim]>[/] If you change a metric now, the test data will reflect it."
+    )
+
+
+def _validate_user_edited_metrics(parsed: Any) -> List[str]:
+    """Re-validate a user-edited metric_definitions.json against the canonical schema.
+
+    Returns a list of plain-English error messages (empty when clean). Each
+    message names the offending metric + what's wrong + the canonical fix —
+    no stack traces, no JSON paths.
+    """
+    from agent_eval.core.metric_generator import _validate_single_metric
+
+    errors: List[str] = []
+    if not isinstance(parsed, dict):
+        return ["The file's top-level shape is wrong — expected a JSON object."]
+    metrics = parsed.get("metrics")
+    if not isinstance(metrics, dict):
+        return [
+            "Missing or invalid [cyan]metrics[/] key — the file must look like "
+            "[cyan]{\"metrics\": {...}}[/] with each metric as a key inside."
+        ]
+    if not metrics:
+        return [
+            "[cyan]metrics[/] is empty — the eval pipeline needs at least one metric to score against."
+        ]
+    for name, defn in metrics.items():
+        per_metric_errors = _validate_single_metric(name, defn)
+        for err in per_metric_errors:
+            # _validate_single_metric returns "'name': details" — strip the quotes
+            # for cleaner CLI output.
+            cleaned = err.replace(f"'{name}':", "").strip()
+            errors.append(f"[bold cyan]{name}[/] — {cleaned}")
+    return errors
+
+
+def _required_reference_fields(custom_metrics: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Extract (metric_name, reference_data_field) pairs from the metrics dict.
+
+    The data-generation step needs this to know which ``reference_data:<field>``
+    keys MUST be populated in the generated golden_data rows. Without this,
+    Gemini might default to ``expected_behavior`` even when the metrics expect
+    ``expected_docs`` / ``expected_route`` / etc. — leading to silent
+    every-row-skipped behavior at evaluation time.
+
+    Returns pairs like ``[("document_retrieval_success", "expected_docs"),
+    ("subagent_routing_accuracy", "expected_route")]``. Empty when no metric
+    needs reference data.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for name, defn in custom_metrics.items():
+        if not isinstance(defn, dict):
+            continue
+        # Custom LLM judge with requires_reference + reference_data:<field> mapping
+        ref_mapping = (defn.get("dataset_mapping") or {}).get("reference") or {}
+        col = ref_mapping.get("source_column", "")
+        if isinstance(col, str) and col.startswith("reference_data:"):
+            field = col.split(":", 1)[1]
+            if field:
+                pairs.append((name, field))
+        # Managed metric with explicit reference_field declaration
+        ref_field = defn.get("reference_field")
+        if isinstance(ref_field, str) and ref_field:
+            pairs.append((name, ref_field))
+    # Dedupe while preserving order.
+    seen: set = set()
+    unique: List[Tuple[str, str]] = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            unique.append(pair)
+    return unique
+
+
+def _review_with_validation_loop(
+    metrics_path: Path,
+    *,
+    custom_metrics: Dict[str, Any],
+    rationale: str,
+    auto_approve: bool,
+) -> Dict[str, Any]:
+    """Wrap ``_review_artifact`` with a validation gate that loops on errors.
+
+    After the user edits the file, re-validate against the canonical schema.
+    If invalid, surface the errors in plain English and let them fix-and-retry.
+    Returns the final (possibly user-edited) metrics dict ready for Call 3.
+    """
+    while True:
+        if auto_approve or not metrics_path.exists():
+            return custom_metrics
+
+        _save_generated_snapshot(metrics_path)
+        edited, parsed = _review_artifact(
+            metrics_path,
+            explanation=lambda: _render_metric_review_guide(custom_metrics, rationale, metrics_path),
+            title="here's what each metric does + open the file to tweak before we generate test data",
+            auto_approve=auto_approve,
+        )
+
+        if not edited:
+            return custom_metrics
+
+        errors = _validate_user_edited_metrics(parsed)
+        if not errors:
+            edited_metrics = (parsed.get("metrics") or {})
+            return {k: v for k, v in edited_metrics.items() if isinstance(v, dict)}
+
+        # Validation failed — surface errors and let user retry.
+        console.print()
+        console.print(
+            f"  [yellow]·[/] [bold]Found {len(errors)} issue(s) in your edits.[/] "
+            "[dim]Fix them so the eval pipeline doesn't break:[/]"
+        )
+        for err in errors:
+            console.print(f"    [red]✗[/] {err}")
+        console.print()
+        console.print(
+            "    [bold]1.[/] [green]Edit again[/] — fix the file and continue"
+        )
+        console.print(
+            "    [bold]2.[/] [yellow]Restore the AI version[/] — discard your edits, use what Gemini generated"
+        )
+        console.print(
+            "    [bold]3.[/] [red]Abort init[/] — exit and fix later"
+        )
+        console.print()
+        try:
+            choice = IntPrompt.ask("  Select", default=1)
+        except (KeyboardInterrupt, EOFError):
+            raise click.Abort()
+        while choice not in (1, 2, 3):
+            choice = IntPrompt.ask("  Select", default=1)
+
+        if choice == 2:
+            # Restore from .gen snapshot (saved before the user's edits).
+            snapshot = metrics_path.with_suffix(metrics_path.suffix + ".gen")
+            if snapshot.exists():
+                metrics_path.write_text(snapshot.read_text())
+                snapshot.unlink()
+                console.print("  [green]>[/] Restored the Gemini-generated version.")
+            return custom_metrics
+        if choice == 3:
+            console.print("  [dim]Aborting init. Re-run when you're ready.[/]")
+            raise click.Abort()
+        # choice == 1 → loop back to the review pause
+
+
+def _validate_dataset_against_metrics(
+    dataset_path: Path,
+    custom_metrics: Dict[str, Any],
+) -> List[str]:
+    """Check that ``dataset.jsonl`` actually feeds every metric the user picked.
+
+    The dangerous case is a metric with ``requires_reference: true`` that needs
+    ``reference_data:expected_docs`` populated — but every generated row has
+    only ``expected_behavior``. The metric silently skips every row at
+    evaluation time and the user sees no signal for it. This validator catches
+    those gaps before the user runs ``evaluate``.
+
+    Returns plain-English warning strings (empty when clean).
+    """
+    warnings: List[str] = []
+    rows: List[dict] = []
+    try:
+        with dataset_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    except Exception as exc:
+        return [f"Couldn't parse dataset.jsonl: {exc}"]
+    if not rows:
+        return ["dataset.jsonl is empty — no rows to evaluate."]
+
+    # Per-metric required reference field check — the gap-2 fix.
+    required_fields = _required_reference_fields(custom_metrics)
+    for metric_name, field in required_fields:
+        rows_with_field = [
+            r for r in rows
+            if isinstance(r.get("reference_data"), dict)
+            and r["reference_data"].get(field) not in (None, "", [], {})
+        ]
+        if rows_with_field:
+            continue
+        # Specifically check whether the field is misplaced as a top-level
+        # row column (a common Gemini slip — see scaffold._rows_from_recommendations
+        # comments). If so, surface the exact fix instead of a generic warning.
+        rows_with_field_top_level = [
+            r for r in rows
+            if r.get(field) not in (None, "", [], {})
+        ]
+        if rows_with_field_top_level:
+            warnings.append(
+                f"[bold cyan]{metric_name}[/] needs [cyan]reference_data.{field}[/] populated, "
+                f"but [bold]{len(rows_with_field_top_level)} row(s)[/] have it as a "
+                f"[cyan]top-level[/] field instead. Move [cyan]{field}[/] inside a nested "
+                f"[cyan]reference_data: {{...}}[/] dict on each row."
+            )
+        else:
+            warnings.append(
+                f"[bold cyan]{metric_name}[/] needs [cyan]reference_data.{field}[/] populated, "
+                f"but no row has it — the metric will skip every row at evaluate time."
+            )
+
+    # Multi-turn metric needs multi-turn rows to score against.
+    multi_turn_metrics = [
+        n for n, d in custom_metrics.items()
+        if isinstance(d, dict) and d.get("requires_multi_turn")
+    ]
+    if multi_turn_metrics:
+        has_multi_turn = any(
+            (r.get("history") or r.get("conversation_plan")) for r in rows
+        )
+        if not has_multi_turn:
+            names = ", ".join(f"[cyan]{n}[/]" for n in multi_turn_metrics)
+            warnings.append(
+                f"{names} need multi-turn rows, but no row has [cyan]history[/] or "
+                f"[cyan]conversation_plan[/] — those metrics will skip every row."
+            )
+
+    # Metrics flagging BOTH `requires_multi_turn` AND `requires_reference`
+    # need at least one row that has BOTH a multi-turn flow AND populated
+    # reference_data. The evaluator handles per-row routing — but the data
+    # generator may not have produced such a row. Soft warning with the two
+    # actionable fixes (add reference_data to a multi-turn row, OR drop one
+    # flag). NOT a blocker — both shapes are fully supported at runtime.
+    both_flagged_metrics = [
+        (n, d) for n, d in custom_metrics.items()
+        if isinstance(d, dict) and d.get("requires_multi_turn") and d.get("requires_reference")
+    ]
+    if both_flagged_metrics:
+        has_both_in_dataset = any(
+            (r.get("history") or r.get("conversation_plan"))
+            and isinstance(r.get("reference_data"), dict)
+            and any(v for v in r["reference_data"].values() if v not in (None, "", [], {}))
+            for r in rows
+        )
+        if not has_both_in_dataset:
+            names = ", ".join(f"[cyan]{n}[/]" for n, _ in both_flagged_metrics)
+            warnings.append(
+                f"{names} flag BOTH [cyan]requires_multi_turn[/] AND "
+                f"[cyan]requires_reference[/], but no row has both. "
+                f"Two fixes (either works): "
+                f"(1) add a [cyan]reference_data[/] block to a multi-turn row in "
+                f"[cyan]dataset.jsonl[/] populating the field this metric reads, OR "
+                f"(2) drop one flag from the metric definition."
+            )
+
+    return warnings
+
+
+def _review_dataset_with_validation(
+    dataset_path: Path,
+    *,
+    custom_metrics: Dict[str, Any],
+    auto_approve: bool,
+) -> None:
+    """Wrap the dataset review pause with the coverage validation gate.
+
+    Loops on warnings: if a metric won't have data to score, give the user
+    Edit again / Continue anyway. Even on the first iteration (no edits yet)
+    the validator runs — Gemini may have generated a dataset that doesn't
+    cover all the metrics' required fields.
+    """
+    while True:
+        if auto_approve or not dataset_path.exists():
+            return
+
+        _save_generated_snapshot(dataset_path)
+        _review_artifact(
+            dataset_path,
+            explanation=lambda: _explain_dataset_file(dataset_path),
+            title="here's what each row drives in the eval pipeline",
+            auto_approve=auto_approve,
+        )
+
+        warnings = _validate_dataset_against_metrics(dataset_path, custom_metrics)
+        if not warnings:
+            return  # clean — continue
+
+        console.print()
+        console.print(
+            f"  [yellow]·[/] [bold]Found {len(warnings)} coverage issue(s) in your dataset.[/] "
+            "[dim]Some metrics won't have rows to score:[/]"
+        )
+        for w in warnings:
+            console.print(f"    [yellow]![/] {w}")
+        console.print()
+        console.print("    [bold]1.[/] [green]Edit again[/] — populate the missing fields and continue")
+        console.print("    [bold]2.[/] [yellow]Continue anyway[/] — those metrics will skip rows; you'll see warnings at evaluate time")
+        console.print()
+        try:
+            choice = IntPrompt.ask("  Select", default=1)
+        except (KeyboardInterrupt, EOFError):
+            return
+        while choice not in (1, 2):
+            choice = IntPrompt.ask("  Select", default=1)
+
+        if choice == 2:
+            return  # continue with warnings
+        # choice == 1 → loop back to the review pause
+
 
 console = Console()
 
@@ -300,7 +850,6 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     console.print(
         "  [cyan]https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-dataset[/]"
     )
-    _continue("Next: how agent-eval reaches your agent →", console=console)
     console.print()
     console.print(
         "  [dim]── Two ways agent-eval can collect that interaction data ──[/]"
@@ -371,6 +920,73 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
             "[cyan]remote_agent_engine_id[/][dim italic], and no[/] "
             "[cyan]AGENT_ENGINE_RESOURCE_NAME[/] [dim italic]env var.[/]"
         )
+
+        # Escape hatch: auto-detect can miss a deployment (metadata file in an
+        # unexpected location, env var not exported in this shell, etc). Let
+        # the user paste a resource name we couldn't find. Only when interactive —
+        # under AGENT_EVAL_NO_PAUSES we skip the prompt entirely.
+        if not _pauses_disabled():
+            console.print()
+            console.print(
+                "    [dim italic]Have one we couldn't find? Paste the resource name below[/]"
+                " [dim italic](or leave blank to stick with local-only).[/]"
+            )
+            console.print(
+                "    [dim italic]Format:[/] [cyan]projects/<NUMBER>/locations/<REGION>/reasoningEngines/<ID>[/]"
+            )
+            try:
+                manual = questionary.text(
+                    "    Resource name (Enter to skip):",
+                    default="",
+                ).ask()
+            except (KeyboardInterrupt, EOFError):
+                manual = None
+            if manual and manual.strip():
+                stripped = manual.strip()
+                if re.match(
+                    r"^projects/[^/]+/locations/[^/]+/reasoningEngines/[^/]+$",
+                    stripped,
+                ):
+                    ae_detection = PathDetection(
+                        path="A",
+                        evidence="user-provided resource name",
+                        agent_engine_resource=stripped,
+                    )
+                    console.print()
+                    console.print(
+                        "  [green]>[/] [bold]Got it — using your manual entry.[/]  "
+                        "[dim](streamlined pass enabled)[/]"
+                    )
+                    console.print(f"    [dim]Resource:[/]  [cyan]{stripped}[/]")
+                    console.print()
+                    _pause()
+                    console.print("  [bold]What this adds to your eval:[/]")
+                    console.print(
+                        "    [dim]>[/] [cyan]agent-eval agent-engine[/] sends your dataset to Vertex's [cyan]create_evaluation_run()[/]."
+                    )
+                    console.print(
+                        "    [dim]>[/] Vertex calls your deployed agent, scores the responses,"
+                    )
+                    console.print(
+                        "    [dim]>[/] and uploads results to GCS — all in one managed call. No local server needed."
+                    )
+                    console.print()
+                    _pause()
+                    console.print(
+                        "    [yellow]Heads-up:[/] [cyan]create_evaluation_run()[/] is "
+                        "[bold]single-turn only[/] — no multi-turn replay,"
+                    )
+                    console.print(
+                        "    no built-in user simulator. We'll see next whether the local pipeline picks up the slack ↓"
+                    )
+                else:
+                    console.print()
+                    console.print(
+                        "    [yellow]·[/] [dim]Doesn't look like a Reasoning Engines resource — sticking with local-only.[/]"
+                    )
+                    console.print(
+                        "    [dim]Expected:[/] [cyan]projects/<NUMBER>/locations/<REGION>/reasoningEngines/<ID>[/]"
+                    )
 
     # ── Scan 2: local ADK source ──
     console.print()
@@ -745,7 +1361,10 @@ def _display_metrics_education(managed_metrics: Dict[str, Dict]) -> None:
     Three short backgrounders, in the order the docs sidebar uses:
       1. The SDK call we'll run for them when they later run `agent-eval evaluate`.
       2. The canonical dataset columns each row in `tests/eval/dataset.jsonl` may use.
-      3. The four families managed metrics belong to.
+      3. The families the catalog's managed metrics belong to (rendered dynamically
+         from what the installed SDK actually exposes — only families with ≥1
+         metric show up, with a footnote naming the families Vertex docs catalog
+         but our pinned SDK doesn't ship as managed).
     Then a callout that the picker is SDK-introspected — resilient to upstream changes.
     """
     from rich.syntax import Syntax
@@ -755,7 +1374,7 @@ def _display_metrics_education(managed_metrics: Dict[str, Dict]) -> None:
     # metrics like COHERENCE / FLUENCY — gets bucketed as adaptive in the picker).
     family_counts: Dict[str, int] = {}
     for key, info in managed_metrics.items():
-        family = metric_families.classify(info.get("managed_metric_name") or key)
+        family = metric_families.classify(managed_base_name(info) or key)
         if family == "custom":
             family = "adaptive_rubric"
         family_counts[family] = family_counts.get(family, 0) + 1
@@ -774,8 +1393,12 @@ def _display_metrics_education(managed_metrics: Dict[str, Dict]) -> None:
     console.print("  [dim]the metrics you select below to the Vertex AI Evaluation SDK like this:[/]")
     console.print()
     code = (
-        "from vertexai import Client, types\n\n"
-        "client = Client(project=PROJECT, location=LOCATION)\n\n"
+        "from vertexai import Client, types\n"
+        "from google.genai.types import HttpOptions\n\n"
+        "client = Client(\n"
+        "    project=PROJECT, location=LOCATION,\n"
+        '    http_options=HttpOptions(api_version="v1beta1"),  # required for evals\n'
+        ")\n\n"
         "result = client.evals.evaluate(\n"
         '    dataset=eval_dataset,              # tests/eval/dataset.jsonl\n'
         "    metrics=[ ...your selections... ], # SDK Metric objects\n"
@@ -806,24 +1429,68 @@ def _display_metrics_education(managed_metrics: Dict[str, Dict]) -> None:
     console.print(cols)
     console.print()
     console.print("  [dim]Docs:[/] [cyan]https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-dataset[/]")
-    _continue("Next: the four metric families →", console=console)
+    _continue("Next: the metric families →", console=console)
 
-    # ── Background 3 — the four families ─────────────────────────────────
+    # ── Background 3 — the families with metrics in this catalog ────────
     console.print()
-    console.print("  [dim]── Background 3 of 3 — the four families managed metrics belong to ──[/]")
+    console.print(
+        f"  [dim]── Background 3 of 3 — the families your[/] [bold]{len(managed_metrics)}[/] "
+        "[dim]managed metrics belong to ──[/]"
+    )
     console.print()
     console.print("  [dim]Knowing the family tells you what data the metric needs and how it's scored.[/]")
     console.print("  [dim]The picker below groups its options by family in this exact order.[/]")
     console.print()
+
+    # Render only families that actually have managed metrics in the live SDK.
+    # Vertex docs catalog four (Adaptive Rubric, Static Rubric, Computation,
+    # Translation) but the SDK we pin only ships managed metrics in two — and
+    # showing four rows where two are empty confused customers (Dani 2026-04-30:
+    # "weren't there 4 families?"). The footnote names the absent ones so users
+    # who expect them know where they went and what to do instead.
+    _ALL_FAMILY_ROWS = [
+        ("adaptive_rubric", "Adaptive Rubric",
+            "Judge LLM generates rubrics on the fly", "optional"),
+        ("static_rubric",   "Static Rubric",
+            "Judge LLM applies a fixed rubric (safety / grounding)", "optional"),
+        ("computation",     "Computation",
+            "Deterministic math (BLEU, ROUGE, exact_match, tool_*)", "[bold]required[/]"),
+        ("translation",     "Translation",
+            "Niche — translation-quality scorers (comet, metricx)", "[bold]required[/]"),
+    ]
+
     fams = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2), show_edge=False)
     fams.add_column("Family", style="bold cyan", min_width=18)
     fams.add_column("How it's scored", style="dim", min_width=44)
     fams.add_column("Reference?", style="dim")
-    fams.add_row("Adaptive Rubric", "Judge LLM generates rubrics on the fly", "optional")
-    fams.add_row("Static Rubric", "Judge LLM applies a fixed rubric (safety / grounding)", "optional")
-    fams.add_row("Computation", "Deterministic math (BLEU, ROUGE, exact_match, tool_*)", "[bold]required[/]")
-    fams.add_row("Translation", "Niche — translation-quality scorers (comet, metricx)", "[bold]required[/]")
+    fams.add_column("In catalog", style="dim", justify="right")
+
+    absent_families: list[tuple[str, str]] = []
+    for key, label, scoring, ref in _ALL_FAMILY_ROWS:
+        n = family_counts.get(key, 0)
+        if n > 0:
+            fams.add_row(label, scoring, ref, str(n))
+        else:
+            absent_families.append((label, scoring))
+
     console.print(fams)
+
+    if absent_families:
+        absent_names = " and ".join(f"[bold]{label}[/]" for label, _ in absent_families)
+        console.print()
+        console.print(
+            f"  [dim italic]Vertex docs also catalog {absent_names}, but the SDK we pin[/]"
+        )
+        console.print(
+            f"  [dim italic]([/][cyan]google-cloud-aiplatform=={sdk_version}[/][dim italic]) doesn't expose any as managed metrics —[/]"
+        )
+        console.print(
+            "  [dim italic]use the[/] [cyan]custom[/] [dim italic]metric path below if you need them. Reference (Vertex's metric-types overview):[/]"
+        )
+        console.print(
+            "  [cyan]https://cloud.google.com/vertex-ai/generative-ai/docs/models/determine-eval[/]"
+        )
+
     console.print()
     console.print("  [dim]Docs:[/] [cyan]https://cloud.google.com/vertex-ai/generative-ai/docs/models/rubric-metric-details[/]")
     _pause(_PAUSE_LONG)
@@ -900,7 +1567,7 @@ def _prompt_managed_metrics_selection(
     grouped: Dict[str, Dict[str, Dict]] = {f: {} for f in KNOWN_FAMILY_ORDER}
 
     for key, info in managed_metrics.items():
-        family = metric_families.classify(info.get("managed_metric_name") or key)
+        family = metric_families.classify(managed_base_name(info) or key)
         if family == "custom":
             # `metric_families.classify` returns "custom" for GCS-YAML legacy
             # rubric metrics (COHERENCE, FLUENCY, …); they belong in adaptive.
@@ -914,7 +1581,7 @@ def _prompt_managed_metrics_selection(
 
     def _tag_for(info: Dict) -> str:
         """Short capability gate that decides whether a metric can run on the user's data."""
-        if info.get("requires_multi_turn") or info.get("applies_to") == "scenarios":
+        if info.get("requires_multi_turn"):
             return "multi-turn"
         if info.get("requires_reference"):
             return "needs ref"
@@ -928,7 +1595,7 @@ def _prompt_managed_metrics_selection(
     console.print()
     console.print("  [bold]Now pick which managed metrics to enable[/]")
     console.print(
-        "  [dim]Same four families you just saw, grouped the same way. "
+        "  [dim]Same families you just saw, grouped the same way. "
         "Catalog first, picker right after.[/]"
     )
     console.print()
@@ -994,7 +1661,7 @@ def _prompt_managed_metrics_selection(
                     sr = info.get("score_range", {})
                     score = f"{sr.get('min', '?')}-{sr.get('max', '?')}"
                     sub.add_row(
-                        info["managed_metric_name"],
+                        managed_base_name(info),
                         score,
                         _tag_for(info),
                         info.get("description", ""),
@@ -1026,12 +1693,12 @@ def _prompt_managed_metrics_selection(
             "  [bold]Picker controls:[/]  "
             "[bold green]●[/] [dim]= selected ·[/]  [bold]○[/] [dim]= unselected ·[/]  "
             "[bold]space[/] [dim]toggles ·[/] [bold]↑/↓[/] [dim]navigates ·[/] "
-            "[bold]enter[/] [dim]confirms[/]"
+            "[bold]enter[/] [dim]→ review screen ([bold]not[/] final — you can edit again from there)[/]"
         )
         # Reflect what's actually pre-checked, and where it came from. Reading
         # `defaults` (mutated on reopen) keeps this honest across loop iterations.
         _checked_names = sorted(
-            managed_metrics[k]["managed_metric_name"]
+            managed_base_name(managed_metrics[k])
             for k in defaults
             if k in managed_metrics
         )
@@ -1098,7 +1765,7 @@ def _prompt_managed_metrics_selection(
             for key in sorted(members):
                 info = members[key]
                 tag = _tag_for(info)
-                label = info["managed_metric_name"]
+                label = managed_base_name(info)
                 if tag:
                     label = f"{label}  [{tag}]"
                 choices.append(
@@ -1129,9 +1796,76 @@ def _prompt_managed_metrics_selection(
             console.print()
             continue
 
+        # ── Review screen (Enter ≠ lock-in) ───────────────────────────────
+        # Customers were hitting Enter mid-navigation thinking it was just
+        # cursor movement, then losing the chance to fix the selection.
+        # Show the recap grouped by family and offer a "go back and edit"
+        # option that reopens the picker with current selections preserved.
+        # Reported by Dani 2026-04-30 after a customer demo misclick.
+        console.print()
+        if selected_keys:
+            from collections import defaultdict as _defaultdict
+            review_by_family: Dict[str, list] = _defaultdict(list)
+            for key in selected_keys:
+                entry = managed_metrics.get(key, {})
+                fam = metric_families.classify(managed_base_name(entry) or key)
+                review_by_family[fam].append(managed_base_name(entry) or key)
+
+            console.print(
+                f"  [bold]Review your selection — {len(selected_keys)} managed metric"
+                f"{'s' if len(selected_keys) != 1 else ''}:[/]"
+            )
+            for fam in family_order:
+                if fam not in review_by_family:
+                    continue
+                names = ", ".join(sorted(review_by_family[fam]))
+                console.print(
+                    f"    [dim]·[/] [bold cyan]{_family_label(fam)}[/] [dim]—[/] {names}"
+                )
+        else:
+            console.print(
+                "  [yellow]·[/] [bold]No managed metrics selected.[/] "
+                "[dim](custom metrics are still available in the next step)[/]"
+            )
+
+        console.print()
+        try:
+            confirm_choice = questionary.select(
+                "  Lock this in?",
+                choices=[
+                    questionary.Choice(
+                        "Yes — lock it in and continue",
+                        value="confirm",
+                    ),
+                    questionary.Choice(
+                        "Go back and edit (your current selection is preserved)",
+                        value="edit",
+                    ),
+                ],
+                default="confirm",  # matches the Choice value, not the label
+                style=picker_style,
+                qmark="?",
+            ).ask()
+        except (KeyboardInterrupt, EOFError):
+            raise KeyboardInterrupt
+
+        if confirm_choice is None:
+            raise KeyboardInterrupt
+
+        if confirm_choice == "edit":
+            defaults = set(selected_keys)
+            console.print()
+            console.print(
+                f"  [dim]↩ Reopening the picker — your[/] "
+                f"[bold]{len(defaults)}[/] [dim]selection"
+                f"{'s' if len(defaults) != 1 else ''} will be kept.[/]"
+            )
+            console.print()
+            continue
+
         break
 
-    # Build selected metrics dict
+    # Build selected metrics dict (final — review confirmed above)
     from agent_eval.core.metric_discovery import get_metric_definition_entry
     selected: Dict[str, Dict] = {}
     for key in selected_keys:
@@ -1139,29 +1873,16 @@ def _prompt_managed_metrics_selection(
         if entry:
             selected[key] = entry
 
-    # Recap grouped by family — confirms the choice and ties back to the
-    # four-family taxonomy one last time.
     console.print()
     if selected:
-        from collections import defaultdict as _defaultdict
-        by_family: Dict[str, list] = _defaultdict(list)
-        for key, entry in selected.items():
-            fam = metric_families.classify(entry.get("managed_metric_name") or key)
-            by_family[fam].append(entry.get("managed_metric_name") or key)
-
         console.print(
-            f"  [green]✓[/] [bold]Selected {len(selected)} managed metric"
-            f"{'s' if len(selected) != 1 else ''}[/]"
+            f"  [green]✓[/] [bold]Locked in {len(selected)} managed metric"
+            f"{'s' if len(selected) != 1 else ''}.[/]"
         )
-        for fam in family_order:
-            if fam not in by_family:
-                continue
-            names = ", ".join(sorted(by_family[fam]))
-            console.print(f"    [dim]·[/] [bold cyan]{_family_label(fam)}[/] [dim]—[/] {names}")
     else:
         console.print(
-            "  [yellow]>[/] [bold]No managed metrics selected.[/] "
-            "[dim]Custom metrics are still available in the next step.[/]"
+            "  [yellow]>[/] [bold]Continuing with no managed metrics.[/] "
+            "[dim](you can add custom metrics in the next step)[/]"
         )
 
     return selected
@@ -1211,13 +1932,15 @@ def _display_agent_analysis(analysis: Dict[str, Any]) -> None:
     console.print("  [dim]Creating state variables in your agent makes them[/]")
     console.print("  [dim]available for evaluation metrics automatically.[/]")
 
-    # Key behaviors
+    # Key behaviors — visually separated from the data table above so the
+    # user can scan the analysis output as two distinct sections.
     behaviors = analysis.get("key_behaviors", [])
     if behaviors:
         console.print()
-        console.print("  [bold]Key behaviors to evaluate:[/]")
+        console.rule("[dim]Key behaviors to evaluate[/]", style="grey50", align="left")
+        console.print()
         for b in behaviors[:5]:
-            console.print(f"    [dim]-[/] {b}")
+            console.print(f"    [dim]•[/] {b}")
 
 
 def _display_state_suggestions(suggestions: list[dict]) -> None:
@@ -1274,7 +1997,7 @@ def _prompt_ai_metrics_multistep(
     existing_custom: Dict[str, Any] = {}
     if existing_metrics:
         for k, v in existing_metrics.items():
-            if isinstance(v, dict) and v.get("is_managed"):
+            if isinstance(v, dict) and is_managed_entry(v):
                 existing_managed_keys.add(k)
             elif isinstance(v, dict):
                 existing_custom[k] = v
@@ -1315,7 +2038,7 @@ def _prompt_ai_metrics_multistep(
 
     if selected_managed:
         names = ", ".join(
-            info["managed_metric_name"] for info in selected_managed.values()
+            managed_base_name(info) for info in selected_managed.values()
         )
         console.print(f"\n  [green]Selected:[/] {names}")
     else:
@@ -1333,6 +2056,45 @@ def _prompt_ai_metrics_multistep(
     console.print("  [dim]Press Enter to skip — Gemini will analyze the code on its own.[/]")
     console.print()
     user_priorities = Prompt.ask("  What should custom metrics focus on?", default="")
+
+    # How many custom metrics? Gemini gravitates to the upper bound of any
+    # range we give it (told 2-4 → returned 3 even when the user asked for
+    # exactly 1). Same fix as test data generation: pin an EXACT number and
+    # let the user override.
+    console.print()
+    console.print(
+        "  [dim italic]Tip: start small.[/] [dim]One sharp metric you understand "
+        "beats five fuzzy ones — easier to debug,[/]"
+    )
+    console.print(
+        "  [dim]easier to trust, and the eval loop becomes more meaningful. "
+        "You can grow the catalog later — your[/]"
+    )
+    console.print(
+        "  [cyan]CLAUDE.md[/] [dim]/[/] [cyan]GEMINI.md[/] [dim]teach your code assistant the "
+        "metric_definitions.json schema, so editing it[/]"
+    )
+    console.print(
+        "  [dim]is a one-line ask away.[/]"
+    )
+    console.print()
+    while True:
+        try:
+            n_custom_metrics = IntPrompt.ask(
+                "  How many custom metrics should Gemini generate?",
+                default=3,
+            )
+        except (KeyboardInterrupt, EOFError):
+            n_custom_metrics = 3
+            break
+        if 1 <= n_custom_metrics <= 10:
+            break
+        console.print("  [red]Pick a number between 1 and 10.[/]")
+    plural = "metric" if n_custom_metrics == 1 else "metrics"
+    console.print(
+        f"  [dim]→ Gemini will generate exactly[/] [bold]{n_custom_metrics} custom {plural}[/]."
+    )
+
     generate_custom = True  # always generate; refine/skip loop is the user's off-ramp
 
     _continue("Next: scan your agent's code for evaluation data →", console=console)
@@ -1359,52 +2121,100 @@ def _prompt_ai_metrics_multistep(
         console.print()
         _display_agent_analysis(agent_analysis)
 
-    # ── State variable suggestions + optional re-analyze ─────────────
+    # ── State variable suggestions (opt-in, single round) ──────────────
+    # Bug fix 2026-05-02: previously this loop ALWAYS displayed suggestions
+    # AND left `suggested_state_variables` in agent_analysis when the user
+    # picked Continue without adding them. Gemini's metric generator then
+    # invented metrics referencing state vars that don't exist in the agent
+    # code (e.g. `retrieval_query` was never persisted, but a metric
+    # `retrieval_query_accuracy` referenced it). Two fixes:
+    #   1. Opt-in prompt — ask BEFORE showing the suggestions
+    #   2. Single round — show once, accept-or-not, no infinite loop
+    #   3. STRIP `suggested_state_variables` after this block so they can't
+    #      leak into Call 2's prompt and influence metric generation
     suggestions = agent_analysis.get("suggested_state_variables", [])
+    user_modified_agent_code = False  # tracks whether to remind about re-deploy later
 
     if suggestions:
-        _display_state_suggestions(suggestions)
-        _continue("Next: re-analyze (if you added the snippets) or continue →", console=console)
+        console.print()
+        console.print(
+            f"  [bold]Gemini found {len(suggestions)} state variable(s)[/] [dim]you could add to "
+            "your agent that would unlock richer evaluation[/]"
+        )
+        console.print(
+            "  [dim](e.g. tracking tool inputs/outputs explicitly so metrics can score them).[/]"
+        )
+        console.print()
+        try:
+            wants_suggestions = questionary.confirm(
+                "  Show the suggestions? You can review the AI-drafted snippets and decide whether to paste them.",
+                default=True,
+            ).ask()
+        except (KeyboardInterrupt, EOFError):
+            wants_suggestions = False
 
-        while True:
+        if wants_suggestions:
+            _display_state_suggestions(suggestions)
+            _continue(
+                "Next: did you add any of these to your agent? →",
+                console=console,
+            )
+
             console.print()
-            console.print("    [bold]1.[/] [cyan]I've made changes[/] — re-analyze my agent")
-            console.print("    [bold]2.[/] [green]Continue[/] — use current state variables")
+            console.print(
+                "    [bold]1.[/] [cyan]Yes — re-analyze[/] (I added one or more snippets to my agent.py)"
+            )
+            console.print(
+                "    [bold]2.[/] [green]No — continue[/] (use the agent's current state variables only; "
+                "drop the suggestions)"
+            )
             console.print()
             action = IntPrompt.ask("  Select", default=2)
             while action not in (1, 2):
                 console.print("  [red]Please enter 1 or 2[/]")
                 action = IntPrompt.ask("  Select", default=2)
 
-            if action == 2:
-                break
-
-            console.print()
-            console.print("  [bold cyan]Re-analyzing your agent's code[/]")
-            console.print("  [dim]Reading updated agent.py, tools, and prompts...[/]")
-            console.print()
-            with console.status(
-                "[bold blue]  Re-analyzing agent source code...[/]", spinner="dots",
-            ):
-                try:
-                    from agent_eval.core.metric_generator import analyze_agent_data as _reanalyze
-                    agent_analysis = _reanalyze(agent_dir, agent_name)
-                except Exception as e:
-                    console.print(f"  [yellow]Re-analysis failed:[/] {e}")
-                    console.print("  [dim]Continuing with previous analysis.[/]")
-                    break
-
-            if agent_analysis.get("tools") or agent_analysis.get("state_variables"):
+            if action == 1:
+                user_modified_agent_code = True
                 console.print()
-                _display_agent_analysis(agent_analysis)
-
-            suggestions = agent_analysis.get("suggested_state_variables", [])
-            if not suggestions:
+                console.print("  [bold cyan]Re-analyzing your agent's code[/]")
+                console.print("  [dim]Reading updated agent.py, tools, and prompts...[/]")
                 console.print()
-                console.print("  [green]>[/] No additional state variable suggestions.")
-                break
+                with console.status(
+                    "[bold blue]  Re-analyzing agent source code...[/]", spinner="dots",
+                ):
+                    try:
+                        from agent_eval.core.metric_generator import analyze_agent_data as _reanalyze
+                        agent_analysis = _reanalyze(agent_dir, agent_name)
+                    except Exception as e:
+                        console.print(f"  [yellow]Re-analysis failed:[/] {e}")
+                        console.print("  [dim]Continuing with previous analysis.[/]")
 
-            _display_state_suggestions(suggestions)
+                if agent_analysis.get("tools") or agent_analysis.get("state_variables"):
+                    console.print()
+                    _display_agent_analysis(agent_analysis)
+
+        # Whether the user added them or not, REMOVE `suggested_state_variables`
+        # so the metric generator doesn't see them. If the user accepted +
+        # re-analyzed, accepted vars are now in `state_variables` (real); if
+        # they declined, the suggestions shouldn't influence Gemini.
+        agent_analysis.pop("suggested_state_variables", None)
+
+        # If the user modified agent.py, flag the re-deploy step here so
+        # they don't run agent-engine against the stale deployed version.
+        if user_modified_agent_code:
+            console.print()
+            console.print(
+                "  [bold yellow]⚠ You changed your agent code.[/] [dim]Local "
+                "[cyan]agent-eval run[/] [dim]will pick up the changes automatically (it[/]"
+            )
+            console.print(
+                "  [dim]imports[/] [cyan]agent.py[/] [dim]live). But[/] [cyan]agent-eval agent-engine[/] "
+                "[dim]hits your[/] [bold]deployed[/] [dim]Reasoning Engine —[/]"
+            )
+            console.print(
+                "  [dim]re-deploy first or you'll evaluate the stale version:[/]  [cyan]make backend[/]"
+            )
 
     # ── Gemini Call 2 — Generate custom metrics (if opted in) ─────────────
     custom_metrics: Dict[str, Any] = {}
@@ -1428,6 +2238,7 @@ def _prompt_ai_metrics_multistep(
                     selected_managed=selected_managed,
                     user_priorities=user_priorities,
                     existing_metrics=existing_metrics,
+                    n_custom_metrics=n_custom_metrics,
                 )
             except Exception as e:
                 console.print(f"\n  [yellow]Metric generation failed:[/] {e}")
@@ -1483,6 +2294,7 @@ def _prompt_ai_metrics_multistep(
                             agent_name=agent_name,
                             agent_analysis=agent_analysis,
                             selected_managed=selected_managed,
+                            n_custom_metrics=n_custom_metrics,
                             user_priorities=combined_priorities,
                             existing_metrics=existing_metrics,
                         )
@@ -1501,11 +2313,78 @@ def _prompt_ai_metrics_multistep(
         if existing_custom:
             custom_metrics.update(existing_custom)
 
+    # ── Materialize metrics file BEFORE Call 3 (data gen) ─────────────────
+    # The file becomes the contract: test data is generated to EXERCISE these
+    # metrics. The user can edit on disk now and the data-gen step picks
+    # up their changes. Validation gate catches schema-breaking edits before
+    # they propagate. (See _render_metric_review_guide for the in-CLI
+    # editing guide — kept out of the JSON to keep the file clean.)
+    from agent_eval.core.path_resolver import agent_project_root
+    from agent_eval.core.scaffold import scaffold_metrics_only
+    project_root = agent_project_root(agent_dir)
+    metrics_path = project_root / "tests" / "eval" / "metrics" / "metric_definitions.json"
+    console.print()
+    console.print("  [bold cyan]Writing metric_definitions.json[/] [dim](you can tweak it before we generate test data)[/]")
+    scaffold_metrics_only(
+        target_dir=agent_dir,
+        agent_name=agent_name,
+        custom_metric_definitions=custom_metrics,
+    )
+    custom_metrics = _review_with_validation_loop(
+        metrics_path,
+        custom_metrics=custom_metrics,
+        rationale=rationale,
+        auto_approve=False,  # this whole multistep path is interactive
+    )
+
     # ── Test data guidance ────────────────────────────────────────────────
     console.print()
     console.print("  [bold cyan]Creating test scenarios and sample queries[/]")
-    console.print("  [dim]Generating multi-turn conversation scripts (for simulation) and[/]")
-    console.print("  [dim]single-turn test queries (for regression testing) based on your metrics.[/]")
+    console.print("  [dim]We'll generate two kinds of test rows from your metrics:[/]")
+    console.print(
+        "    [cyan]•[/] [bold]Multi-turn[/] [dim]— conversation scripts that drive[/] [cyan]simulate[/] [dim](ADK UserSim plays the user role)[/]"
+    )
+    console.print(
+        "    [cyan]•[/] [bold]Single-turn[/] [dim]— specific queries with reference data that drive[/] [cyan]interact[/] [dim]+[/] [cyan]agent-engine[/]"
+    )
+    console.print()
+
+    # Row-count prompt. Gemini gravitates to the lower bound of any range we
+    # give it (told 5-8 → returned 5), so we pin an EXACT number per kind
+    # and let the user override.
+    console.print(
+        "  [dim italic]Tip: start small.[/] [dim]A few well-chosen rows you can read end-to-end "
+        "beat dozens of[/]"
+    )
+    console.print(
+        "  [dim]auto-generated noise — easier to debug, easier to trust the scores. "
+        "You can grow the[/]"
+    )
+    console.print(
+        "  [dim]dataset later — your[/] [cyan]CLAUDE.md[/] [dim]/[/] [cyan]GEMINI.md[/] "
+        "[dim]teach your code assistant the row schema, so adding[/]"
+    )
+    console.print(
+        "  [dim]more rows is a one-line ask away.[/]"
+    )
+    console.print()
+    while True:
+        try:
+            n_rows = IntPrompt.ask(
+                "  How many rows of [bold]each kind[/] should we generate?",
+                default=5,
+            )
+        except (KeyboardInterrupt, EOFError):
+            n_rows = 5
+            break
+        if 1 <= n_rows <= 30:
+            break
+        console.print("  [red]Pick a number between 1 and 30.[/]")
+    console.print(
+        f"  [dim]→ Gemini will generate exactly[/] [bold]{n_rows} multi-turn[/] [dim]+[/] "
+        f"[bold]{n_rows} single-turn[/] [dim]rows ({n_rows * 2} total).[/]"
+    )
+
     console.print()
     if existing_scenarios or existing_golden:
         console.print("  [dim]You have existing test data. Gemini will extend it — guide what new[/]")
@@ -1518,6 +2397,13 @@ def _prompt_ai_metrics_multistep(
     test_data_priorities = Prompt.ask("  What should test data focus on?", default="")
 
     _continue("Next: generate test scenarios and sample queries →", console=console)
+
+    # Required reference_data field names — extracted from the (possibly
+    # user-edited) metrics so Call 3 knows which fields MUST be populated.
+    # Gap-2 fix from the audit: without this, Gemini defaulted to
+    # expected_behavior even when metrics expected expected_docs / expected_route
+    # → silent every-row-skipped behavior at evaluate time.
+    required_ref_fields = _required_reference_fields(custom_metrics)
 
     # ── Gemini Call 3 — Generate test data ────────────────────────────────
     recommendations: Dict[str, Any] = {}
@@ -1534,6 +2420,9 @@ def _prompt_ai_metrics_multistep(
                 existing_scenarios=existing_scenarios,
                 existing_golden=existing_golden,
                 user_priorities=test_data_priorities,
+                metric_rationale=rationale,
+                required_reference_fields=required_ref_fields,
+                rows_per_kind=n_rows,
             )
         except Exception as e:
             console.print(f"  [yellow]Test data generation failed:[/] {e}")
@@ -1587,6 +2476,9 @@ def _prompt_ai_metrics_multistep(
                         agent_name=agent_name,
                         agent_analysis=agent_analysis,
                         metric_definitions=custom_metrics,
+                        metric_rationale=rationale,
+                        required_reference_fields=required_ref_fields,
+                        rows_per_kind=n_rows,
                         existing_scenarios=existing_scenarios,
                         existing_golden=existing_golden,
                         user_priorities=test_data_priorities,
@@ -1673,18 +2565,18 @@ def _display_generated_metrics(metrics: dict, rationale: str) -> None:
     table.add_column("Runs On", style="dim", justify="center")
 
     def _runs_on(defn: dict) -> str:
-        if defn.get("requires_multi_turn") or defn.get("applies_to") == "scenarios":
+        if defn.get("requires_multi_turn"):
             return "multi-turn rows"
-        if defn.get("requires_reference") or defn.get("applies_to") == "golden_dataset":
+        if defn.get("requires_reference"):
             return "reference rows"
         return "any row"
 
     # Sort: managed metrics first, then custom
-    sorted_metrics = sorted(metrics.items(), key=lambda x: (0 if x[1].get("is_managed") else 1, x[0]))
+    sorted_metrics = sorted(metrics.items(), key=lambda x: (0 if is_managed_entry(x[1]) else 1, x[0]))
 
     shown_custom_separator = False
     for name, defn in sorted_metrics:
-        is_managed = defn.get("is_managed", False)
+        is_managed = is_managed_entry(defn)
 
         # Add separator before first custom metric
         if not is_managed and not shown_custom_separator:
@@ -1710,7 +2602,8 @@ def _display_generated_metrics(metrics: dict, rationale: str) -> None:
 
     if rationale and not rationale.startswith("\n"):
         console.print()
-        console.print("  [bold]Rationale[/]")
+        console.rule("[dim]Rationale — why these metrics[/]", style="grey50", align="left")
+        console.print()
         for line in rationale.strip().splitlines():
             console.print(f"  [dim]{line}[/]")
 
@@ -1736,16 +2629,21 @@ def _display_recommendations(recommendations: dict) -> None:
                 console.print(f"  {line}")
 
     # ── Scenario table (multi-turn) ──────────────────────────────────────
+    # Visually separate the strategy paragraph from the scenarios table so
+    # the test data display reads as distinct sections, not a wall of text.
     scenarios = recommendations.get("scenarios", [])
     if scenarios:
         console.print()
-        console.print(
-            "  [bold]Suggested Scenarios[/] [dim]— multi-turn conversations for ADK User Sim.[/]"
+        console.rule(
+            "[dim]Suggested Scenarios — multi-turn conversations for ADK User Sim[/]",
+            style="grey50",
+            align="left",
         )
         console.print(
             "  [dim]The simulator follows these plans without reference data —[/]"
             "\n  [dim]it evaluates how the agent handles the full conversation.[/]"
         )
+        console.print()
         scenario_table = Table(border_style="cyan", padding=(0, 2), expand=True)
         scenario_table.add_column("#", style="dim", width=3)
         scenario_table.add_column("Starting Prompt", style="cyan", ratio=2)
@@ -1760,13 +2658,16 @@ def _display_recommendations(recommendations: dict) -> None:
     golden = recommendations.get("golden_data", [])
     if golden:
         console.print()
-        console.print(
-            "  [bold]Suggested Test Queries[/] [dim]— single-turn queries with reference data.[/]"
+        console.rule(
+            "[dim]Suggested Test Queries — single-turn queries with reference data[/]",
+            style="grey50",
+            align="left",
         )
         console.print(
             "  [dim]Each query includes expected behavior so the evaluator can[/]"
             "\n  [dim]check if the agent's response matches what it should do.[/]"
         )
+        console.print()
         golden_table = Table(border_style="cyan", padding=(0, 2), expand=True)
         golden_table.add_column("#", style="dim", width=3)
         golden_table.add_column("Query", style="cyan", ratio=2)
@@ -1797,24 +2698,28 @@ def _display_summary(
     chosen_paths: set[str] | None = None,
 ) -> None:
     """Show what files will be created/kept, with descriptions of each file's purpose."""
-    eval_dir = agent_dir / "eval"
-    unified_dir = agent_dir / "tests" / "eval"
-    is_existing = eval_dir.exists() or unified_dir.exists()
+    # Files land at the AGENT PROJECT ROOT (where pyproject.toml lives) —
+    # NEVER inside the agent module dir. Pre-rescue this used `agent_dir / "tests"`
+    # which displayed `app/tests/eval/` even though we wrote to the project root.
+    from agent_eval.core.path_resolver import agent_project_root
+    project_root = agent_project_root(agent_dir)
+    unified_dir = project_root / "tests" / "eval"
+    is_existing = unified_dir.exists()
     chosen_paths = chosen_paths or {"A", "B"}
 
     # Determine what will happen to each file
-    existing_metrics = (eval_dir / "metrics" / "metric_definitions.json").exists()
-    existing_scenarios = (eval_dir / "scenarios" / "conversation_scenarios.json").exists()
-    existing_golden = (eval_dir / "eval_data" / "golden_dataset.json").exists()
-    existing_session = (eval_dir / "scenarios" / "session_input.json").exists()
     existing_dataset = (unified_dir / "dataset.jsonl").exists()
     existing_unified_metrics = (unified_dir / "metrics" / "metric_definitions.json").exists()
     has_ai = custom_metrics is not None
 
-    if "B" in chosen_paths:
-        console.print(f"  Creating local pipeline files in [cyan]{eval_dir}/[/]")
-    if "A" in chosen_paths:
-        console.print(f"  Creating Agent Engine pass files in [cyan]{unified_dir}/[/]")
+    # One unified location, both surfaces read from it (Phase D — single
+    # source of truth). The chosen_paths set still influences the
+    # next-steps text below (which commands to highlight) but doesn't
+    # change WHERE we write.
+    console.print(
+        f"  Writing eval files to [cyan]{unified_dir}/[/]  "
+        f"[dim](one location feeds simulate, interact, and agent-engine)[/]"
+    )
     if is_existing and has_ai:
         console.print("  [dim]Existing files will be backed up to .backup/ before updating.[/]")
     elif is_existing:
@@ -1827,59 +2732,58 @@ def _display_summary(
     table.add_column("File", style="cyan", ratio=2)
     table.add_column("Purpose", ratio=3)
 
-    # ── Agent Engine pass: unified SDK-aligned layout ────────────────────
-    if "A" in chosen_paths:
-        if existing_dataset:
-            table.add_row("[yellow]kept[/]", "[dim]tests/eval/dataset.jsonl[/]", "[dim]Existing unified dataset for Agent Engine (unchanged)[/]")
-        else:
-            table.add_row("[green]new[/]", "tests/eval/dataset.jsonl", "Unified prompt/session_inputs rows for `agent-eval agent-engine`")
+    # ── Unified layout (Phase D): one dataset.jsonl + one metrics file ──
+    # Same files regardless of detected execution paths. simulate, interact,
+    # and agent-engine all read from the same source of truth at the
+    # project root. The chosen_paths set still influences the next-steps
+    # text below (which commands to highlight) but no longer changes which
+    # files get written.
+    if existing_unified_metrics and not has_ai:
+        table.add_row(
+            "[yellow]kept[/]",
+            "[dim]tests/eval/metrics/metric_definitions.json[/]",
+            "[dim]Your current scoring rubrics (unchanged)[/]",
+        )
+    elif has_ai and existing_unified_metrics:
+        table.add_row(
+            "[green]updated[/]",
+            "tests/eval/metrics/metric_definitions.json",
+            "AI-generated scoring rubrics (previous version backed up to .backup/)",
+        )
+    else:
+        table.add_row(
+            "[green]new[/]",
+            "tests/eval/metrics/metric_definitions.json",
+            "LLM-as-judge scoring rubrics (managed + custom)",
+        )
 
-        if "B" not in chosen_paths:
-            # Path-A-only flow scaffolds metrics into tests/eval too
-            if existing_unified_metrics:
-                table.add_row("[yellow]kept[/]", "[dim]tests/eval/metrics/metric_definitions.json[/]", "[dim]Existing scoring rubrics (unchanged)[/]")
-            else:
-                label = "[green]new[/]" if not has_ai else "[green]new[/]"
-                table.add_row(label, "tests/eval/metrics/metric_definitions.json", "LLM-as-judge scoring rubrics")
-
-    # ── Local pipeline: ADK-runtime layout (used by simulate/UserSim) ────
-    if "B" in chosen_paths:
-        if has_ai:
-            if existing_metrics:
-                table.add_row("[green]updated[/]", "eval/metrics/metric_definitions.json", "AI-generated scoring rubrics (previous version backed up)")
-            else:
-                table.add_row("[green]new[/]", "eval/metrics/metric_definitions.json", "AI-generated scoring rubrics for evaluating agent responses")
-        elif existing_metrics:
-            table.add_row("[yellow]kept[/]", "[dim]eval/metrics/metric_definitions.json[/]", "[dim]Your current scoring rubrics (unchanged)[/]")
-        else:
-            table.add_row("[green]new[/]", "eval/metrics/metric_definitions.json", "LLM-as-judge scoring rubrics for evaluating agent responses")
-
-        if mode in ("user-sim", "both"):
-            if has_ai:
-                if existing_scenarios:
-                    table.add_row("[green]updated[/]", "eval/scenarios/conversation_scenarios.json", "AI scenarios merged with existing (previous version backed up)")
-                else:
-                    table.add_row("[green]new[/]", "eval/scenarios/conversation_scenarios.json", "AI-generated multi-turn conversation scripts for ADK User Sim")
-            elif existing_scenarios:
-                table.add_row("[yellow]kept[/]", "[dim]eval/scenarios/conversation_scenarios.json[/]", "[dim]Your current multi-turn scenario scripts (unchanged)[/]")
-            else:
-                table.add_row("[green]new[/]", "eval/scenarios/conversation_scenarios.json", "Multi-turn conversation scripts for ADK User Sim")
-
-        if mode in ("diy", "both"):
-            if has_ai:
-                if existing_golden:
-                    table.add_row("[green]updated[/]", "eval/eval_data/golden_dataset.json", "AI queries merged with existing (previous version backed up)")
-                else:
-                    table.add_row("[green]new[/]", "eval/eval_data/golden_dataset.json", "AI-generated test queries with expected behaviors")
-            elif existing_golden:
-                table.add_row("[yellow]kept[/]", "[dim]eval/eval_data/golden_dataset.json[/]", "[dim]Your current test queries (unchanged)[/]")
-            else:
-                table.add_row("[green]new[/]", "eval/eval_data/golden_dataset.json", "Single-turn test queries with expected behaviors")
-
-        if not existing_session:
-            table.add_row("[green]new[/]", "eval/scenarios/session_input.json", "Agent name + user ID for trace collection")
+    if existing_dataset and not has_ai:
+        table.add_row(
+            "[yellow]kept[/]",
+            "[dim]tests/eval/dataset.jsonl[/]",
+            "[dim]Your current evaluation rows (unchanged)[/]",
+        )
+    elif has_ai and existing_dataset:
+        table.add_row(
+            "[green]updated[/]",
+            "tests/eval/dataset.jsonl",
+            "AI-generated rows (previous version backed up to .backup/)",
+        )
+    else:
+        table.add_row(
+            "[green]new[/]",
+            "tests/eval/dataset.jsonl",
+            "Single source of truth — drives simulate (multi-turn rows), "
+            "interact + agent-engine (single-turn rows)",
+        )
 
     console.print(table)
+    console.print()
+    console.print(
+        "  [dim]One file feeds every path. ADK's per-run scenario files "
+        "(conversation_scenarios.json etc.) are projected from this dataset "
+        "by `agent-eval simulate` and live in app/ as ephemeral cache.[/]"
+    )
 
 
 def _display_next_steps(
@@ -1888,83 +2792,97 @@ def _display_next_steps(
     chosen_paths: set[str] | None = None,
 ) -> None:
     eval_path = agent_dir / "eval"
-    unified_path = agent_dir / "tests" / "eval"
+    from agent_eval.core.path_resolver import agent_project_root
+    project_root = agent_project_root(agent_dir).resolve()
+    unified_eval = project_root / "tests" / "eval"
     has_ai = custom_metrics is not None
     chosen_paths = chosen_paths or {"A", "B"}
+    has_local = "B" in chosen_paths
+    has_agent_engine = "A" in chosen_paths
 
-    lines = []
+    # Resolve agent_dir relative to project_root for tighter command display
+    # (e.g. "agents/crwd-legal-discovery/app" instead of an absolute path).
+    try:
+        agent_dir_rel = agent_dir.resolve().relative_to(project_root)
+    except (ValueError, OSError):
+        agent_dir_rel = agent_dir
+
+    lines: list[str] = []
     step = 1
 
-    # Review files — point at whichever metrics file actually exists
-    metrics_path = (
-        eval_path / "metrics" / "metric_definitions.json"
-        if "B" in chosen_paths
-        else unified_path / "metrics" / "metric_definitions.json"
-    )
+    # Review files — single source of truth at the project root.
     lines.append(f"[bold]{step}.[/] Review your metric definitions:")
-    lines.append(f"   [cyan]{metrics_path}[/]")
+    lines.append(f"   [cyan]{unified_eval / 'metrics' / 'metric_definitions.json'}[/]")
     step += 1
-    if "A" in chosen_paths:
-        lines.append(f"[bold]{step}.[/] Review your Agent Engine dataset:")
-        lines.append(f"   [cyan]{unified_path}/dataset.jsonl[/]")
-        step += 1
-    if "B" in chosen_paths and mode in ("user-sim", "both"):
-        lines.append(f"[bold]{step}.[/] Review your scenarios:")
-        lines.append(f"   [cyan]{eval_path}/scenarios/conversation_scenarios.json[/]")
-        step += 1
-    if "B" in chosen_paths and mode in ("diy", "both"):
-        lines.append(f"[bold]{step}.[/] Review your golden dataset:")
-        lines.append(f"   [cyan]{eval_path}/eval_data/golden_dataset.json[/]")
-        step += 1
+    lines.append(f"[bold]{step}.[/] Review your evaluation dataset (one file, all paths):")
+    lines.append(f"   [cyan]{unified_eval / 'dataset.jsonl'}[/]")
+    step += 1
 
     lines.append("")
-    if chosen_paths == {"A"}:
-        # No local source — only the streamlined pass is available.
-        lines.append(f"[bold]{step}.[/] Run the streamlined Agent Engine pass:")
-        lines.append(f"   [dim]$[/] agent-eval agent-engine")
-        lines.append("")
-        lines.append("   [dim]Vertex calls your deployed agent, scores responses against your metrics,[/]")
-        lines.append("   [dim]and uploads results to GCS — one managed call.[/]")
-        lines.append("")
-        lines.append("   [dim]To also enable the local pipeline (multi-turn UserSim + full traces), put[/]")
-        lines.append("   [dim]your agent.py somewhere we can find it and re-run[/] [cyan]agent-eval init[/][dim].[/]")
-    elif chosen_paths == {"B"}:
-        # The default, common case — iterating locally before deploying.
-        lines.append(f"[bold]{step}.[/] Run the local pipeline:")
-        lines.append(f"   [dim]$[/] agent-eval run --agent-dir {agent_dir}")
-        lines.append("")
-        lines.append("   [dim]Four phases in sequence — collect traces (UserSim + DIY) → evaluate → analyze.[/]")
-        lines.append("   [dim]This is the iteration loop. Tweak your agent, re-run, compare.[/]")
-        lines.append("")
-        lines.append("   [dim]Once you deploy to Agent Engine ([/][cyan]make backend[/][dim]), re-run[/] "
-                     "[cyan]agent-eval init[/] [dim]and we'll[/]")
-        lines.append("   [dim]wire up the streamlined single-turn pass too.[/]")
-    else:
-        # Both surfaces detected — lead with the local iteration loop.
+
+    # ── Where to run the next commands from + one-time dep install ──────
+    # Both `run` and `agent-engine` walk up from cwd to find the nearest
+    # pyproject.toml — running from accelerate/ root finds the wrong one.
+    # Plus both import the agent's `agent.py` for AgentInfo, so the agent's
+    # deps need to be in agent-eval's venv too (otherwise: missing-dep
+    # warnings + reduced-fidelity scoring).
+    lines.append(f"[bold yellow]→ Before you run anything below:[/]")
+    lines.append(f"   [dim]$[/] cd {project_root}")
+    lines.append(f"   [dim]$[/] uv pip install -e .   [dim](one-time — install agent deps into agent-eval's venv)[/]")
+    lines.append("")
+
+    # Always lead with the local iteration loop when local source is
+    # available. The streamlined Agent Engine pass is a confirmation step
+    # against the deployed agent — surfaced second.
+    if has_local:
         lines.append(f"[bold]{step}.[/] Run the local pipeline (the iteration loop):")
-        lines.append(f"   [dim]$[/] agent-eval run --agent-dir {agent_dir}")
+        lines.append(f"   [dim]$[/] agent-eval run --agent-dir {agent_dir_rel}")
         lines.append("")
         lines.append("   [dim]Four phases — collect traces (UserSim + DIY) → evaluate → analyze.[/]")
-        lines.append("   [dim]Use this for every change you make.[/]")
+        lines.append("   [dim]simulate reads multi-turn rows from dataset.jsonl, interact reads single-turn.[/]")
+        step += 1
         lines.append("")
-        lines.append(f"[bold]{step + 1}.[/] Run the streamlined Agent Engine pass (confirm against the deployed agent):")
+
+    if has_agent_engine:
+        lines.append(f"[bold]{step}.[/] Run the streamlined pass against the deployed agent:")
+        lines.append(f"   [dim]$[/] make backend            [dim](redeploy if you changed[/] [cyan]agent.py[/] [dim]since last deploy)[/]")
         lines.append(f"   [dim]$[/] agent-eval agent-engine")
         lines.append("")
-        lines.append("   [dim]Single-turn managed scoring against the live deployment — slower iteration but[/]")
-        lines.append("   [dim]the truth check. Compare both with[/] [cyan]agent-eval dashboard[/][dim].[/]")
+        lines.append(
+            "   [dim]Auto-discovers[/] [cyan]tests/eval/dataset.jsonl[/] [dim]and[/] "
+            "[cyan]deployment_metadata.json[/] [dim]from the project root.[/]"
+        )
+        lines.append(
+            "   [yellow]⚠[/] [dim]This hits the[/] [bold]deployed[/] [dim]agent — local edits to[/] "
+            "[cyan]agent.py[/] [dim]won't show up until you re-deploy with[/] [cyan]make backend[/][dim].[/]"
+        )
+        if has_local:
+            lines.append(
+                "   [dim]Single-turn managed scoring against the live deployment. Multi-turn rows are[/]"
+            )
+            lines.append(
+                "   [dim]skipped here (Agent Engine is single-turn only) — covered by[/] [cyan]simulate[/] "
+                "[dim]above. Compare both surfaces with[/] [cyan]agent-eval dashboard[/][dim].[/]"
+            )
+        else:
+            lines.append("   [dim]Vertex calls your deployed agent, scores against your metrics, uploads to GCS.[/]")
+            lines.append("   [dim]To also enable the local pipeline (UserSim + full traces), put your agent.py[/]")
+            lines.append("   [dim]somewhere we can find it and re-run[/] [cyan]agent-eval init[/][dim].[/]")
+        step += 1
 
-    if has_ai and (eval_path / ".backup").exists():
+    if has_ai and (unified_eval / ".backup").exists():
         lines.append("")
-        lines.append("[dim]Your previous eval files are backed up in eval/.backup/[/]")
+        lines.append("[dim]Your previous eval files are backed up in tests/eval/.backup/.[/]")
         lines.append("[dim]Delete the backup when you're satisfied with the new files.[/]")
 
-    if "B" in chosen_paths:
+    if has_local:
         lines.append("")
-        lines.append("[dim]Note: The interact phase sends queries to a running agent.[/]")
-        lines.append("[dim]Make sure your agent is serving (e.g. [bold]adk web[/bold]) before running.[/]")
+        lines.append("[dim]Note: the interact phase sends queries to a running agent.[/]")
+        lines.append("[dim]Start your agent (e.g. [bold]adk web[/bold] or [bold]agents-cli playground[/bold]) before running.[/]")
         lines.append("[dim]If the agent isn't reachable, interact is skipped gracefully.[/]")
+
     lines.append("")
-    lines.append("[dim]Or run individual steps — see: agent-eval --help[/]")
+    lines.append("[dim]Run individual phases — see: agent-eval --help[/]")
 
     console.print(Panel("\n".join(lines), title="[bold]Next Steps[/]", border_style="green", padding=(1, 2)))
 
@@ -2042,7 +2960,7 @@ def _display_connection_map(
             continue
 
         sources: list[str] = []
-        if defn.get("is_managed"):
+        if is_managed_entry(defn):
             sources.append("request/response (auto)")
         else:
             mapping = defn.get("dataset_mapping", {})
@@ -2055,12 +2973,14 @@ def _display_connection_map(
 
         source_str = ", ".join(sources) if sources else "default"
 
-        if defn.get("requires_multi_turn") or defn.get("applies_to") == "scenarios":
-            runs_on = "multi-turn"
-        elif defn.get("requires_reference") or defn.get("applies_to") == "golden_dataset":
-            runs_on = "reference"
-        else:
-            runs_on = "any"
+        # Flags compose — a metric can require both. Show that explicitly so
+        # the user understands the row → metric routing.
+        flags = []
+        if defn.get("requires_multi_turn"):
+            flags.append("multi-turn")
+        if defn.get("requires_reference"):
+            flags.append("reference")
+        runs_on = " + ".join(flags) if flags else "any row"
 
         table.add_row(name, source_str, runs_on)
 
@@ -2262,12 +3182,17 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
 
         # Step 3 — Detect the execution path for THIS agent.
         # Scope rule:
-        # - Multiple agents in search_dir → scope to agent_dir (avoid
-        #   picking up a sibling agent's deployment_metadata.json).
-        # - Single agent (typical ASP layout) → scope to search_dir so
-        #   project-root metadata that lives one level above the agent
-        #   module folder is still found.
-        detect_root = agent_dir if len(agents) > 1 else search_dir
+        # - Multiple agents in search_dir → scope to THIS agent's project
+        #   root (the directory with pyproject.toml, typically one level
+        #   above app/). That's where ASP writes deployment_metadata.json.
+        #   Scoping to agent_dir alone (the app/ folder) misses the file
+        #   that sits one level up — the bug Dani found 2026-05-01 when
+        #   running init from the accelerate root with multiple agents
+        #   under agents/.
+        # - Single agent (typical when --target-dir IS the agent project)
+        #   → search_dir already is the project root.
+        from agent_eval.core.path_resolver import agent_project_root as _ae_root
+        detect_root = _ae_root(agent_dir) if len(agents) > 1 else search_dir
         detection = _display_path_detection(detect_root)
         chosen_paths = _prompt_path_choice(detection)
 
@@ -2285,35 +3210,82 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
     _display_summary(agent_dir, agent_name, mode, metrics, custom_metrics, chosen_paths)
 
     if not auto_approve:
-        _continue("Next: write the eval files →", console=console)
+        _continue("Next: write the eval files (you'll review each one) →", console=console)
 
     console.print()
-    if "B" in chosen_paths or not chosen_paths:
-        scaffold_eval_structure(
-            target_dir=agent_dir,
-            agent_name=agent_name,
-            mode=mode if mode != "dataset-only" else "both",
-            metrics=metrics,
-            custom_metric_definitions=custom_metrics,
-            ai_recommendations=recommendations,
+
+    # ── Scaffold Step 1: metrics ──────────────────────────────────────────
+    # In the AI multi-step flow, _prompt_ai_metrics_multistep already
+    # materialized metric_definitions.json + ran the review/validation gate
+    # BEFORE Call 3 generated the dataset. Here we use if_exists="skip" so
+    # we don't clobber those edits; only write when the file isn't on disk
+    # yet (the non-AI / starter-metrics path).
+    from agent_eval.core.path_resolver import agent_project_root
+    from agent_eval.core.scaffold import scaffold_dataset_jsonl, scaffold_metrics_only
+
+    project_root = agent_project_root(agent_dir)
+    metrics_path = project_root / "tests" / "eval" / "metrics" / "metric_definitions.json"
+
+    metrics_already_materialized = metrics_path.exists()
+    scaffold_metrics_only(
+        target_dir=agent_dir,
+        agent_name=agent_name,
+        metrics=metrics,
+        custom_metric_definitions=custom_metrics,
+        if_exists="skip",
+    )
+    # Non-AI / starter-metrics path: the file was just written for the first
+    # time. Run the same review + validation loop the AI path uses so the
+    # user gets a chance to tweak before the dataset gets written.
+    if not metrics_already_materialized and metrics_path.exists() and not auto_approve:
+        try:
+            starter_parsed = _parse_artifact(metrics_path)
+        except Exception:
+            starter_parsed = {"metrics": {}}
+        starter_metrics_dict = {
+            k: v for k, v in (starter_parsed.get("metrics") or {}).items()
+            if isinstance(v, dict)
+        }
+        custom_metrics = _review_with_validation_loop(
+            metrics_path,
+            custom_metrics=starter_metrics_dict,
+            rationale="",
+            auto_approve=auto_approve,
         )
 
-    if "A" in chosen_paths or not chosen_paths:
-        # The agent-engine command reads from tests/eval/metrics/ first;
-        # write it whenever the Agent Engine pass is selected so it doesn't
-        # fall back to the legacy eval/metrics/ layout.
-        from agent_eval.core.scaffold import scaffold_dataset_jsonl, scaffold_metrics_only
-        scaffold_metrics_only(
-            target_dir=agent_dir,
-            agent_name=agent_name,
-            metrics=metrics,
-            custom_metric_definitions=custom_metrics,
-        )
-        scaffold_dataset_jsonl(
-            target_dir=agent_dir,
-            agent_name=agent_name,
-            recommendations=recommendations,
-        )
+    # ── Scaffold Step 2: unified dataset.jsonl — same review loop ──────
+    dataset_path = project_root / "tests" / "eval" / "dataset.jsonl"
+
+    scaffold_dataset_jsonl(
+        target_dir=agent_dir,
+        agent_name=agent_name,
+        recommendations=recommendations,
+    )
+    # Review + coverage validation. The validator catches the dangerous case
+    # where a metric needs reference_data:expected_docs but the generated rows
+    # only have expected_behavior — silent every-row-skipped at evaluate time.
+    _review_dataset_with_validation(
+        dataset_path,
+        custom_metrics=custom_metrics or {},
+        auto_approve=auto_approve,
+    )
+
+    # Materialize an empty `eval_config.json` upfront so the user sees the
+    # full canonical scaffold (dataset + metrics + eval_config). simulate.py
+    # would create one on-demand, but writing it here means the Next Steps
+    # panel can point at a file that already exists. Empty `criteria` keeps
+    # ADK's per-interaction scoring out of the way — agent-eval scores in
+    # batch via Vertex AI. If a user already has one with criteria,
+    # simulate.py's backup-and-empty flow handles it on first run.
+    eval_config_path = project_root / "tests" / "eval" / "eval_config.json"
+    if not eval_config_path.exists():
+        eval_config_path.parent.mkdir(parents=True, exist_ok=True)
+        eval_config_path.write_text(json.dumps({"criteria": {}}, indent=2) + "\n")
+
+    # Legacy ADK runtime files (eval/scenarios/) are NOT written anymore in
+    # the unified flow. simulate.py projects them on-demand from
+    # dataset.jsonl. Old projects can run `agent-eval migrate` to fold any
+    # hand-edited scenarios into the unified file.
 
     if custom_metrics:
         if not auto_approve:
@@ -2324,3 +3296,155 @@ def init(target_dir, agent_name, mode, auto_approve, ai_metrics):
         _continue("Next: how to run your first evaluation →", console=console)
     console.print()
     _display_next_steps(agent_name, agent_dir, mode, custom_metrics, chosen_paths)
+
+
+def _explain_metrics_file(path: Path, custom_metrics: Optional[Dict[str, Any]]) -> None:
+    """Render the per-metric breakdown of metric_definitions.json so the
+    user knows what each entry does + which internal flags drive routing."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        console.print(f"  [yellow]Couldn't pre-render explanation:[/] {exc}")
+        return
+
+    metrics = data.get("metrics") or {}
+    if not metrics:
+        console.print("  [dim](file is empty)[/]")
+        return
+
+    table = Table(show_header=True, padding=(0, 1), border_style="dim")
+    table.add_column("Metric", style="bold")
+    table.add_column("Type")
+    table.add_column("Required SDK columns")
+    table.add_column("Routing flags")
+
+    from agent_eval.core.evaluator import _MANAGED_METRIC_REQUIRED_COLUMNS
+
+    for name, defn in metrics.items():
+        is_managed = bool(is_managed_entry(defn))
+        if is_managed:
+            mname = managed_base_name(defn)
+            required = _MANAGED_METRIC_REQUIRED_COLUMNS.get(mname, ("prompt", "response"))
+            required_str = ", ".join(required)
+            type_str = "[cyan]managed[/]"
+        else:
+            mapping = defn.get("dataset_mapping") or {}
+            required_str = ", ".join(sorted(mapping.keys())) or "(custom template)"
+            type_str = "[magenta]custom[/]"
+        flags = []
+        if defn.get("requires_reference"):
+            flags.append("requires_reference")
+        if defn.get("requires_multi_turn"):
+            flags.append("requires_multi_turn")
+        flags_str = ", ".join(flags) if flags else "[dim]any row[/]"
+        table.add_row(name, type_str, required_str, flags_str)
+
+    console.print(table)
+    console.print(
+        "  [dim]Internal keys agent-eval reads:[/] "
+        "[bold]is_managed[/]→takes Vertex's RubricMetric path; "
+        "[bold]requires_multi_turn[/]→only score rows with `history`; "
+        "[bold]requires_reference[/]→only score rows with `reference`; "
+        "[bold]dataset_mapping[/]→which trace fields go in which SDK column."
+    )
+
+
+def _explain_dataset_file(path: Path) -> None:
+    """Render a row breakdown of the unified dataset.jsonl so the user
+    sees the kinds of rows we generated and which paths each one feeds."""
+    from agent_eval.core.dataset_io import read_dataset, is_multi_turn, is_single_turn
+
+    try:
+        rows = read_dataset(path)
+    except Exception as exc:
+        console.print(f"  [yellow]Couldn't pre-render explanation:[/] {exc}")
+        return
+
+    if not rows:
+        console.print("  [dim](no rows)[/]")
+        return
+
+    n_multi = sum(1 for r in rows if is_multi_turn(r))
+    n_single = sum(1 for r in rows if is_single_turn(r))
+    n_both = sum(1 for r in rows if is_multi_turn(r) and is_single_turn(r))
+    n_with_ref = sum(1 for r in rows if r.get("reference") or isinstance(r.get("reference_data"), dict))
+
+    # Two orthogonal axes describe each row:
+    #   1. SHAPE — multi-turn (driven by `simulate`) vs single-turn (driven by
+    #      `interact` + `agent-engine`). Decides which command(s) read the row.
+    #   2. REFERENCE — does the row carry `reference_data` for golden-comparison?
+    #      Independent of shape — multi-turn AND single-turn rows can both have it.
+    summary = (
+        f"  [bold]{len(rows)} row(s)[/]: "
+        f"[cyan]{n_multi} multi-turn[/] (→ `simulate`, "
+        f"tests conversation flow), "
+        f"[green]{n_single} single-turn[/] (→ `interact` + `agent-engine`, "
+        f"tests one-shot quality)"
+    )
+    if n_both:
+        summary += f", [magenta]{n_both} both[/] (drive every command)"
+    summary += (
+        f". [yellow]{n_with_ref} carry [cyan]reference_data[/][/] "
+        f"(eligible for golden-comparison metrics — works on either shape)."
+    )
+    console.print(summary)
+
+    # Show a 1-line sample per row, capped at 6 so the output stays scannable.
+    table = Table(show_header=True, padding=(0, 1), border_style="dim")
+    table.add_column("ID")
+    table.add_column("Kind", style="bold")
+    table.add_column("Drives")
+    table.add_column("Prompt", overflow="ellipsis", max_width=55)
+    table.add_column("Reference?")
+
+    for i, row in enumerate(rows[:6]):
+        rid = row.get("id") or f"row_{i:03d}"
+        kind = row.get("kind") or ("multi_turn" if is_multi_turn(row) else "single_turn")
+        if is_multi_turn(row) and is_single_turn(row):
+            drives = "simulate + interact + agent-engine"
+        elif is_multi_turn(row):
+            drives = "simulate"
+        else:
+            drives = "interact + agent-engine"
+        prompt = (row.get("prompt") or "").replace("\n", " ")[:55]
+        has_ref = "✓" if (row.get("reference") or isinstance(row.get("reference_data"), dict)) else "[dim]—[/]"
+        table.add_row(rid, kind, drives, prompt, has_ref)
+
+    if len(rows) > 6:
+        table.add_row("…", "…", "…", f"({len(rows) - 6} more)", "…")
+    console.print(table)
+    console.print()
+
+    # ── In-CLI editing guide for the dataset (no JSON noise in the file) ──
+    # Same pattern as the metrics review pause: explain what each key does,
+    # what the user can edit freely, and what they must keep.
+    console.print("  [bold]What each row's keys mean[/]")
+    keys = Table(show_header=False, box=None, padding=(0, 2), show_edge=False)
+    keys.add_column(style="bold cyan", min_width=18)
+    keys.add_column(style="dim")
+    keys.add_row("kind", "REQUIRED — \"multi_turn\" / \"single_turn\" / \"both\". Decides which command(s) read the row.")
+    keys.add_row("id", "REQUIRED — short label so failures point at a specific row. Edit freely.")
+    keys.add_row("prompt", "REQUIRED — the user's first message to the agent.")
+    keys.add_row("session_inputs", "ADK session init: app_name, user_id, state seed. Usually leave alone.")
+    keys.add_row("conversation_plan", "Multi-turn ONLY — JSON array of follow-up turns the simulated user sends.")
+    keys.add_row("reference_data", "OPTIONAL on ANY row (multi-turn or single-turn) — NESTED dict. expected_behavior is the human-readable golden answer; add metric-specific fields (expected_docs, expected_routing, etc.) to satisfy reference-required metrics. A multi-turn row WITH reference_data also feeds metrics that need both flags.")
+    keys.add_row("history", "Optional multi-turn — earlier user turns in canonical Vertex shape. Auto-built when user_inputs has >1 entry.")
+    console.print(keys)
+
+    console.print()
+    console.print("  [bold]What you can edit freely[/]")
+    console.print("    [green]✓[/] [bold]prompt[/] — sharpen the queries to match your real users")
+    console.print("    [green]✓[/] [bold]reference_data[/] — set the EXACT expected outputs your metrics will compare against")
+    console.print("    [green]✓[/] [bold]conversation_plan[/] — reorder, add, or refine the simulated user's follow-ups (must stay a list of strings)")
+    console.print("    [green]✓[/] Add new rows — copy an existing row, change [cyan]id[/] + [cyan]prompt[/]")
+    console.print("    [green]✓[/] Toggle a row's [cyan]kind[/] to \"both\" if you want it driven by simulate AND interact")
+    console.print()
+    console.print("  [bold]What you must keep[/]")
+    console.print("    [red]✗[/] [bold]kind[/] — required on every row, must be one of multi_turn/single_turn/both")
+    console.print("    [red]✗[/] [bold]reference_data[/] [red]must be a NESTED dict[/] (not flattened to top-level expected_*)")
+    console.print("    [red]✗[/] [bold]conversation_plan[/] [red]must be a JSON array[/] (not a numbered string — ADK iterates over characters otherwise)")
+    console.print()
+    console.print("  [bold]What happens next[/]")
+    console.print("    [dim]>[/] When you continue, this becomes the [bold]single source of truth[/] —")
+    console.print("    [dim]>[/] [cyan]simulate[/] reads the multi-turn rows, [cyan]interact[/]+[cyan]agent-engine[/] read the single-turn rows.")
+    console.print("    [dim]>[/] We'll then check that every metric has rows it can actually score against.")

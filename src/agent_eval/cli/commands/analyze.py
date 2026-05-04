@@ -11,9 +11,10 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+
 from rich.table import Table
 
-from agent_eval.cli._pacing import _continue
+from agent_eval.cli._pacing import _continue, _pauses_disabled
 from agent_eval.core.analyzer import Analyzer
 
 console = Console()
@@ -41,11 +42,18 @@ def _display_metrics_table(
     current_summary: dict,
     comparison_data: Optional[dict] = None,
     focus: Optional[str] = None,
+    *,
+    results_dir: Optional[str] = None,
+    run_name_override: Optional[str] = None,
 ) -> None:
     """Display a Rich table of metrics with optional delta columns.
 
     Shows all metrics. When --focus contains metric name substrings,
     matching rows are highlighted in bold for easy screenshotting.
+
+    The table title resolves the run name in this order: explicit
+    ``run_name_override`` → comparison's ``current_run_name`` → results-dir
+    folder name (the human-typed run_id) → experiment_id timestamp.
     """
     overall = current_summary.get("overall_summary", {})
     det_metrics = overall.get("deterministic_metrics", {})
@@ -73,8 +81,15 @@ def _display_metrics_table(
 
     has_comparison = bool(delta_lookup)
 
-    # Determine table title — prefer user-friendly folder names over experiment IDs
-    run_name = (comparison_data or {}).get("current_run_name") or current_summary.get("experiment_id", "current")
+    # Determine table title — prefer user-friendly folder names over experiment
+    # IDs. Resolution order: explicit run_name → comparison's current_run_name
+    # → results-dir folder name (the run_id the user typed) → experiment_id.
+    run_name = (
+        run_name_override
+        or (comparison_data or {}).get("current_run_name")
+        or (Path(results_dir).name if results_dir else None)
+        or current_summary.get("experiment_id", "current")
+    )
     if has_comparison:
         baseline_name = comparison_data.get("baseline_run_name") or comparison_data.get("baseline_id", "baseline")
         title = f"Evaluation Results: {run_name} vs {baseline_name}"
@@ -235,15 +250,15 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
     \b
     Examples:
       # Basic analysis (auto-compares to previous run if available)
-      uv run agent-eval analyze --results-dir eval/results/baseline --agent-dir ./my_agent
+      agent-eval analyze --results-dir tests/eval/results/baseline --agent-dir ./my_agent
 
     \b
       # With developer focus (highlights specific metrics)
-      uv run agent-eval analyze --results-dir eval/results/v2 --focus "latency, cache"
+      agent-eval analyze --results-dir tests/eval/results/v2 --focus "latency, cache"
 
     \b
       # Compare to a specific previous run
-      uv run agent-eval analyze --results-dir eval/results/v3 --compare-to eval/results/v1
+      agent-eval analyze --results-dir tests/eval/results/v3 --compare-to tests/eval/results/v1
     """
     from agent_eval.core.evaluator import configure_logging
     configure_logging(debug=debug)
@@ -281,27 +296,29 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
             analysis_result["current_summary"],
             analysis_result.get("comparison_data"),
             focus,
+            results_dir=results_dir,
         )
-        # Anchor before the (potentially long) AI analysis renders, so the
-        # metrics table doesn't scroll off-screen unread.
-        _continue("Press Enter to read the AI analysis →", console=console)
-
-    # ── Display the AI analysis ───────────────────────────────────────
-    _display_analysis(results_dir)
+    # The AI analysis used to print 80-200 lines of dense Gemini prose
+    # straight to terminal here. With the HTML report, that's now
+    # overwhelming + redundant — open report.html in a browser for the
+    # full thing with charts, heatmap, and collapsible per-question
+    # details. Use --print-analysis to restore the legacy terminal dump.
 
     # ── Done ───────────────────────────────────────────────────────────
     cwd = Path.cwd()
     rel_results = os.path.relpath(results_dir, cwd)
 
-    output_files = [
-        f"  {rel_results}/eval_summary.json         — Aggregated metrics",
-        f"  {rel_results}/gemini_analysis.md         — AI diagnosis (shown above)",
-        f"  {rel_results}/question_answer_log.md     — Per-question breakdown",
-    ]
+    html_path = (analysis_result or {}).get("html_report_path")
+    rel_html = os.path.relpath(html_path, cwd) if html_path else None
 
+    output_files = [
+        f"  {rel_results}/eval_summary.json         — Aggregated metrics (raw JSON)",
+        f"  {rel_results}/gemini_analysis.md         — AI diagnosis (raw markdown)",
+        f"  {rel_results}/question_answer_log.md     — Per-question breakdown (raw markdown)",
+    ]
     if analysis_result and analysis_result.get("optimization_log_path"):
         rel_log = os.path.relpath(analysis_result["optimization_log_path"], cwd)
-        output_files.append(f"  {rel_log}  — Cumulative comparison log")
+        output_files.append(f"  {rel_log}  — Cumulative comparison log (raw markdown)")
 
     comparison_info = ""
     if analysis_result and analysis_result.get("comparison_data"):
@@ -309,12 +326,40 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
         baseline_label = cmp.get("baseline_run_name") or cmp.get("baseline_id", "previous")
         comparison_info = f"\n[bold]Compared to:[/]  {baseline_label}\n"
 
+    main_block = ""
+    if rel_html:
+        main_block = (
+            f"[bold cyan]📊 The full report is ready.[/] [dim]Tabs: Overview · "
+            f"Per-Question · Iteration History · AI Analysis[/]\n"
+            f"  [bold]{rel_html}[/]\n"
+            f"  [dim]file://{Path(html_path).resolve()}[/]\n\n"
+            f"  [bold]Open it:[/]  [cyan]agent-eval report[/]            [dim]# default browser[/]\n"
+            f"  [dim]Or:[/]      [cyan]agent-eval report --serve[/]      [dim]# localhost http (SSH/remote dev)[/]\n\n"
+        )
+    main_block += "[bold]Raw artifacts:[/]\n" + "\n".join(output_files)
+
     console.print(Panel(
-        f"[bold green]Analysis complete![/]\n"
-        f"{comparison_info}\n"
-        f"[bold]Saved to:[/]\n"
-        + "\n".join(output_files),
+        f"[bold green]Analysis complete![/]"
+        f"{comparison_info}\n\n"
+        + main_block,
         title="[bold]Done[/]",
         border_style="green",
         padding=(1, 2),
     ))
+
+    # Offer to open immediately. Skip in NO_PAUSES (CI) or when the user
+    # already declined via --no-open at run time. webbrowser.open returns
+    # False on remote/headless systems — we surface --serve in that case.
+    if rel_html and not _pauses_disabled() and sys.stdin.isatty():
+        from rich.prompt import Confirm
+        import webbrowser
+        if Confirm.ask("\n  Open the report in your default browser now?", default=True):
+            try:
+                opened = webbrowser.open(f"file://{Path(html_path).resolve()}", new=2)
+            except Exception:
+                opened = False
+            if not opened:
+                console.print(
+                    "  [yellow]No display available[/] [dim](remote dev box?)[/] — "
+                    "run [cyan]agent-eval report --serve[/] for a localhost URL you can tunnel."
+                )

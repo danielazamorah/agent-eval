@@ -127,6 +127,12 @@ The following table shows how each metric changed. 🟢 = improvement, 🔴 = re
 3.  End with a **## Summary** section: 2-3 sentences summarizing the overall impact. Was this iteration a net positive? What should the developer focus on next?
 4.  Use the emoji indicators (🟢/🔴/⚪) consistently throughout your analysis.
 
+**Noise awareness — important:**
+LLM-as-judge metric scores carry stochastic variance. With small dataset sizes (typical eval runs have ≤20 rows per metric) and binary or low-resolution rating scales, deltas under ±5% on a single LLM metric are usually noise from autorater variance, NOT real improvements or regressions. Treat them accordingly:
+- For LLM metrics with small deltas (|Δ| < 5%) on small datasets, label them as "within noise" rather than calling them improvements/regressions. Do not propose code changes to "fix" a 1-3% LLM metric drift.
+- Deterministic metrics (latency, tokens, cost, cache hits) are exact measurements — even small deltas are real.
+- Large LLM deltas (|Δ| ≥ 10%) or consistent directional shifts across multiple related rubrics ARE meaningful signals worth investigating.
+
 Format your entire response as a single Markdown document.
 """
 

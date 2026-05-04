@@ -98,7 +98,7 @@ def _after_failure(action_label: str) -> str:
             ),
             questionary.Choice("Exit setup", value="exit"),
         ],
-        default="Try again",
+        default="retry",  # matches the Choice value, not the label
     ).ask()
     return answer or "exit"
 
@@ -122,17 +122,27 @@ def _adc_file_path() -> Path:
 
 
 def _adc_account(path: Path) -> Optional[str]:
-    """Read the email tied to the ADC file. Returns None if unreadable.
+    """Identifier for the ADC file, or None if unreadable / unknown structure.
 
-    User-credential ADC files have an `account` field; service-account JSON
-    keys have `client_email`. Both are useful for catching the case where the
-    on-disk ADC file doesn't match whoever is currently logged in via gcloud.
+    Modern user ADC files (`type: "authorized_user"`) are just a refresh token —
+    they do NOT carry an email. Returns "" in that case so the caller can tell
+    "valid user creds, nothing to compare against" apart from "couldn't parse
+    the file" (which returns None and triggers re-login).
+
+    Service-account JSON keys (`type: "service_account"`) do carry `client_email`.
     """
     try:
         with path.open("r") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return None
+    cred_type = data.get("type", "")
+    if cred_type == "service_account":
+        return data.get("client_email") or ""
+    if cred_type == "authorized_user":
+        # Older gcloud versions sometimes populated `account`; modern ones don't.
+        return data.get("account") or ""
+    # Unknown structure — treat as unreadable unless something email-shaped is there.
     return data.get("account") or data.get("client_email") or None
 
 
@@ -289,6 +299,35 @@ def _enable_api(project: str, api: str) -> Tuple[bool, str]:
         return False, "gcloud not on PATH"
 
 
+def _ensure_quota_project(project: str) -> None:
+    """Best-effort: bind the ADC quota project to the given project ID.
+
+    Idempotent — re-running on an already-set quota project is a no-op. Skipped
+    silently if gcloud isn't on PATH (already warned earlier in the flow).
+    Called from the ADC step *after* ADC is confirmed valid; this way it works
+    whether ADC was already present or was just re-created.
+    """
+    if not project:
+        return
+    try:
+        result = subprocess.run(
+            ["gcloud", "auth", "application-default", "set-quota-project", project],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            _ok(f"Quota project bound to [cyan]{project}[/] [dim](so API calls bill correctly)[/]")
+            return
+        _warn("Could not bind quota project — Vertex API calls may bill the wrong project.")
+        err = (result.stderr or "").strip()
+        if err:
+            _hint(err.splitlines()[-1][:300])
+        _hint(f"Run manually: gcloud auth application-default set-quota-project {project}")
+    except FileNotFoundError:
+        return
+    except subprocess.TimeoutExpired:
+        _warn("gcloud timed out while binding quota project.")
+
+
 # ── Step implementations ────────────────────────────────────────────────────
 
 
@@ -350,7 +389,7 @@ def _step_1_account(auto_approve: bool) -> str:
         return account  # skip
 
 
-def _step_2_adc(auto_approve: bool, active_account: str = "") -> bool:
+def _step_3_adc(auto_approve: bool, active_account: str = "", project: str = "") -> bool:
     """Verify the ADC file exists AND matches the active gcloud account.
 
     Two reasons we don't just trust file existence:
@@ -365,9 +404,13 @@ def _step_2_adc(auto_approve: bool, active_account: str = "") -> bool:
 
     On mismatch we *force* a re-run of `application-default login` rather than
     skipping — picking the wrong identity here propagates to every later call.
+
+    `project` is required so that re-logins can pass `--billing-project=<project>`
+    (binding the quota project at ADC creation time) and any pre-existing valid
+    ADC file gets `set-quota-project` called on it as a no-op-friendly safety.
     """
     _step(
-        2,
+        3,
         "Application Default Credentials (ADC)",
         "ADC is what the Vertex AI Python SDK reads to know who's calling.",
         "Without a real ADC file (or with a stale one), the SDK silently uses",
@@ -387,11 +430,18 @@ def _step_2_adc(auto_approve: bool, active_account: str = "") -> bool:
         reason = "missing"
     else:
         adc_email = _adc_account(adc_file)
-        if not adc_email:
+        if adc_email is None:
             _warn(f"ADC file at [cyan]{adc_file}[/] is present but unreadable.")
             _hint("It may be a leftover from `gcloud auth application-default revoke`.")
             needs_login = True
             reason = "unreadable"
+        elif adc_email == "":
+            # Valid user ADC file (modern gcloud doesn't store an email in it).
+            # The active gcloud account from Step 1 is the closest display name we have.
+            label = active_account or "user credentials"
+            _ok(f"ADC file present at [cyan]{adc_file}[/]  [dim]({label})[/]")
+            _ensure_quota_project(project)
+            return True
         elif active_account and adc_email.lower() != active_account.lower():
             _warn(
                 f"ADC file is for [cyan]{adc_email}[/] but you're logged in as "
@@ -403,11 +453,13 @@ def _step_2_adc(auto_approve: bool, active_account: str = "") -> bool:
             needs_login = True
             reason = "mismatch"
         else:
-            _ok(f"ADC file present at [cyan]{adc_file}[/]  [dim](account: {adc_email or '?'})[/]")
+            _ok(f"ADC file present at [cyan]{adc_file}[/]  [dim](account: {adc_email})[/]")
+            _ensure_quota_project(project)
             return True
 
     if auto_approve:
-        _hint("Run:  gcloud auth application-default login")
+        _hint("Run:  gcloud auth application-default login"
+              + (f" --billing-project={project}" if project else ""))
         return False
 
     prompt_text = {
@@ -421,16 +473,19 @@ def _step_2_adc(auto_approve: bool, active_account: str = "") -> bool:
 
     while True:
         try:
-            subprocess.run(
-                ["gcloud", "auth", "application-default", "login"],
-                check=True,
-            )
+            login_cmd = ["gcloud", "auth", "application-default", "login"]
+            if project:
+                # Bind the quota project at ADC creation time so the next gcloud
+                # call doesn't have to fix it up after the fact.
+                login_cmd.extend(["--billing-project", project])
+            subprocess.run(login_cmd, check=True)
             if adc_file.exists():
                 new_email = _adc_account(adc_file)
                 if new_email:
                     _ok(f"ADC file created.  [dim](account: {new_email})[/]")
                 else:
                     _ok("ADC file created.")
+                _ensure_quota_project(project)
                 return True
             _warn("Login completed but ADC file still missing — check gcloud version.")
         except subprocess.CalledProcessError as e:
@@ -450,15 +505,22 @@ def _step_2_adc(auto_approve: bool, active_account: str = "") -> bool:
         return False  # skip
 
 
-def _step_3_project(auto_approve: bool) -> Tuple[Optional[str], Optional[str]]:
-    """Resolve project + location, save to .env, set quota project."""
+def _step_2_project(auto_approve: bool) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve project + location, save to .env, point gcloud config at it.
+
+    Runs BEFORE Step 3 (ADC) so the ADC login can pass `--billing-project=<project>`
+    — that binds the quota project at creation time, instead of having to fix
+    it up afterwards with `set-quota-project`.
+    """
     from dotenv import load_dotenv
     load_dotenv(override=True)
 
     _step(
-        3,
+        2,
         "Project + location",
         "Saved to .env so future commands (and the SDK) pick them up automatically.",
+        "Also runs `gcloud config set project` so Step 3 can bind the quota project at",
+        "ADC creation time (avoids the awkward set-quota-project-after-the-fact dance).",
     )
 
     project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT_ID")
@@ -507,35 +569,25 @@ def _step_3_project(auto_approve: bool) -> Tuple[Optional[str], Optional[str]]:
         _write_env(project, location)
         _ok("Saved to [cyan].env[/] for future runs.")
 
-    # Quota project — bind the ADC to this project so API calls bill correctly
-    while True:
-        try:
-            result = subprocess.run(
-                ["gcloud", "auth", "application-default", "set-quota-project", project],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                _ok(f"Quota project set to [cyan]{project}[/] (billing for ADC calls).")
-                break
-            _warn("Could not set quota project — Vertex API calls may bill the wrong project.")
+    # Make sure `gcloud config get-value project` returns this project too —
+    # subsequent gcloud subcommands (services list, projects describe, etc.)
+    # all default to the gcloud config project unless we pass --project.
+    try:
+        result = subprocess.run(
+            ["gcloud", "config", "set", "project", project],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            _ok(f"gcloud config: project = [cyan]{project}[/]")
+        else:
             err = (result.stderr or "").strip()
+            _warn("Could not update gcloud config — later steps will fall back to --project flags.")
             if err:
                 _hint(err.splitlines()[-1][:300])
-            _hint(f"Run manually: gcloud auth application-default set-quota-project {project}")
-        except FileNotFoundError:
-            _hint("Skipped quota-project setup (gcloud not on PATH).")
-            break
-        except subprocess.TimeoutExpired:
-            _warn("gcloud timed out while setting quota project.")
-
-        if auto_approve:
-            break
-        choice = _after_failure("Set quota project")
-        if choice == "retry":
-            continue
-        if choice == "exit":
-            _abort_setup()
-        break  # skip
+    except FileNotFoundError:
+        _hint("Skipped gcloud config set (gcloud not on PATH).")
+    except subprocess.TimeoutExpired:
+        _warn("gcloud timed out while setting config project.")
 
     return project, location
 
@@ -800,8 +852,9 @@ def setup(asp: bool, auto_approve: bool) -> None:
     \b
     Steps walked through:
       1. Active gcloud account (must be personal, not gce-sa@…)
-      2. Application Default Credentials (the file at ~/.config/gcloud/…)
-      3. Project + location + .env
+      2. Project + location + .env (also sets `gcloud config project`)
+      3. Application Default Credentials (the file at ~/.config/gcloud/…)
+         — created with `--billing-project=<project>` so quota project is bound at login time
       4. Foundation APIs (Service Usage, Resource Manager, Vertex AI, IAM)
       5. Autorater IAM binding (offers to run it for you)
       6. Agent Starter Pack APIs (optional — Cloud Build, Cloud Run, Artifact Registry)
@@ -824,14 +877,16 @@ def setup(asp: bool, auto_approve: bool) -> None:
     # Prompt now so steps 4/5 don't silently degrade to "skip".
     _ensure_session(account, auto_approve=auto_approve)
 
-    # 2. Application Default Credentials (validated against the active account
-    #    from step 1 — file existence alone is not enough, see _step_2_adc).
-    _step_2_adc(auto_approve=auto_approve, active_account=account)
-
-    # 3. Project + location + .env
-    project, _location = _step_3_project(auto_approve=auto_approve)
+    # 2. Project + location + .env  (must come BEFORE ADC so we can pass
+    #    --billing-project on the ADC login — binds the quota project at
+    #    creation time instead of fixing it up after.)
+    project, _location = _step_2_project(auto_approve=auto_approve)
     if not project:
         return
+
+    # 3. Application Default Credentials (validated against the active account
+    #    from step 1 — file existence alone is not enough, see _step_3_adc).
+    _step_3_adc(auto_approve=auto_approve, active_account=account, project=project)
 
     # 4. Foundation APIs
     _step_4_foundation_apis(project, auto_approve=auto_approve)

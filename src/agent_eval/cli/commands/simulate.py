@@ -7,6 +7,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional
 
 import click
 from rich.console import Console
@@ -28,9 +29,23 @@ def _clean_env(project_root: Path) -> dict[str, str]:
 
     1. Strips VIRTUAL_ENV so uv resolves the agent's project venv (not root's)
     2. Loads the agent project's .env file so GCP vars are available
+    3. Prepends project_root to PYTHONPATH so the agent's top-level package
+       imports resolve in the subprocess. ADK's ``adk eval`` runs as an
+       installed console script, which means cwd is NOT automatically on
+       sys.path. Without this, any agent whose ``agent.py`` does
+       ``import app.foo`` (the ASP-standard layout) dies with
+       ``ModuleNotFoundError: No module named 'app'`` — exactly the
+       failure that killed Phase 1 of the 2026-04-23 customer demo.
     """
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
+
+    project_root_str = str(project_root)
+    existing_pp = env.get("PYTHONPATH", "")
+    if existing_pp:
+        env["PYTHONPATH"] = project_root_str + os.pathsep + existing_pp
+    else:
+        env["PYTHONPATH"] = project_root_str
 
     # Load .env from the agent's project root (where pyproject.toml lives)
     dotenv_path = project_root / ".env"
@@ -90,43 +105,308 @@ def _count_scenarios(scenarios_file: Path) -> int:
         return 0
 
 
-def _step_symlinks(agent_dir: Path, eval_dir: Path) -> None:
-    """Step 1: Create symlinks in the agent module dir pointing to eval/scenarios/.
+def _row_to_adk_scenario(row: dict, idx: int) -> dict:
+    """Convert one unified ``dataset.jsonl`` row to ADK's ConversationScenario.
 
-    ADK requires session_input.json, conversation_scenarios.json, and
-    eval_config.json to be inside the agent module directory (next to agent.py).
-    We symlink them from eval/scenarios/ so there's a single source of truth.
+    ADK's pydantic schema (per https://adk.dev/evaluate/user-sim/) is::
+
+        {
+          "starting_prompt": "Initial user message",
+          "conversation_plan": "High-level goals to accomplish"  # STRING
+        }
+
+    Our canonical row schema stores ``conversation_plan`` as a *list* of
+    follow-up user turns — that's the natural way to author multi-turn
+    flows. We join the list into a single goal-list string at projection
+    time so ADK accepts it.
+
+    Mapping rules:
+      - ``starting_prompt`` ← row["prompt"] (or, when prompt is missing
+        but history exists, the first historical user turn)
+      - ``conversation_plan`` ← row["conversation_plan"] joined as a
+        numbered goal list; otherwise rebuilt from row["history"] + the
+        canonical prompt as the final follow-up.
     """
-    _step_header(1, "Symlink scenario files",
-                 "ADK needs scenario files next to agent.py. Creating symlinks\n"
-                 "  from eval/scenarios/ so you only maintain files in one place.")
+    def _plan_to_string(items: list) -> str:
+        clean = [str(item).strip() for item in items if str(item).strip()]
+        if not clean:
+            return ""
+        # Numbered goals — most legible to the simulated-user LLM, and
+        # preserves order. Single-item plans drop the numbering for clarity.
+        if len(clean) == 1:
+            return clean[0]
+        return "\n".join(f"{i + 1}. {goal}" for i, goal in enumerate(clean))
 
+    plan = row.get("conversation_plan")
+    if plan:
+        starting = row.get("prompt") or ""
+        plan_list = list(plan) if isinstance(plan, list) else [str(plan)]
+        return {"starting_prompt": starting, "conversation_plan": _plan_to_string(plan_list)}
+
+    history = row.get("history") or row.get("conversation_history") or []
+    history_texts: list[str] = []
+    for turn in history:
+        if isinstance(turn, dict):
+            parts = (turn.get("parts") or [])
+            text = " ".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+            if text:
+                history_texts.append(text)
+
+    prompt = row.get("prompt") or ""
+    if history_texts:
+        # First user turn opens the conversation; the rest become the plan
+        # ADK feeds back to the agent, with the canonical prompt as the
+        # final follow-up.
+        starting = history_texts[0]
+        plan_list = history_texts[1:] + ([prompt] if prompt else [])
+    else:
+        starting = prompt
+        plan_list = []
+    return {"starting_prompt": starting, "conversation_plan": _plan_to_string(plan_list)}
+
+
+def _project_dataset_to_adk_files(
+    agent_dir: Path,
+    project_root: Path,
+) -> tuple[int, str]:
+    """Project multi-turn rows from ``<project_root>/tests/eval/dataset.jsonl``
+    into ADK's expected files inside ``<agent_dir>``.
+
+    ADK requires ``conversation_scenarios.json``, ``session_input.json``,
+    and ``eval_config.json`` next to ``agent.py``. Per Phase D: those files
+    are derived from the unified dataset and treated as ephemeral cache —
+    the user only ever edits ``dataset.jsonl``.
+
+    Returns ``(scenario_count, source_label)`` for logging.
+    """
+    from agent_eval.core.dataset_io import read_dataset, is_multi_turn
+
+    dataset_path = project_root / "tests" / "eval" / "dataset.jsonl"
+    if not dataset_path.exists():
+        return 0, "missing"
+
+    rows = read_dataset(dataset_path)
+    multi_turn_rows = [r for r in rows if is_multi_turn(r)]
+    scenarios = [_row_to_adk_scenario(r, i) for i, r in enumerate(multi_turn_rows)]
+    scenarios = [s for s in scenarios if s.get("starting_prompt")]
+    if not scenarios:
+        return 0, "no-multi-turn-rows"
+
+    # Pick session_inputs from the first multi-turn row that has them.
+    session_inputs = next(
+        (r["session_inputs"] for r in multi_turn_rows if r.get("session_inputs")),
+        {"app_name": agent_dir.name, "user_id": "eval_user", "state": {}},
+    )
+
+    # Write the three files ADK reads. Marker comment tells future devs
+    # these are generated and shouldn't be hand-edited.
+    scenarios_target = agent_dir / "conversation_scenarios.json"
+    session_target = agent_dir / "session_input.json"
+    eval_config_target = agent_dir / "eval_config.json"
+
+    # ADK's ConversationScenarios pydantic schema is `extra="forbid"` —
+    # any key beyond `scenarios` triggers a validation error. Don't add a
+    # `_generated_by` marker here; the CLI prints the source-of-truth
+    # reminder instead.
+    scenarios_payload = {
+        "scenarios": scenarios,
+    }
+    scenarios_target.write_text(json.dumps(scenarios_payload, indent=2) + "\n")
+    session_target.write_text(json.dumps(session_inputs, indent=2) + "\n")
+
+    # eval_config: project-level source of truth lives at
+    # <project_root>/tests/eval/eval_config.json. ADK reads the agent-dir
+    # copy. We deliberately keep the agent-dir copy with EMPTY criteria so
+    # ADK's per-interaction scoring stays out of the way — agent-eval scores
+    # in batch via Vertex AI Evaluation. Running both is slow + confusing.
+    #
+    # If the project source has non-empty criteria (e.g. an Agent Starter
+    # Pack scaffold), back it up once and replace with the empty default —
+    # then point the user at metric_definitions.json as the single rubric
+    # surface. Idempotent: after the first call, criteria is {} so we no-op.
+    project_eval_config = project_root / "tests" / "eval" / "eval_config.json"
+    backup_path: Optional[Path] = None
+    backed_up_count = 0
+    backed_up_names: List[str] = []
+
+    if project_eval_config.exists():
+        try:
+            existing = json.loads(project_eval_config.read_text())
+            existing_criteria = (existing or {}).get("criteria") or {}
+            if isinstance(existing_criteria, dict) and existing_criteria:
+                from datetime import datetime as _dt
+                backup_dir = project_root / "tests" / "eval" / ".backup" / _dt.now().strftime("%Y%m%d_%H%M%S")
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backup_dir / "eval_config.json"
+                backup_path.write_text(project_eval_config.read_text())
+                backed_up_count = len(existing_criteria)
+                backed_up_names = list(existing_criteria.keys())
+                # Replace the source with an empty config — preserve any
+                # non-criteria keys the user may have set (model defaults etc.).
+                existing["criteria"] = {}
+                project_eval_config.write_text(json.dumps(existing, indent=2) + "\n")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            cfg = json.loads(project_eval_config.read_text())
+        except (json.JSONDecodeError, TypeError):
+            cfg = dict(_DEFAULT_EVAL_CONFIG)
+    else:
+        project_eval_config.parent.mkdir(parents=True, exist_ok=True)
+        cfg = dict(_DEFAULT_EVAL_CONFIG)
+        project_eval_config.write_text(json.dumps(cfg, indent=2) + "\n")
+
+    # Cap the user simulator's max_allowed_invocations to MAX(plan turns) + 2
+    # for THIS run — the ADK default is 20, which lets the simulator keep
+    # going long after our scripted plan ends, ballooning sim time when the
+    # agent is slow (the crwd-legal-discovery 2026-05-03 run hit this hard
+    # — 3 multi-turn scenarios, 5+ minute waits). The +2 leaves room for an
+    # extra clarifying turn the simulator might need to satisfy the goal.
+    # The cap is computed from the projected scenarios above so it's always
+    # tied to the actual data being driven (not the dataset's other rows).
+    def _plan_depth(scenario: dict) -> int:
+        plan = scenario.get("conversation_plan")
+        if isinstance(plan, list):
+            return len(plan)
+        if isinstance(plan, str) and plan:
+            # Already projected to a numbered string — count "<n>." markers.
+            import re
+            return max(1, len(re.findall(r"^\s*\d+\.", plan, flags=re.MULTILINE)))
+        return 1
+    deepest_plan = max((_plan_depth(s) for s in scenarios), default=1)
+    max_invocations = deepest_plan + 2  # +2 = small safety margin for clarification turns
+    sim_cfg = (cfg.get("user_simulator_config") or {}).copy()
+    # Only override when the user hasn't pinned a value themselves.
+    if "max_allowed_invocations" not in sim_cfg:
+        sim_cfg["max_allowed_invocations"] = max_invocations
+        cfg["user_simulator_config"] = sim_cfg
+
+    eval_config_target.write_text(json.dumps(cfg, indent=2) + "\n")
+
+    console.print(
+        f"    [green]+[/] Projected {len(scenarios)} multi-turn row(s) → "
+        f"{agent_dir.name}/conversation_scenarios.json"
+    )
+    console.print(
+        f"    [green]+[/] Wrote {agent_dir.name}/session_input.json from row session_inputs"
+    )
+    _cap_note = (
+        f"capped to {max_invocations} sim turns"
+        if sim_cfg.get("max_allowed_invocations") == max_invocations
+        else "user-pinned max_allowed_invocations preserved"
+    )
+    console.print(
+        f"    [green]+[/] Wrote {agent_dir.name}/eval_config.json "
+        f"[dim](empty criteria + {_cap_note}; ADK default is 20 → can stall on slow agents)[/]"
+    )
+
+    # One-time message when we just relocated the user's ADK criteria.
+    # This is gentler than a perpetual warning — it happens exactly once
+    # per project (after that the criteria block is {} and we no-op).
+    if backup_path is not None:
+        names = ", ".join(backed_up_names[:3])
+        more = f" (+{backed_up_count - 3} more)" if backed_up_count > 3 else ""
+        rel_backup = backup_path.relative_to(project_root)
+        console.print()
+        console.print(
+            f"    [yellow]![/] [bold]Backed up your existing ADK eval_config[/] "
+            f"({backed_up_count} criterion{'s' if backed_up_count != 1 else ''}: "
+            f"[cyan]{names}[/]{more})"
+        )
+        console.print(f"      [dim]→ {rel_backup}[/]")
+        console.print(
+            "      [dim]Why: ADK's per-interaction scorers + agent-eval's batch "
+            "scorers would double-score every row (slow + confusing).[/]"
+        )
+        console.print(
+            "      [dim]Want those rubrics back? Add them as `custom_llm_judge` "
+            "metrics in tests/eval/metrics/metric_definitions.json — "
+            "agent-eval will score them in batch via Vertex AI.[/]"
+        )
+
+    console.print(
+        "    [dim]Source of truth: tests/eval/dataset.jsonl — these files are "
+        "regenerated on each `simulate` run.[/]"
+    )
+    return len(scenarios), "dataset.jsonl"
+
+
+def _step_symlinks(agent_dir: Path, eval_dir: Path) -> None:
+    """Step 1: Make ADK's required scenario files available next to ``agent.py``.
+
+    Two paths:
+
+    1. **Unified dataset present** (post-rescue): project multi-turn rows
+       from ``<project_root>/tests/eval/dataset.jsonl`` into
+       ``<agent_dir>/conversation_scenarios.json`` etc. Files are
+       regenerated each run; users edit only ``dataset.jsonl``.
+
+    2. **Legacy layout only** (pre-rescue): symlink from
+       ``<agent_dir>/eval/scenarios/*.json`` (the old hand-edited
+       location). Print a one-liner suggesting ``agent-eval migrate``.
+    """
+    from agent_eval.core.path_resolver import agent_project_root
+
+    _step_header(
+        1,
+        "Stage scenario files",
+        "ADK needs scenario files next to agent.py. We project them from\n"
+        "  tests/eval/dataset.jsonl on each run, or fall back to symlinking\n"
+        "  legacy eval/scenarios/ for projects that haven't migrated yet.",
+    )
+
+    project_root = agent_project_root(agent_dir)
+    n_scenarios, source = _project_dataset_to_adk_files(agent_dir, project_root)
+
+    if source == "dataset.jsonl":
+        return
+
+    # ── Legacy fallback ────────────────────────────────────────────────
+    if source == "no-multi-turn-rows":
+        console.print(
+            "    [yellow]![/] Found tests/eval/dataset.jsonl but no multi-turn rows. "
+            "simulate has nothing to drive — add rows with `history` or "
+            "`conversation_plan`, or only use `interact` for single-turn evals."
+        )
+        return
+
+    # source == "missing": no unified dataset, look for legacy symlink source
     scenarios_dir = eval_dir / "scenarios"
+    if not scenarios_dir.exists():
+        console.print(
+            f"    [yellow]![/] Neither {project_root.name}/tests/eval/dataset.jsonl "
+            f"nor {agent_dir.name}/eval/scenarios/ found. Run `agent-eval init` "
+            f"first to scaffold a dataset."
+        )
+        return
 
+    console.print(
+        "    [dim]Using legacy eval/scenarios/ — run `agent-eval migrate` "
+        "to fold these into the unified dataset.jsonl.[/]"
+    )
     for filename in _ADK_REQUIRED_FILES:
         target = agent_dir / filename
-        source = scenarios_dir / filename
+        source_file = scenarios_dir / filename
 
-        # Create default eval_config.json if it doesn't exist
-        if filename == "eval_config.json" and not source.exists():
-            source.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text(json.dumps(_DEFAULT_EVAL_CONFIG, indent=2) + "\n")
-            console.print(f"    [green]+[/] Created {source}")
-            console.print(f"      [dim]Empty criteria — ADK's built-in scoring is skipped (agent-eval runs its own batch evaluation)[/]")
+        if filename == "eval_config.json" and not source_file.exists():
+            source_file.parent.mkdir(parents=True, exist_ok=True)
+            source_file.write_text(json.dumps(_DEFAULT_EVAL_CONFIG, indent=2) + "\n")
+            console.print(f"    [green]+[/] Created {source_file}")
 
-        if not source.exists():
-            console.print(f"    [yellow]![/] Skipping {filename} — not found in {scenarios_dir}")
+        if not source_file.exists():
+            console.print(f"    [yellow]![/] Skipping {filename} — not in {scenarios_dir}")
             continue
 
-        # Remove existing file/symlink at target
         action = "updated" if (target.is_symlink() or target.exists()) else "created"
         if target.is_symlink() or target.exists():
             target.unlink()
 
-        # Create relative symlink
-        rel_path = os.path.relpath(source, agent_dir)
+        rel_path = os.path.relpath(source_file, agent_dir)
         target.symlink_to(rel_path)
-        console.print(f"    [green]+[/] {action.capitalize()} symlink: {agent_dir.name}/{filename} → {rel_path}")
+        console.print(
+            f"    [green]+[/] {action.capitalize()} symlink: "
+            f"{agent_dir.name}/{filename} → {rel_path}"
+        )
 
 
 def _step_clear_history(agent_dir: Path) -> None:
@@ -381,7 +661,7 @@ def simulate(agent_dir, eval_dir, run_id, debug):
         eval_path = _find_eval_dir(agent_path)
         if not eval_path:
             console.print(f"\n  [red]Error:[/] No eval/ directory found near {agent_path}")
-            console.print(f"  [dim]Run `uv run agent-eval init` first to scaffold one.[/]")
+            console.print(f"  [dim]Run `agent-eval init` first to scaffold one.[/]")
             sys.exit(1)
 
     from agent_eval.core.config import find_eval_files
@@ -390,7 +670,7 @@ def simulate(agent_dir, eval_dir, run_id, debug):
         scenarios_file = discovered["scenarios"][0]
     else:
         console.print(f"\n  [red]Error:[/] No scenario files found in {eval_path / 'scenarios'}")
-        console.print(f"  [dim]Create your scenarios as .json files in eval/scenarios/[/]")
+        console.print(f"  [dim]Add multi-turn rows (with history or conversation_plan) to tests/eval/dataset.jsonl[/]")
         sys.exit(1)
 
     session_file = eval_path / "scenarios" / "session_input.json"
@@ -413,7 +693,7 @@ def simulate(agent_dir, eval_dir, run_id, debug):
             console.print(Panel(
                 "[bold]Give this run a name[/] so you can easily find it later.\n\n"
                 "Examples: [cyan]baseline[/], [cyan]v2-tool-hardening[/], [cyan]cache-optimization[/]\n\n"
-                "[dim]Results will be saved to eval/results/<run-id>/.\n"
+                "[dim]Results will be saved to tests/eval/results/<run-id>/.\n"
                 "Press Enter to use an auto-generated timestamp instead.[/]",
                 title="[bold]Run ID[/]",
                 border_style="blue",
@@ -434,7 +714,7 @@ def simulate(agent_dir, eval_dir, run_id, debug):
         f"[bold]Scenarios:[/]  [cyan]{n_scenarios}[/] scenario{'s' if n_scenarios != 1 else ''}"
         f" in conversation_scenarios.json\n"
         f"[bold]Run ID:[/]     [cyan]{run_id}[/]"
-        f"  [dim](results saved to eval/results/{run_id}/)[/]\n\n"
+        f"  [dim](results saved to tests/eval/results/{run_id}/)[/]\n\n"
         f"[bold]What will happen:[/]\n"
         f"  [dim]1.[/] Symlink scenario files into agent directory (for ADK)\n"
         f"  [dim]2.[/] Clear previous eval_history (avoid stale traces)\n"
@@ -488,14 +768,14 @@ def simulate(agent_dir, eval_dir, run_id, debug):
     console.print()
     console.print("[bold]1.[/] Run deterministic + LLM-as-judge metrics:")
     console.print()
-    console.print(f"uv run agent-eval evaluate \\")
+    console.print(f"agent-eval evaluate \\")
     console.print(f"  --interaction-file {rel_run}/raw/processed_interaction_sim.jsonl \\")
     console.print(f"  --metrics-files {rel_metrics} \\")
     console.print(f"  --results-dir {rel_run}")
     console.print()
     console.print("[bold]2.[/] Generate AI-powered analysis:")
     console.print()
-    console.print(f"uv run agent-eval analyze \\")
+    console.print(f"agent-eval analyze \\")
     console.print(f"  --results-dir {rel_run} \\")
     console.print(f"  --agent-dir {rel_agent}")
     console.print()

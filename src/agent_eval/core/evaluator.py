@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 from google.cloud import aiplatform
+from google.genai.types import HttpOptions
 from vertexai import Client, types
 
 from agent_eval.core.config import CONFIG, get_project_id
@@ -25,6 +26,7 @@ from agent_eval.core.data_mapper import (
 )
 from agent_eval.core.metric_discovery import is_api_predefined as _is_api_predefined_discovery
 from agent_eval.core.metric_discovery import _GCS_PLACEHOLDERS
+from agent_eval.core.metric_schema import is_managed_entry, managed_base_name
 
 # Setup Logger — root logger at CRITICAL silences all third-party noise by default.
 # Our own logger (agent_eval) is explicitly set to INFO so our messages show.
@@ -68,6 +70,207 @@ _CAP_INTERMEDIATE_EVENTS = "has_intermediate_events"
 _CAP_RESPONSE = "has_response"
 
 
+def _last_user_text(df: pd.DataFrame) -> pd.Series:
+    """Plain-text user prompt per row, suitable for the SDK's ``prompt`` slot.
+
+    Vertex's RubricMetric judges accept ``prompt``/``response`` as plain
+    strings. The wrapped ``{"contents": [...]}`` JSON in the ``request``
+    column trips a pydantic ``Content / contents Extra inputs not permitted``
+    validator on newer SDK versions, so we extract the latest user turn and
+    hand the judge clean text instead.
+    """
+    def _extract(row: Any) -> str:
+        ui = row.get("user_inputs") if hasattr(row, "get") else None
+        # ``user_inputs`` round-trips as either a list (JSONL) or a JSON
+        # string (CSV from older runs). Decode strings, accept lists.
+        if isinstance(ui, str):
+            try:
+                ui = json.loads(ui)
+            except (json.JSONDecodeError, ValueError):
+                ui = [ui]
+        if isinstance(ui, list) and ui:
+            return str(ui[-1])
+        # Fallbacks for rows that didn't capture user_inputs.
+        for col in ("question", "prompt"):
+            val = row.get(col) if hasattr(row, "get") else None
+            if isinstance(val, str) and val.strip():
+                return val
+        return ""
+
+    return df.apply(_extract, axis=1)
+
+
+# Per-row column defaults + per-managed-metric required columns now live in
+# ``core/metric_schema`` so generator + factory + evaluator share one source
+# of truth. Aliased here so existing call sites in this file keep working.
+from agent_eval.core.metric_schema import (
+    SDK_COLUMN_DEFAULTS as _SDK_COLUMN_DEFAULTS,
+    MANAGED_METRIC_REQUIRED_COLUMNS as _MANAGED_METRIC_REQUIRED_COLUMNS,
+)
+
+
+def _decode_maybe_json(v: Any) -> Any:
+    """Decode JSON or Python-repr string fields; pass lists/dicts through.
+
+    Interaction rows round-trip through both JSONL (preserves list/dict) and
+    CSV (stringifies — pandas writes Python repr with single quotes which
+    json.loads rejects). Tries json first, then ast.literal_eval. This
+    makes downstream column resolution agnostic to which file format
+    landed in the DataFrame.
+    """
+    if isinstance(v, (list, dict)):
+        return v
+    if not isinstance(v, str) or not v:
+        return v
+    try:
+        return json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        import ast
+        parsed = ast.literal_eval(v)
+        if isinstance(parsed, (list, dict)):
+            return parsed
+    except (ValueError, SyntaxError, MemoryError):
+        pass
+    return v
+
+
+def _resolve_source_column(source: Optional[str], row: Any) -> Any:
+    """Resolve a source spec against a single interaction row.
+
+    Supported syntaxes:
+      ``final_response``                       — plain column lookup
+      ``user_inputs[-1]``                      — last item of a list column
+      ``extracted_data:retrieved_documents``   — colon-prefixed nested lookup
+      ``final_session_state:state.app:foo``    — colon-prefixed dotted lookup
+    """
+    if source is None:
+        return None
+    if source.endswith("[-1]"):
+        col = source[:-4]
+        val = _decode_maybe_json(row.get(col) if hasattr(row, "get") else None)
+        if isinstance(val, list) and val:
+            return val[-1]
+        return val if isinstance(val, str) else ""
+    if ":" in source:
+        head, _, tail = source.partition(":")
+        container = _decode_maybe_json(row.get(head) if hasattr(row, "get") else None)
+        for key in tail.split("."):
+            if isinstance(container, dict):
+                container = container.get(key)
+            else:
+                return None
+        return container
+    return row.get(source) if hasattr(row, "get") else None
+
+
+def _normalize_intermediate_events(raw_events: Any) -> List[Dict[str, Any]]:
+    """ADK event dicts → Vertex evals.Event-compatible dicts.
+
+    ADK shape: ``{content, id, author, timestamp (float), invocationId, actions, ...}``
+    Vertex shape: ``{event_id, content (genai.Content), creation_timestamp (ISO), author}``
+
+    Anything ADK-specific (invocationId, actions, modelVersion, finish_reason,
+    thoughtSignature, ...) is dropped; the SDK's pydantic Event model accepts
+    only the four canonical keys.
+    """
+    from datetime import datetime, timezone
+    if not isinstance(raw_events, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for ev in raw_events:
+        if not isinstance(ev, dict):
+            continue
+        content = ev.get("content")
+        if content is None:
+            continue
+        norm: Dict[str, Any] = {"content": content}
+        if "id" in ev and ev["id"]:
+            norm["event_id"] = str(ev["id"])
+        if "author" in ev and ev["author"]:
+            norm["author"] = str(ev["author"])
+        ts = ev.get("timestamp")
+        if isinstance(ts, (int, float)):
+            norm["creation_timestamp"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        elif isinstance(ts, str) and ts:
+            norm["creation_timestamp"] = ts
+        out.append(norm)
+    return out
+
+
+def _build_managed_eval_column(sdk_col: str, source: str, df: pd.DataFrame) -> List[Any]:
+    """Build a single SDK column from a source spec, applying any needed transform."""
+
+    def _build_one(row: Any) -> Any:
+        # intermediate_events: when source is the default 'events', pull from
+        # final_session_state.events; otherwise treat source as a column path.
+        if sdk_col == "intermediate_events":
+            if source == "events":
+                fss = _decode_maybe_json(row.get("final_session_state"))
+                events = (fss or {}).get("events", []) if isinstance(fss, dict) else []
+            else:
+                events = _decode_maybe_json(_resolve_source_column(source, row))
+            return _normalize_intermediate_events(events or [])
+        if sdk_col == "history":
+            raw = _decode_maybe_json(_resolve_source_column(source, row))
+            return raw if isinstance(raw, list) else []
+        # All other columns resolve to a string (or pass-through for list refs).
+        val = _decode_maybe_json(_resolve_source_column(source, row))
+        if val is None:
+            return ""
+        if isinstance(val, (list, dict)):
+            return json.dumps(val, default=str)
+        return str(val)
+
+    return [_build_one(row) for _, row in df.iterrows()]
+
+
+def _resolve_column_source(metric_info: Dict[str, Any], sdk_col: str) -> Optional[str]:
+    """Find the source spec for an SDK column.
+
+    Lookup order:
+      1. Explicit ``dataset_mapping.<sdk_col>.source_column`` on the metric
+      2. For ``sdk_col == "reference"`` only: the metric's ``reference_field``
+         setting → ``reference_data:<field>`` (per-metric override of the
+         default ``reference_data.expected_behavior`` lookup)
+      3. ``SDK_COLUMN_DEFAULTS[sdk_col]`` from ``core/metric_schema.py``
+    """
+    user_mapping = (metric_info.get("dataset_mapping") or {}).get(sdk_col)
+    if isinstance(user_mapping, dict) and user_mapping.get("source_column"):
+        return user_mapping["source_column"]
+    if sdk_col == "reference":
+        ref_field = metric_info.get("reference_field")
+        if isinstance(ref_field, str) and ref_field:
+            return f"reference_data:{ref_field}"
+    return _SDK_COLUMN_DEFAULTS.get(sdk_col)
+
+
+def _build_managed_eval_dataset(
+    metric_info: Dict[str, Any],
+    metric_name: str,
+    managed_metric_name: str,
+    original_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Build the eval_dataset DataFrame for a managed metric per the FLATTEN
+    schema. Returns ``(df, error_reason)`` — when error_reason is set, the
+    caller should add the metric to skipped_metrics and continue."""
+    required = _MANAGED_METRIC_REQUIRED_COLUMNS.get(
+        managed_metric_name, ("prompt", "response")
+    )
+    cols: Dict[str, List[Any]] = {}
+    for sdk_col in required:
+        source = _resolve_column_source(metric_info, sdk_col)
+        if source is None:
+            return pd.DataFrame(), (
+                f"required SDK column '{sdk_col}' has no source — declare it "
+                f"in dataset_mapping.{sdk_col}.source_column or rely on a "
+                f"default (none registered for '{sdk_col}')"
+            )
+        cols[sdk_col] = _build_managed_eval_column(sdk_col, source, original_df)
+    return pd.DataFrame(cols, index=original_df.index), None
+
+
 def _interaction_row_capabilities(row: pd.Series) -> set:
     """Return the capability tags a single interaction row supports.
 
@@ -108,22 +311,56 @@ def _required_capabilities(metric_info: Dict[str, Any]) -> set:
     return required
 
 
+_VERBOSE_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_CLEAN_LOG_FORMAT = "  %(message)s"
+
+
+def _install_clean_handler() -> None:
+    """Attach a single clean-format handler to the agent_eval logger and stop
+    propagation so its messages don't ALSO render through basicConfig's
+    verbose-formatted root handler. Idempotent — safe to call repeatedly.
+    """
+    # Remove any existing agent-eval-owned handlers before attaching a fresh one.
+    for h in list(logger.handlers):
+        if getattr(h, "_agent_eval_clean", False):
+            logger.removeHandler(h)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(_CLEAN_LOG_FORMAT))
+    handler._agent_eval_clean = True  # type: ignore[attr-defined]
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+def _restore_verbose_handler() -> None:
+    """Restore default propagation so debug mode flows through basicConfig's
+    verbose formatter (timestamp + name + level prefix)."""
+    for h in list(logger.handlers):
+        if getattr(h, "_agent_eval_clean", False):
+            logger.removeHandler(h)
+    logger.propagate = True
+
+
 def configure_logging(debug: bool = False) -> None:
     """Configure logging levels based on debug flag.
 
-    Normal mode (default): root at CRITICAL, agent_eval at INFO, third-party at CRITICAL.
-    Debug mode (--debug): root at DEBUG, everything visible (SDK retries, ADK internals).
+    Normal mode (default): root at CRITICAL, agent_eval at INFO with a clean
+    "  <message>" formatter so its output blends with the CLI panels. Third-party
+    loggers stay silent. Debug mode (--debug): root at DEBUG with the verbose
+    "timestamp - name - level - msg" format so SDK retries / ADK internals are
+    fully traceable.
     """
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.DEBUG)
+        _restore_verbose_handler()
     else:
         logging.getLogger().setLevel(logging.CRITICAL)
         logger.setLevel(logging.INFO)
         for name in _NOISY_LOGGERS:
             logging.getLogger(name).setLevel(logging.CRITICAL)
+        _install_clean_handler()
 
 def serialize_rubric_verdicts(rubric_verdicts: Any) -> Optional[List[Dict]]:
     """Serialize rubric verdicts to JSON-compatible format."""
@@ -217,11 +454,15 @@ def parse_eval_result(
 
 def run_single_metric_evaluation(
     task_args: Tuple,
-) -> Tuple[Optional[pd.DataFrame], str, Optional[pd.DataFrame]]:
+) -> Tuple[Optional[pd.DataFrame], str, Optional[pd.DataFrame], Optional[Dict[str, str]]]:
     """Worker function for parallel evaluation.
 
     Returns:
-        Tuple of (parsed_results_df, metric_name, input_dataset_df)
+        Tuple of (parsed_results_df, metric_name, input_dataset_df, error_info)
+        where error_info is None on success, or a dict with keys
+        ``exception_type`` and ``message`` when all retries failed. Callers
+        surface ``error_info`` to the user instead of the long-standing
+        misleading "API rate limits" copy.
     """
     eval_dataset, metric_obj, metric_df, metric_name, client, retries, delay, gcs_dest = task_args
 
@@ -229,15 +470,16 @@ def run_single_metric_evaluation(
     if gcs_dest:
         eval_kwargs["config"] = types.EvaluateMethodConfig(dest=gcs_dest)
 
+    last_exc: Optional[Exception] = None
     for attempt in range(retries):
         try:
             logger.info(f"Starting evaluation: {metric_name} (Attempt {attempt + 1})")
             result = client.evals.evaluate(dataset=eval_dataset, metrics=[metric_obj], **eval_kwargs)
             parsed_df = parse_eval_result(result, metric_name, metric_df)
             logger.info(f"Finished evaluation: {metric_name}")
-            # Return input dataset along with results for full traceability
-            return parsed_df, metric_name, eval_dataset
+            return parsed_df, metric_name, eval_dataset, None
         except Exception as e:
+            last_exc = e
             logger.error(f"Failed '{metric_name}': {e}")
             if attempt < retries - 1:
                 time.sleep(delay * (2**attempt))
@@ -255,11 +497,24 @@ def run_single_metric_evaluation(
             fallback_dataset = eval_dataset.drop(columns=["reference"])
             result = client.evals.evaluate(dataset=fallback_dataset, metrics=[metric_obj], **eval_kwargs)
             parsed_df = parse_eval_result(result, metric_name, metric_df)
-            return parsed_df, metric_name, fallback_dataset
+            return parsed_df, metric_name, fallback_dataset, None
         except Exception as e:
+            last_exc = e
             logger.error(f"'{metric_name}' fallback also failed: {e}")
 
-    return None, metric_name, None
+    error_info: Optional[Dict[str, str]] = None
+    if last_exc is not None:
+        msg = str(last_exc).strip()
+        # Trim to the first line of error text so the table column stays
+        # readable. Full text is in eval_summary.json + logs.
+        first_line = msg.splitlines()[0] if msg else last_exc.__class__.__name__
+        if len(first_line) > 140:
+            first_line = first_line[:137] + "..."
+        error_info = {
+            "exception_type": last_exc.__class__.__name__,
+            "message": first_line,
+        }
+    return None, metric_name, None, error_info
 
 
 def load_and_consolidate_metrics(metric_files: List[str]) -> Dict[str, Any]:
@@ -288,7 +543,16 @@ def load_and_consolidate_metrics(metric_files: List[str]) -> Dict[str, Any]:
 def filter_metrics_by_criteria(
     metric_definitions: Dict[str, Any], filters: Dict[str, List[str]]
 ) -> Dict[str, Any]:
-    """Filter metric definitions based on specified criteria."""
+    """Filter metric definitions based on specified criteria.
+
+    The ``metric_type`` filter distinguishes deterministic metrics (latency,
+    tokens, cost — merged in by ``core/deterministic_metrics.py`` with an
+    explicit ``metric_type: "deterministic"``) from LLM-judge metrics
+    (canonical-schema entries with ``kind: managed | parametrized_managed |
+    custom_llm_judge``, which carry NO ``metric_type`` field). The
+    default-to-``"llm"`` below is correct for that reason — it's not a
+    legacy-schema read.
+    """
     if not filters:
         return metric_definitions
     filtered = {}
@@ -296,6 +560,8 @@ def filter_metrics_by_criteria(
         match = True
         for key, vals in filters.items():
             val_to_check = (
+                # See docstring: deterministic metrics flag themselves
+                # explicitly; canonical LLM-judge entries don't.
                 info.get("metric_type", "llm")
                 if key == "metric_type"
                 else info.get("agents", ["data_explorer_agent"])
@@ -342,18 +608,34 @@ def save_metrics_summary(
     run_type: str,
     test_description: str,
     metric_definitions: Dict[str, Any] = None,
-    failed_metrics: list[str] | None = None,
+    failed_metrics: list[dict] | list[str] | None = None,
     skipped_metrics: list[dict] | None = None,
 ) -> None:
     """Calculate and save a comprehensive summary of metrics including full input/output."""
     logger.info("--- Generating Metrics Summary ---")
 
-    # Build score_range lookup from metric definitions
+    # Build score_range lookup from metric definitions. Custom_llm_judge
+    # metrics often omit score_range — in that case derive it from
+    # rating_scores keys (binary 0/1 most often; multi-tier otherwise).
+    # Without this, the eval table defaults to "0–5" which looks alarming
+    # and inconsistent with our binary convention.
     score_ranges = {}
     if metric_definitions:
         for name, info in metric_definitions.items():
-            if isinstance(info, dict) and "score_range" in info:
+            if not isinstance(info, dict):
+                continue
+            if "score_range" in info:
                 score_ranges[name] = info["score_range"]
+                continue
+            rating_scores = info.get("rating_scores")
+            if isinstance(rating_scores, dict) and rating_scores:
+                try:
+                    keys = sorted(int(k) for k in rating_scores.keys())
+                    score_ranges[name] = {
+                        "min": keys[0], "max": keys[-1], "type": "rubric",
+                    }
+                except (ValueError, TypeError):
+                    pass
 
     grouped = df.groupby("question_id")
     all_question_summaries = []
@@ -519,7 +801,14 @@ class Evaluator:
             raise ValueError("GOOGLE_CLOUD_PROJECT environment variable is not set.")
 
         aiplatform.init(project=self.project_id, location=self.location)
-        self.client = Client(project=self.project_id, location=self.location)
+        # Per docs/evaluation-agents-client: HttpOptions(api_version="v1beta1")
+        # is required for the evals module to expose all surfaces. Without it,
+        # newer SDK calls (rubric_groups, agent_info, etc.) silently degrade.
+        self.client = Client(
+            project=self.project_id,
+            location=self.location,
+            http_options=HttpOptions(api_version="v1beta1"),
+        )
 
     def evaluate(self, metrics_files: List[str], results_dir: Path,
                  interaction_files: Union[List[Path], Path, None] = None,
@@ -538,7 +827,7 @@ class Evaluator:
         all_dfs = []
         is_jsonl = False
         for ifile in interaction_files:
-            logger.info(f"Loading interaction data from {ifile}")
+            logger.info(f"Loading interaction data from {Path(ifile).name}")
             file_ext = ifile.suffix.lower()
             if file_ext == '.jsonl':
                 from agent_eval.core.converters import read_jsonl
@@ -641,19 +930,10 @@ class Evaluator:
                 if info.get("metric_type") == "deterministic":
                     continue
 
-                # Per-row capability filter — replaces legacy `applies_to`
-                # routing. A metric runs on rows whose capabilities are a
-                # superset of what it requires (e.g. requires_reference → row
-                # must have non-empty reference_data).
+                # Per-row capability filter — a metric runs on rows whose
+                # capabilities are a superset of what it requires (e.g.
+                # requires_reference → row must have non-empty reference_data).
                 required_caps = _required_capabilities(info)
-
-                # Backward compat: when a metric file still uses `applies_to`
-                # without the newer requires_* flags, translate it to the
-                # equivalent capability so existing user metric files keep
-                # working.
-                legacy_applies_to = info.get("applies_to", "all")
-                if not required_caps and legacy_applies_to == "golden_dataset":
-                    required_caps = {_CAP_REFERENCE}
 
                 if required_caps:
                     capability_mask = agent_df.apply(
@@ -675,86 +955,71 @@ class Evaluator:
                 else:
                     agent_df_filtered = agent_df
 
-                is_managed = info.get("is_managed", False)
+                is_managed = is_managed_entry(info)
 
-                # Use filtered original_df to match the capability filter
-                original_df_filtered = (
-                    original_df.loc[agent_df_filtered.index] if required_caps else original_df
-                )
+                # Always align original_df with the agent-filtered + capability-filtered
+                # subset. Previously this was conditional on required_caps being
+                # truthy, which left a 12-row original_df paired with a 6-row
+                # agent_df when the agent mask had filtered out rows but no
+                # capability filter ran. Vertex's autorater scored the 12-row
+                # eval_dataset, then post-processing tried to write 12 results
+                # into the 6-row agent_df → "index 6 is out of bounds for axis 0
+                # with size 6" at exactly the boundary between sources.
+                original_df_filtered = original_df.loc[agent_df_filtered.index]
 
                 if is_managed:
-                    m_name = info.get("managed_metric_name", "").upper()
+                    m_name = managed_base_name(info)
                     if _is_api_predefined(m_name):
-                        needs_ref = info.get("requires_reference", False)
-                        ref_field = info.get("reference_field")  # optional override
+                        # FLATTEN schema, per ~/.claude/projects/.../memory/
+                        # vertex-eval-sdk-schema.md. Each managed metric has
+                        # its own required-column list (prompt+response for
+                        # rubric-style; plus intermediate_events for tool
+                        # metrics; plus history for multi-turn; etc.).
+                        eval_dataset, error_reason = _build_managed_eval_dataset(
+                            info, metric_name, m_name, original_df_filtered
+                        )
+                        if error_reason:
+                            skipped_metrics.append({
+                                "metric": metric_name,
+                                "reason": error_reason,
+                            })
+                            logger.warning("Skipping '%s' — %s", metric_name, error_reason)
+                            continue
 
-                        # Pick the right column to put in the SDK's `response` slot.
-                        # `response` is the wrapped API object; `final_response` is
-                        # plain text. For text-comparison metrics like
-                        # FINAL_RESPONSE_MATCH, we want the clean text on both sides.
-                        resp_field = info.get("response_field") or info.get("default_response_field")
-                        if resp_field and resp_field in original_df_filtered.columns:
-                            eval_dataset = original_df_filtered[["request"]].copy()
-                            eval_dataset["response"] = original_df_filtered[resp_field].astype(str)
-                            logger.debug(
-                                "'%s': using '%s' as response column for text comparison",
-                                metric_name, resp_field,
+                        # Reference columns may be empty per row even when
+                        # present in the schema. Drop empty-reference rows so
+                        # the metric scores only on populated examples.
+                        if "reference" in eval_dataset.columns:
+                            non_empty = (
+                                eval_dataset["reference"].astype(str).str.strip() != ""
                             )
-                        else:
-                            eval_dataset = original_df_filtered[["request", "response"]].copy()
-
-                        # Rename to SDK-canonical column name. Internal DataFrames
-                        # use `request` for legacy reasons; the SDK expects `prompt`.
-                        eval_dataset = eval_dataset.rename(columns={"request": "prompt"})
-
-                        if needs_ref and "reference_data" in original_df_filtered.columns:
-                            eval_dataset["reference"] = (
-                                original_df_filtered["reference_data"].apply(
-                                    lambda rd: extract_reference_text(rd, ref_field)
-                                )
-                            )
-                            non_empty = eval_dataset["reference"].astype(str).str.strip() != ""
                             dropped = int((~non_empty).sum())
                             eval_dataset = eval_dataset[non_empty].copy()
-
                             if eval_dataset.empty:
-                                field_hint = (
-                                    f"`reference_data.{ref_field}`" if ref_field
-                                    else "any conventional `reference_data` field "
-                                         "(e.g. expected_response, expected_behavior, ground_truth)"
-                                )
                                 skipped_metrics.append({
                                     "metric": metric_name,
                                     "reason": (
-                                        f"requires reference_data; {field_hint} not populated "
-                                        f"in {len(original_df_filtered)} row(s)"
+                                        "all rows have empty 'reference' — populate "
+                                        "reference_data in your golden dataset, or "
+                                        "override dataset_mapping.reference.source_column"
                                     ),
                                 })
                                 logger.warning(
-                                    "Skipping '%s' — needs reference data but %s not found. "
-                                    "Edit eval/eval_data/golden_dataset.json to add expected values.",
-                                    metric_name, field_hint,
+                                    "Skipping '%s' — reference column empty in all rows",
+                                    metric_name,
                                 )
                                 continue
-
                             if dropped:
                                 logger.info(
                                     "'%s': scoring %d row(s); skipped %d without reference",
                                     metric_name, len(eval_dataset), dropped,
                                 )
-                        elif needs_ref:
-                            skipped_metrics.append({
-                                "metric": metric_name,
-                                "reason": "requires reference_data column; not present in dataset",
-                            })
-                            logger.warning(
-                                "Skipping '%s' — no reference_data column. Run `agent-eval interact` "
-                                "with a golden dataset that has reference values.",
-                                metric_name,
-                            )
-                            continue
 
-                        logger.info(f"Using GEMINI format for API Predefined metric: {metric_name}")
+                        logger.info(
+                            "Built FLATTEN dataset for '%s' (%s): cols=%s rows=%d",
+                            metric_name, m_name, list(eval_dataset.columns),
+                            len(eval_dataset),
+                        )
                     else:
                         # GCS YAML: client-side LLM-as-judge, needs prompt/response columns
                         # Auto-build dataset_mapping from known GCS template placeholders
@@ -788,36 +1053,24 @@ class Evaluator:
                     logger.warning("Skipping '%s' — empty dataset after column mapping", metric_name)
                     continue
 
-                # Create Metric Object
-                if is_managed:
-                    m_name = info.get("managed_metric_name", "").upper()
-                    metric_obj = getattr(types.RubricMetric, m_name, None)
-                    if metric_obj is None:
-                        logger.warning(
-                            "Managed metric '%s' not found as RubricMetric.%s — "
-                            "falling back to LLMMetric with template. "
-                            "Check that managed_metric_name is a valid SDK metric.",
-                            metric_name, m_name,
-                        )
-                        template = info.get("template", "")
-                        if not template:
-                            skipped_metrics.append({"metric": metric_name, "reason": f"unknown managed metric '{m_name}' and no fallback template"})
-                            continue
-                        metric_obj = types.LLMMetric(
-                            name=metric_name, prompt_template=template,
-                        )
-                else:
-                    # Use template directly for custom LLM metrics
-                    # The SDK will substitute placeholders from dataset columns
-                    template = info.get("template", "")
-                    if not template:
-                        skipped_metrics.append({"metric": metric_name, "reason": "no template defined"})
-                        logger.warning("Metric '%s' has no template defined, skipping", metric_name)
-                        continue
-                    metric_obj = types.LLMMetric(
-                        name=metric_name,
-                        prompt_template=template,
+                # Build the SDK metric object via the canonical-schema factory.
+                # build_metric dispatches on `kind` and constructs the right
+                # types.RubricMetric / types.LLMMetric / types.Metric — including
+                # the docs' MetricPromptBuilder(criteria, rating_scores) pattern
+                # for custom_llm_judge entries.
+                from agent_eval.core import metric_factory
+                try:
+                    metric_obj = metric_factory.build_metric(metric_name, info)
+                except Exception as build_err:  # noqa: BLE001
+                    skipped_metrics.append({
+                        "metric": metric_name,
+                        "reason": f"failed to build metric: {build_err}",
+                    })
+                    logger.warning(
+                        "Skipping '%s' — failed to build SDK metric: %s",
+                        metric_name, build_err,
                     )
+                    continue
 
                 eval_tasks.append((
                     eval_dataset, metric_obj, agent_df, metric_name, self.client,
@@ -825,19 +1078,25 @@ class Evaluator:
                     self.config.get("gcs_dest"),
                 ))
 
-        # Run Parallel Execution
-        failed_metrics = []
+        # Run Parallel Execution. failed_metrics is a list of dicts so we
+        # can show the user the real exception class + message instead of
+        # the long-standing misleading "API rate limits" warning.
+        failed_metrics: List[Dict[str, str]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG.MAX_WORKERS) as executor:
             future_to_metric = {
                 executor.submit(run_single_metric_evaluation, t): t[3]
                 for t in eval_tasks
             }
             for future in concurrent.futures.as_completed(future_to_metric):
-                res, m_name, input_df = future.result()
+                res, m_name, input_df, error_info = future.result()
                 if res is not None:
                     all_llm_results.append((res, m_name, input_df))
                 else:
-                    failed_metrics.append(m_name)
+                    entry: Dict[str, str] = {"metric": m_name}
+                    if error_info:
+                        entry["exception_type"] = error_info["exception_type"]
+                        entry["message"] = error_info["message"]
+                    failed_metrics.append(entry)
 
         # --- Consolidate Results ---
         final_df = original_df.copy()

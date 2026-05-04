@@ -140,15 +140,19 @@ class TestInitAutoApprove(unittest.TestCase):
             result = self._invoke(root)
 
             assert result.exit_code == 0, result.output
-            # Local pipeline scaffolded
-            assert (root / "eval" / "metrics" / "metric_definitions.json").exists()
-            assert (root / "eval" / "scenarios" / "conversation_scenarios.json").exists()
+            # Phase D unified layout: ONE source of truth at the project
+            # root. No more eval/scenarios/ or eval/eval_data/ files —
+            # multi-turn rows go in dataset.jsonl and simulate.py projects
+            # them to ADK's expected files at runtime.
+            assert (root / "tests" / "eval" / "metrics" / "metric_definitions.json").exists()
+            assert (root / "tests" / "eval" / "dataset.jsonl").exists()
+            assert not (root / "eval" / "scenarios" / "conversation_scenarios.json").exists()
+            assert not (root / "eval" / "eval_data" / "golden_dataset.json").exists()
+            assert not (root / "app" / "tests").exists(), \
+                "F3 regression: app/tests/ must not exist; tests/eval/ lives at the project root"
             # Next-steps leads with the local iteration loop
-            assert "Run the local pipeline" in result.output
             assert "agent-eval run" in result.output
-            # And tells the user how to unlock the streamlined pass later
-            assert "deploy" in result.output.lower()
-            # Critically: no chooser appears
+            # No chooser, no Path A/B leak
             assert "Choose path" not in result.output
             assert "Path A" not in result.output
             assert "Path B" not in result.output
@@ -162,11 +166,13 @@ class TestInitAutoApprove(unittest.TestCase):
             result = self._invoke(root)
 
             assert result.exit_code == 0, result.output
-            # Both layouts scaffolded
-            assert (root / "eval" / "metrics" / "metric_definitions.json").exists()
+            # Same unified layout regardless of detection.
+            assert (root / "tests" / "eval" / "metrics" / "metric_definitions.json").exists()
             assert (root / "tests" / "eval" / "dataset.jsonl").exists()
+            assert not (root / "app" / "tests").exists(), \
+                "F3 regression: app/tests/ must not exist"
             # Next-steps STILL leads with `run` (the iteration loop), then
-            # mentions agent-engine as the secondary pass
+            # mentions agent-engine as the secondary pass.
             run_idx = result.output.find("agent-eval run")
             ae_idx = result.output.find("agent-eval agent-engine")
             assert run_idx != -1, "agent-eval run missing from next-steps"
@@ -176,7 +182,6 @@ class TestInitAutoApprove(unittest.TestCase):
                 "loop) and surface `agent-engine` second — got run at "
                 f"{run_idx}, agent-engine at {ae_idx}"
             )
-            # No chooser
             assert "Path A" not in result.output
             assert "Path B" not in result.output
 
@@ -193,10 +198,8 @@ class TestInitAutoApprove(unittest.TestCase):
             result = self._invoke(root)
 
             assert result.exit_code == 0, result.output
-            # Defaulted to local-only — eval/ scaffolded, tests/eval/dataset.jsonl
-            # only created when agent_engine surface is in chosen_paths.
-            assert (root / "eval" / "metrics" / "metric_definitions.json").exists()
-            assert "Run the local pipeline" in result.output
+            # Unified scaffold lands at <project_root>/tests/eval/.
+            assert (root / "tests" / "eval" / "metrics" / "metric_definitions.json").exists()
             assert "Path A" not in result.output
             assert "Path B" not in result.output
 

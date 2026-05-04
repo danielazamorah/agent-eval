@@ -4,71 +4,92 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 
 console = Console()
 
 
+# Starter metrics scaffolded when the user opts out of AI generation.
+#
+# CANONICAL SCHEMA — mirrors the six patterns from
+# https://cloud.google.com/vertex-ai/generative-ai/docs/models/determine-eval
+# See ``core/metric_schema.py`` for the full schema spec.
+#
+# Two managed adaptive rubrics + two binary custom_llm_judge metrics. The
+# custom ones are deliberately decomposed into single-criterion binary checks
+# (rather than 0-5 vibes) — the inter-rater-reliability research and the
+# docs' own static rubric metrics (SAFETY, FINAL_RESPONSE_MATCH) both score
+# this way. Re-shape the criteria/rating_scores when scaffolding for a
+# different agent shape.
 METRIC_TEMPLATES = {
     "general_quality": {
-        "metric_type": "llm",
-        "is_managed": True,
-        "managed_metric_name": "GENERAL_QUALITY",
-        "use_gemini_format": True,
-        "score_range": {"min": 0, "max": 1, "description": "Passing rate for quality rubrics"},
+        "kind": "managed",
+        "base": "GENERAL_QUALITY",
     },
     "trajectory_accuracy": {
-        "metric_type": "llm",
+        "kind": "custom_llm_judge",
         "requires_multi_turn": True,
-        "score_range": {"min": 0, "max": 5, "description": "0=Wrong, 5=Perfect trajectory"},
+        "instruction": (
+            "Evaluate whether the agent's execution trajectory used the available "
+            "tools correctly to address the user's request. Score 1 only if EVERY "
+            "criterion below is met; 0 if any criterion fails."
+        ),
+        "criteria": {
+            "tool_existence": (
+                "Every tool the agent called appears in the **Available Tools** list. "
+                "Hallucinated tool names → 0."
+            ),
+            "no_obvious_detour": (
+                "The agent did not take an obvious detour or call an irrelevant tool "
+                "before reaching the answer."
+            ),
+        },
+        "rating_scores": {
+            "1": "Pass: both criteria met",
+            "0": "Fail: at least one criterion not met",
+        },
         "dataset_mapping": {
             "prompt": {"source_column": "user_inputs"},
             "response": {"source_column": "trace_summary"},
             "reference": {"source_column": "extracted_data:tool_declarations"},
         },
-        "template": (
-            "Evaluate the agent's execution trajectory.\n\n"
-            "**User Request:**\n{prompt}\n\n"
-            "**Agent Trajectory:**\n{response}\n\n"
-            "**Available Tools:**\n{reference}\n\n"
-            "CRITICAL: Only evaluate against tools that EXIST in the list above.\n\n"
-            "**Scoring (0-5):**\n"
-            "- 5: Optimal trajectory using available tools\n"
-            "- 3: Acceptable with minor inefficiencies\n"
-            "- 0: Completely wrong approach\n\n"
-            "Score: [0-5]\nExplanation: [Your reasoning]"
-        ),
     },
     "tool_use_quality": {
-        "metric_type": "llm",
-        "score_range": {"min": 0, "max": 5, "description": "0=Poor, 5=Excellent"},
+        "kind": "custom_llm_judge",
+        "instruction": (
+            "Evaluate the agent's tool calls for correctness. Score 1 only if EVERY "
+            "criterion below is met; 0 if any criterion fails. The tool list and "
+            "actual call trace are in the **Reference** section."
+        ),
+        "criteria": {
+            "selection": "Each tool the agent chose is appropriate for the request.",
+            "arguments": "Tool arguments are populated correctly (right keys, right types, no obvious typos).",
+            "no_redundancy": "No duplicate / unnecessary tool calls.",
+        },
+        "rating_scores": {
+            "1": "Pass: all three criteria met",
+            "0": "Fail: at least one criterion not met",
+        },
         "dataset_mapping": {
             "prompt": {"source_column": "user_inputs"},
             "response": {"source_column": "final_response"},
             "reference": {
-                "template": "Available Tools: {extracted_data_tool_declarations}\n\nTool Calls: {extracted_data_tool_interactions}",
-                "source_columns": ["extracted_data:tool_declarations", "extracted_data:tool_interactions"],
+                "template": (
+                    "Available Tools: {extracted_data_tool_declarations}\n\n"
+                    "Tool Calls: {extracted_data_tool_interactions}"
+                ),
+                "source_columns": [
+                    "extracted_data:tool_declarations",
+                    "extracted_data:tool_interactions",
+                ],
             },
         },
-        "template": (
-            "Evaluate tool usage.\n\n"
-            "**Request:** {prompt}\n"
-            "**Response:** {response}\n\n"
-            "{reference}\n\n"
-            "**Criteria:**\n"
-            "1. Tool Selection: Were appropriate tools chosen?\n"
-            "2. Arguments: Were parameters correct?\n"
-            "3. Efficiency: Were calls non-redundant?\n\n"
-            "Score: [0-5]\nExplanation:"
-        ),
     },
     "safety": {
-        "metric_type": "llm",
-        "is_managed": True,
-        "managed_metric_name": "SAFETY",
-        "use_gemini_format": True,
-        "score_range": {"min": 0, "max": 1, "description": "Passing rate for safety rubrics"},
+        "kind": "managed",
+        "base": "SAFETY",
     },
 }
 
@@ -308,15 +329,28 @@ def scaffold_metrics_only(
     agent_name: str = "app",
     metrics: list[str] | None = None,
     custom_metric_definitions: dict | None = None,
+    *,
+    if_exists: str = "backup_and_overwrite",
 ) -> None:
-    """Scaffold only ``tests/eval/metrics/metric_definitions.json`` (Path A use).
+    """Scaffold ``<project_root>/tests/eval/metrics/metric_definitions.json``.
 
-    Path A doesn't need scenarios or golden datasets — ``agent-engine`` reads
-    ``tests/eval/dataset.jsonl`` directly and only needs the metric file to
-    know what to score against. Writes to the canonical unified layout.
+    Writes at the agent's project root (parent of the ``app/`` module dir
+    in standard ASP layout) — NOT inside the agent module. Pre-rescue this
+    landed in ``<agent_dir>/tests/eval/`` which created the F3 confusion.
+
+    The file content is minimal (just ``metrics``) — editing instructions and
+    rationale belong in the CLI experience (see ``_metric_review_guide`` in
+    ``cli/commands/init.py``), not embedded in the user's data file.
+
+    ``if_exists`` controls behavior when the target file already exists:
+      - ``"backup_and_overwrite"`` (default) — back up to ``.backup/`` then write
+      - ``"skip"`` — leave the existing file alone, log "kept"
+      - ``"overwrite"`` — overwrite without backup
     """
-    eval_dir = target_dir / "tests" / "eval"
-    metric_defs = {"metrics": {}}
+    from agent_eval.core.path_resolver import agent_project_root
+    project_root = agent_project_root(target_dir)
+    eval_dir = project_root / "tests" / "eval"
+    metric_defs: dict = {"metrics": {}}
 
     if custom_metric_definitions:
         for key, defn in custom_metric_definitions.items():
@@ -338,15 +372,22 @@ def scaffold_metrics_only(
     _write_if_missing(eval_dir / "results" / ".gitkeep", "")
 
     metrics_path = eval_dir / "metrics" / "metric_definitions.json"
-    if metrics_path.exists() and custom_metric_definitions:
-        backup = _backup_existing_files(eval_dir, mode="dataset-only")
-        if backup:
-            console.print(f"  [dim]Previous metrics backed up to tests/eval/.backup/[/]")
-    if metrics_path.exists() and not custom_metric_definitions:
-        console.print(f"  [yellow]kept[/]     {eval_dir}/metrics/metric_definitions.json")
-    else:
-        metrics_path.write_text(json.dumps(metric_defs, indent=2) + "\n")
-        console.print(f"  [green]created[/]  {eval_dir}/metrics/metric_definitions.json")
+    if metrics_path.exists():
+        if if_exists == "skip":
+            console.print(
+                f"  [yellow]kept[/]     {eval_dir}/metrics/metric_definitions.json  "
+                f"[dim](already on disk; not overwriting)[/]"
+            )
+            return
+        if if_exists == "backup_and_overwrite" and custom_metric_definitions:
+            backup = _backup_existing_files(eval_dir, mode="dataset-only")
+            if backup:
+                console.print(f"  [dim]Previous metrics backed up to tests/eval/.backup/[/]")
+        if if_exists == "backup_and_overwrite" and not custom_metric_definitions:
+            console.print(f"  [yellow]kept[/]     {eval_dir}/metrics/metric_definitions.json")
+            return
+    metrics_path.write_text(json.dumps(metric_defs, indent=2) + "\n")
+    console.print(f"  [green]created[/]  {eval_dir}/metrics/metric_definitions.json")
     console.print(f"  [green]created[/]  {eval_dir}/results/.gitkeep")
 
 
@@ -356,26 +397,62 @@ def _rows_from_recommendations(
 ) -> list[dict]:
     """Convert Gemini's recommendations dict into unified dataset.jsonl rows.
 
-    Maps the same shape that ``_build_ai_scenarios`` / ``_build_ai_golden_data``
-    produce for the legacy files, but emits canonical SDK columns instead:
-    - ``starting_prompt`` → ``prompt``; ``conversation_plan`` kept verbatim
-    - ``user_inputs[-1]`` → ``prompt``; earlier turns → ``conversation_history``
-    - ``reference_data.expected_behavior`` → ``reference``; other
-      ``reference_data.*`` keys flatten to top-level ``expected_*`` columns
+    Each row carries an explicit ``kind`` field (``"multi_turn"`` /
+    ``"single_turn"`` / ``"both"``) so the user can tell at a glance what
+    drives what — and ``detect_capabilities`` can read it instead of
+    inferring from field presence.
+
+    Field shape:
+    - **Multi-turn rows**: ``prompt`` + ``conversation_plan`` (a LIST of
+      strings, one per follow-up turn — NOT a numbered string). Drive
+      ``simulate``.
+    - **Single-turn rows**: ``prompt`` + nested ``reference_data`` dict.
+      Drive ``interact`` and ``agent-engine``. ``reference_data.expected_behavior``
+      is also mirrored to the SDK-canonical top-level ``reference`` column for
+      managed metrics like FINAL_RESPONSE_MATCH.
+    - **Both**: a row that has both ``conversation_plan`` AND ``reference_data``
+      drives both paths. Not generated by the AI today, but the format supports
+      it for hand-edited rows.
+
     Every row gets the supplied ``session_inputs``.
     """
     rows: list[dict] = []
     if not recommendations:
         return rows
 
-    for scen in recommendations.get("scenarios") or []:
+    # Key ORDER on every row: kind → id → prompt → session_inputs → ...
+    # This puts the row's identity (what it is + which one) at the top so
+    # the file is scannable. The id-at-the-end pre-2026-05-01 made it hard
+    # to spot where one row ended and the next began when scrolling JSONL.
+    for i, scen in enumerate(recommendations.get("scenarios") or [], 1):
         prompt = scen.get("starting_prompt") or scen.get("description") or ""
         if not prompt:
             continue
-        row: dict = {"prompt": prompt, "session_inputs": session_inputs}
+        row: dict = {
+            "kind": "multi_turn",
+            "id": scen.get("id") or f"multi_turn_{i:03d}",
+            "prompt": prompt,
+            "session_inputs": session_inputs,
+        }
         plan = scen.get("conversation_plan")
-        if plan:
-            row["conversation_plan"] = plan
+        if plan is not None:
+            # Coerce to LIST regardless of what Gemini returned. Some prompts
+            # still slip through with a numbered string; ADK's UserSim then
+            # iterates over CHARACTERS instead of turns. Defensive parse:
+            # split on numbered markers ("1. ", "2. ", ...) or newlines.
+            row["conversation_plan"] = _coerce_conversation_plan_to_list(plan)
+        # Preserve reference_data on multi-turn rows when present. This
+        # supports metrics that flag BOTH requires_multi_turn AND
+        # requires_reference (e.g. "judge the trajectory AND compare the
+        # final answer to a known-good route"). The simulate→convert
+        # pipeline propagates this through to the saved interaction row
+        # via _build_prompt_to_reference_map() in run.py.
+        scen_ref_data = {
+            k: v for k, v in (scen.get("reference_data") or {}).items()
+            if v not in (None, "", [], {})
+        }
+        if scen_ref_data:
+            row["reference_data"] = scen_ref_data
         rows.append(row)
 
     for i, g in enumerate(recommendations.get("golden_data") or [], 1):
@@ -384,26 +461,61 @@ def _rows_from_recommendations(
             user_inputs = [g["description"]]
         if not user_inputs:
             continue
-        row = {"prompt": user_inputs[-1], "session_inputs": session_inputs}
+        row = {
+            "kind": "single_turn",
+            "id": g.get("id") or f"single_turn_{i:03d}",
+            "prompt": user_inputs[-1],
+            "session_inputs": session_inputs,
+        }
         if len(user_inputs) > 1:
-            row["conversation_history"] = [
+            # SDK FLATTEN canonical column name. Older code used
+            # 'conversation_history'; both still parse but 'history' is
+            # the wire form so writing it directly avoids a translation.
+            row["history"] = [
                 {"role": "user", "parts": [{"text": t}]} for t in user_inputs[:-1]
             ]
-        ref_data = g.get("reference_data") or {}
-        for key, value in ref_data.items():
-            if not value:
-                continue
-            if key == "expected_behavior":
-                row["reference"] = value
-            else:
-                row[key] = value
-        if g.get("id"):
-            row["id"] = g["id"]
-        else:
-            row["id"] = f"ai_generated_{i:03d}"
+        # Keep reference_data NESTED — single source of truth for
+        # golden-comparison metrics. The evaluator's per-metric
+        # `reference_data:<field>` source columns + the
+        # SDK_COLUMN_DEFAULTS["reference"] = "reference_data:expected_behavior"
+        # default in metric_schema.py wire it up. We do NOT mirror to a
+        # top-level `reference` column anymore (pre-2026-05-02 behavior) —
+        # the duplication forced a "don't hand-edit reference" caveat in
+        # the editing guide and risked silent desync when users edited
+        # one but not the other.
+        ref_data = {
+            k: v for k, v in (g.get("reference_data") or {}).items() if v not in (None, "", [], {})
+        }
+        if ref_data:
+            row["reference_data"] = ref_data
         rows.append(row)
 
     return rows
+
+
+def _coerce_conversation_plan_to_list(plan: Any) -> list[str]:
+    """Normalize ``conversation_plan`` to a list of turn strings.
+
+    Defensive against Gemini returning a numbered string instead of a JSON
+    array (common slip even when the prompt explicitly asks for an array).
+    Without this, ADK's UserSim iterates over individual characters of the
+    string and the simulation breaks.
+    """
+    import re as _re
+    if isinstance(plan, list):
+        return [str(t).strip() for t in plan if str(t).strip()]
+    if isinstance(plan, str):
+        # Try splitting on numbered markers first ("1. ", "2. ", ...)
+        parts = _re.split(r"\s*\n?\s*\d+\.\s+", plan)
+        cleaned = [p.strip() for p in parts if p.strip()]
+        if len(cleaned) > 1:
+            return cleaned
+        # Fall back to newline splitting
+        cleaned = [p.strip() for p in plan.splitlines() if p.strip()]
+        if cleaned:
+            return cleaned
+        return [plan.strip()]
+    return []
 
 
 def scaffold_dataset_jsonl(
@@ -412,16 +524,24 @@ def scaffold_dataset_jsonl(
     *,
     recommendations: dict | None = None,
 ) -> None:
-    """Scaffold ``tests/eval/dataset.jsonl`` for Path A (Agent Engine) usage.
+    """Scaffold the unified ``<project_root>/tests/eval/dataset.jsonl``.
+
+    This is the single source of truth for evaluation data — consumed by
+    ``simulate`` (multi-turn rows), ``interact`` (single-turn rows), and
+    ``agent-engine`` (single-turn rows; multi-turn skipped with a clear
+    message). Writes at the project root (parent of the agent module in
+    ASP layout), NOT inside the agent module dir.
 
     When ``recommendations`` carries Gemini-generated ``scenarios`` and/or
-    ``golden_data``, those are converted into rows so Path A evaluates against
-    the user's actual agent (not generic "Hello" prompts) — the existing file
-    is backed up and replaced so re-running ``init --ai-metrics`` actually
-    refreshes content. Without recommendations, an existing file is preserved
-    and only fresh projects get the 2-row starter.
+    ``golden_data``, those are converted into rows so the user starts with
+    realistic data — the existing file is backed up and replaced so
+    re-running ``init --ai-metrics`` refreshes content. Without
+    recommendations, an existing file is preserved and only fresh projects
+    get the 2-row starter.
     """
-    dataset_path = target_dir / "tests" / "eval" / "dataset.jsonl"
+    from agent_eval.core.path_resolver import agent_project_root
+    project_root = agent_project_root(target_dir)
+    dataset_path = project_root / "tests" / "eval" / "dataset.jsonl"
 
     session_inputs = {"app_name": agent_name, "user_id": "eval_user", "state": {}}
     ai_rows = _rows_from_recommendations(recommendations, session_inputs)
@@ -431,7 +551,7 @@ def scaffold_dataset_jsonl(
         return
 
     if dataset_path.exists() and ai_rows:
-        backup_root = target_dir / "tests" / "eval" / ".backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_root = project_root / "tests" / "eval" / ".backup" / datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_root.mkdir(parents=True, exist_ok=True)
         shutil.copy2(dataset_path, backup_root / "dataset.jsonl")
         console.print(f"  [dim]Previous dataset backed up to {backup_root}[/]")

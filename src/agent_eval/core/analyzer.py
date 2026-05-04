@@ -979,7 +979,33 @@ class Analyzer:
         )
         logger.debug("Optimization log updated: %s", log_path)
 
-        # 5. GCS Upload (Placeholder)
+        # 5. Single self-contained HTML report combining everything.
+        # Folds the three markdown files into one tabs-based browseable
+        # page (Overview, Per-Question heatmap, Iteration History, AI
+        # Analysis). Markdowns stay on disk for tooling that wants raw
+        # files; the HTML is the recommended viewing surface.
+        html_report_path = None
+        try:
+            from agent_eval.core.html_report import generate_html_report
+            gemini_md = (run_folder / "gemini_analysis.md").read_text() \
+                if (run_folder / "gemini_analysis.md").exists() else None
+            opt_log_md = log_path.read_text() if log_path and log_path.exists() else None
+            agent_dir_path = Path(self.config.get("agent_dir") or "")
+            agent_name = agent_dir_path.name if agent_dir_path.name else None
+            html_report_path = generate_html_report(
+                run_dir=run_folder,
+                summary=current_summary,
+                comparison=comparison_data,
+                gemini_analysis_md=gemini_md,
+                optimization_log_md=opt_log_md,
+                results_csv=results_file,
+                agent_name=agent_name,
+            )
+            logger.debug("HTML report written: %s", html_report_path)
+        except Exception as exc:
+            logger.warning("Could not generate HTML report: %s", exc)
+
+        # 6. GCS Upload (Placeholder)
         if gcs_bucket:
             logger.debug("[PLACEHOLDER] Uploading Results to GCS: gs://%s", gcs_bucket)
 
@@ -987,4 +1013,5 @@ class Analyzer:
             "current_summary": current_summary,
             "comparison_data": comparison_data,
             "optimization_log_path": log_path,
+            "html_report_path": html_report_path,
         }
