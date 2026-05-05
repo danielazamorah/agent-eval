@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import ast
@@ -280,8 +293,15 @@ class Analyzer:
             if not isinstance(user_inputs, list):
                 user_inputs = [str(user_inputs)] if user_inputs else []
 
-            # Final agent response
-            final_response = row.get("final_response", "")
+            # Final agent response. Pandas reads empty CSV cells as float
+            # NaN, which crashes downstream `len()` calls in
+            # _format_log_entry_markdown. Coerce to str at the source so
+            # the markdown renderer can trust the type.
+            final_response_raw = row.get("final_response", "")
+            if final_response_raw is None or (isinstance(final_response_raw, float) and pd.isna(final_response_raw)):
+                final_response = ""
+            else:
+                final_response = str(final_response_raw)
 
             # Agent trajectory
             trace_summary = robust_json_loads(row.get("trace_summary", []))
@@ -369,8 +389,11 @@ class Analyzer:
                 agent_resp = text_responses[i].replace("\n", "\n  ")
                 conversation_md += f"**Agent Turn {i+1}:**\n  {agent_resp}\n\n"
 
-        # Final agent response (summary block)
-        final_response = entry["final_response"][:500] + "..." if len(entry["final_response"]) > 500 else entry["final_response"]
+        # Final agent response (summary block). Belt-and-suspenders: even
+        # though _process_log_row coerces to str, defend here too in case a
+        # caller bypasses that path.
+        fr = entry["final_response"] if isinstance(entry["final_response"], str) else str(entry["final_response"] or "")
+        final_response = fr[:500] + "..." if len(fr) > 500 else fr
         response_md = f"### Final Response Summary\n\n{final_response}\n"
 
         # Agent trajectory
@@ -401,14 +424,28 @@ class Analyzer:
                 score_str = f"{score:.2f}" if isinstance(score, (int, float)) else str(score)
                 adk_md += f"- **{metric}:** {score_str}\n"
 
-        # Evaluation metrics with explanations
+        # Evaluation metrics with explanations. The `explanation` field
+        # varies wildly across metrics — string for most, list of dicts
+        # for hallucination, sometimes float NaN when the autorater
+        # failed. Coerce every shape into a printable string before
+        # truncating so `len()` / slice never sees a non-string.
         metrics_md = "### Evaluation Metrics\n\n"
         for m_name, m_val in entry["eval_results"].items():
             if isinstance(m_val, dict):
                 score = m_val.get("score", "N/A")
                 score_str = f"{score:.2f}" if isinstance(score, (int, float)) else str(score)
-                expl = m_val.get("explanation", "")
-                # Truncate long explanations
+                expl_raw = m_val.get("explanation", "")
+                if isinstance(expl_raw, str):
+                    expl = expl_raw
+                elif expl_raw is None:
+                    expl = ""
+                elif isinstance(expl_raw, (list, dict)):
+                    try:
+                        expl = json.dumps(expl_raw, default=str, indent=2)
+                    except (TypeError, ValueError):
+                        expl = str(expl_raw)
+                else:
+                    expl = str(expl_raw)
                 expl_short = expl[:300] + "..." if len(expl) > 300 else expl
                 metrics_md += f"#### {m_name}: **{score_str}**\n\n{expl_short}\n\n"
             else:
