@@ -734,9 +734,9 @@ def _verify_environment(auto_approve: bool = False) -> None:
 
     load_dotenv(override=True)
 
-    console.print(Rule(style="dim"))
     console.print()
-    console.print("  [bold]Step 1 — Checking your Google Cloud environment[/]")
+    console.print(Rule("  Step 1/4: Checking your Google Cloud environment  ", style="bold cyan"))
+    console.print()
     console.print(
         "  [dim]Eval needs a project, ADC credentials, and the Vertex AI API enabled.[/]"
     )
@@ -812,204 +812,43 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
     )
 
     console.print()
-    console.print(Rule(style="dim"))
-    console.print()
-    console.print("  [bold]Step 3 — Figuring out how to reach your agent[/]")
+    console.print(Rule("  Step 3/4: Figuring out how to reach your agent  ", style="bold cyan"))
     console.print()
     console.print(
-        "  [dim]── Why this step ──[/]"
+        "  [dim]To score your agent, agent-eval first needs to[/] [bold]run it against test inputs[/]"
     )
     console.print(
-        "  [dim]Before[/] [bold]agent-eval[/] [dim]can score your agent, it needs to[/] [bold]run it against[/]"
-    )
-    console.print(
-        "  [bold]test inputs[/] [dim]and[/] [bold]capture what happens[/] [dim]— every prompt, response, tool[/]"
-    )
-    console.print(
-        "  [dim]call, and execution trace. This step decides[/] [bold]how agent-eval reaches your[/]"
-    )
-    console.print(
-        "  [bold]agent[/] [dim]to do that capture.[/]"
+        "  [dim]and[/] [bold]capture what happens[/] [dim]— every prompt, response, tool call, trace.[/]"
     )
     console.print()
     console.print(
-        "  [dim]The[/] [bold]local pipeline[/] [dim]is the default — it imports your[/] [cyan]agent.py[/] "
-        "[dim]directly so you can[/]"
-    )
-    console.print(
-        "  [dim]iterate on changes without deploying. If we[/] [bold]also[/] [dim]find an Agent Engine deployment[/]"
-    )
-    console.print(
-        "  [dim]for the same agent, we[/] [bold]additionally[/] [dim]wire up Vertex's streamlined single-turn pass —[/]"
-    )
-    console.print(
-        "  [dim]the two[/] [bold]compose[/][dim], they don't replace each other.[/]"
+        "  [dim]The[/] [bold]local pipeline[/] [dim]is the default — we import your[/] [cyan]agent.py[/] "
+        "[dim]directly so you can iterate without redeploying.[/]"
     )
     console.print()
     console.print(
-        "  [dim]Either way, the captured interactions land in a single file:[/]"
-    )
-    console.print()
-    console.print(
-        "      [cyan]tests/eval/dataset.jsonl[/]   [dim](canonical SDK columns — see Step 4 backgrounder)[/]"
-    )
-    console.print()
-    console.print(
-        "  [dim]Step 4 hands that file to Vertex's[/] [cyan]client.evals.evaluate()[/] [dim]for scoring. The[/]"
+        "  [dim]Captured interactions land in[/] [cyan]tests/eval/dataset.jsonl[/][dim], which Step 4 hands to[/]"
     )
     console.print(
-        "  [dim]format maps directly to the docs' dataset spec:[/]"
-    )
-    console.print(
-        "  [cyan]https://cloud.google.com/vertex-ai/generative-ai/docs/models/evaluation-dataset[/]"
-    )
-    console.print()
-    console.print(
-        "  [dim]── Two ways agent-eval can collect that interaction data ──[/]"
-    )
-    console.print()
-    console.print(
-        "    [bold cyan]Local pipeline[/]      [bold]Local ADK source (or any ADK FastAPI URL)[/]  "
-        "[dim]— UserSim multi-turn + interact single-turn, full traces.[/]"
-    )
-    console.print(
-        "             [dim italic]UserSim docs:[/] [cyan]https://adk.dev/evaluate/user-sim/[/]"
-    )
-    console.print(
-        "    [bold cyan]Streamlined pass[/]    [bold]Deployed to Agent Engine[/]                  "
-        "[dim]— Vertex calls your agent for us (managed, single-turn). Adds on top.[/]"
+        "  [cyan]client.evals.evaluate()[/][dim] for scoring (canonical Vertex SDK schema).[/]"
     )
     console.print()
 
-    # ── Scan 1: deployed Agent Engine ──
-    _continue("Next: look for a deployed Agent Engine →", console=console)
+    # ── Scan: local ADK source (the primary surface) ──
+    _continue("Next: look for a local agent.py →", console=console)
     with console.status(
-        "  [dim]Looking for an Agent Engine deployment...[/]",
-        spinner="dots",
-    ):
-        _pause(_PAUSE_LONG)
-        ae_detection = _detect_agent_engine(search_dir)
-
-    console.print()
-
-    if ae_detection is not None:
-        console.print(
-            "  [green]>[/] [bold]Found a deployed Agent Engine.[/]  "
-            "[dim](streamlined pass available)[/]"
-        )
-        console.print(f"    [dim]How we know:[/]  {ae_detection.evidence}")
-        if ae_detection.agent_engine_resource:
-            console.print(
-                f"    [dim]Resource:   [/]  [cyan]{ae_detection.agent_engine_resource}[/]"
-            )
-        console.print()
-        _pause()
-        console.print("  [bold]What this adds to your eval:[/]")
-        console.print(
-            "    [dim]>[/] [cyan]agent-eval agent-engine[/] sends your dataset to Vertex's [cyan]create_evaluation_run()[/]."
-        )
-        console.print(
-            "    [dim]>[/] Vertex calls your deployed agent, scores the responses,"
-        )
-        console.print(
-            "    [dim]>[/] and uploads results to GCS — all in one managed call. No local server needed."
-        )
-        console.print()
-        _pause()
-        console.print(
-            "    [yellow]Heads-up:[/] [cyan]create_evaluation_run()[/] is "
-            "[bold]single-turn only[/] — no multi-turn replay,"
-        )
-        console.print(
-            "    no built-in user simulator. We'll see next whether the local pipeline picks up the slack ↓"
-        )
-    else:
-        console.print(
-            "  [yellow]·[/] [bold]No Agent Engine deployment found here.[/] "
-            "[dim](that's fine — local pipeline still works)[/]"
-        )
-        console.print(
-            "    [dim italic]No[/] [cyan]deployment_metadata.json[/] [dim italic]with[/] "
-            "[cyan]remote_agent_engine_id[/][dim italic], and no[/] "
-            "[cyan]AGENT_ENGINE_RESOURCE_NAME[/] [dim italic]env var.[/]"
-        )
-
-        # Escape hatch: auto-detect can miss a deployment (metadata file in an
-        # unexpected location, env var not exported in this shell, etc). Let
-        # the user paste a resource name we couldn't find. Only when interactive —
-        # under AGENT_EVAL_NO_PAUSES we skip the prompt entirely.
-        if not _pauses_disabled():
-            console.print()
-            console.print(
-                "    [dim italic]Have one we couldn't find? Paste the resource name below[/]"
-                " [dim italic](or leave blank to stick with local-only).[/]"
-            )
-            console.print(
-                "    [dim italic]Format:[/] [cyan]projects/<NUMBER>/locations/<REGION>/reasoningEngines/<ID>[/]"
-            )
-            try:
-                manual = questionary.text(
-                    "    Resource name (Enter to skip):",
-                    default="",
-                ).ask()
-            except (KeyboardInterrupt, EOFError):
-                manual = None
-            if manual and manual.strip():
-                stripped = manual.strip()
-                if re.match(
-                    r"^projects/[^/]+/locations/[^/]+/reasoningEngines/[^/]+$",
-                    stripped,
-                ):
-                    ae_detection = PathDetection(
-                        path="A",
-                        evidence="user-provided resource name",
-                        agent_engine_resource=stripped,
-                    )
-                    console.print()
-                    console.print(
-                        "  [green]>[/] [bold]Got it — using your manual entry.[/]  "
-                        "[dim](streamlined pass enabled)[/]"
-                    )
-                    console.print(f"    [dim]Resource:[/]  [cyan]{stripped}[/]")
-                    console.print()
-                    _pause()
-                    console.print("  [bold]What this adds to your eval:[/]")
-                    console.print(
-                        "    [dim]>[/] [cyan]agent-eval agent-engine[/] sends your dataset to Vertex's [cyan]create_evaluation_run()[/]."
-                    )
-                    console.print(
-                        "    [dim]>[/] Vertex calls your deployed agent, scores the responses,"
-                    )
-                    console.print(
-                        "    [dim]>[/] and uploads results to GCS — all in one managed call. No local server needed."
-                    )
-                    console.print()
-                    _pause()
-                    console.print(
-                        "    [yellow]Heads-up:[/] [cyan]create_evaluation_run()[/] is "
-                        "[bold]single-turn only[/] — no multi-turn replay,"
-                    )
-                    console.print(
-                        "    no built-in user simulator. We'll see next whether the local pipeline picks up the slack ↓"
-                    )
-                else:
-                    console.print()
-                    console.print(
-                        "    [yellow]·[/] [dim]Doesn't look like a Reasoning Engines resource — sticking with local-only.[/]"
-                    )
-                    console.print(
-                        "    [dim]Expected:[/] [cyan]projects/<NUMBER>/locations/<REGION>/reasoningEngines/<ID>[/]"
-                    )
-
-    # ── Scan 2: local ADK source ──
-    console.print()
-    _continue("Next: look for local source for the same agent →", console=console)
-    with console.status(
-        "  [dim]Looking for a local agent.py...[/]",
+        "  [dim]Scanning for a local agent.py...[/]",
         spinner="dots",
     ):
         _pause(_PAUSE_LONG)
         local_detection = _detect_local_adk(search_dir)
+
+    # ── Scan: deployed Agent Engine (silent — only surfaced if found) ──
+    # Detection still runs so a deployed agent gets wired up automatically,
+    # but we don't pause the user through extra prompts when nothing's found.
+    # The manual-entry escape hatch is preserved for the rare case where
+    # auto-detect misses a real deployment.
+    ae_detection = _detect_agent_engine(search_dir)
 
     console.print()
 
@@ -1022,70 +861,47 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
             rel = first
         extra = f" (+{local_count - 1} more)" if local_count > 1 else ""
 
+        console.print(
+            "  [green]>[/] [bold]Found your local ADK agent.[/]"
+        )
+        console.print(f"    [dim]agent.py at[/] [cyan]{rel}[/]{extra}")
+
         if ae_detection is not None:
-            # Both surfaces detected — connect them: the local pipeline runs
-            # against this agent.py, and the streamlined pass runs against the
-            # already-detected deployment.
+            # Both surfaces detected — quiet acknowledgment, no deep dive.
+            # The streamlined pass is wired up automatically; the user can
+            # opt into it later via `agent-eval agent-engine`.
             console.print(
-                "  [green]+[/] [bold]Local source for the same agent is also here.[/]  "
-                "[dim](local pipeline available too — both compose)[/]"
+                "  [green]+[/] [dim]Also detected a deployed agent for the same project[/] "
+                "[dim italic](Vertex's streamlined single-turn pass is available too).[/]"
             )
-            console.print(f"    [dim]How we know:[/]  agent.py at {rel}{extra}")
-            console.print()
-            _pause()
-            console.print(
-                "    [dim]>[/] [bold]agent-eval[/]'s local UserSim imports your agent module directly"
-            )
-            console.print(
-                "    [dim]>[/] (no FastAPI server needed) — so [bold]multi-turn coverage is on the table[/]"
-            )
-            console.print(
-                "    [dim]>[/] alongside the streamlined single-turn pass."
-            )
-        else:
-            console.print(
-                "  [green]>[/] [bold]Found a local ADK agent.[/]  "
-                "[dim](local pipeline ready)[/]"
-            )
-            console.print(f"    [dim]How we know:[/]  agent.py at {rel}{extra}")
-            console.print()
-            _pause()
-            console.print("  [bold]What this means for your eval:[/]")
-            console.print(
-                "    [dim]>[/] [bold]Multi-turn conversations[/] — we'll start your agent locally and drive it"
-            )
-            console.print(
-                "      with ADK's [cyan]UserSim[/] (an LLM playing the role of a scripted user)."
-            )
-            console.print(
-                "    [dim]>[/] [bold]Single-turn queries[/] — [cyan]agent-eval interact[/] hits ADK's REST endpoints"
-            )
-            console.print(
-                "      ([cyan]/run[/], [cyan]/debug/trace[/]) on whatever URL you point it at — local dev,"
-            )
-            console.print(
-                "      Cloud Run, or any other ADK FastAPI host."
-            )
-            console.print(
-                "    [dim]>[/] [bold]Scoring[/] — every trace converges at Vertex's "
-                "[cyan]client.evals.evaluate()[/] with the metrics you'll pick in a moment."
-            )
-            console.print()
-            _pause()
-            console.print(
-                "    [dim italic]Heads-up: if you later run this against a Cloud Run deployment, "
-                "ADK's debug traces aren't always persisted there — we'll fall back to "
-                "state-derived metrics only.[/]"
-            )
+
+        console.print()
+        _pause()
+        console.print("  [bold]What this means for your eval:[/]")
+        console.print(
+            "    [dim]>[/] [bold]Multi-turn conversations[/] — we'll drive your agent locally with ADK's [cyan]UserSim[/]."
+        )
+        console.print(
+            "    [dim]>[/] [bold]Single-turn queries[/] — [cyan]agent-eval interact[/] hits your agent's REST endpoint"
+        )
+        console.print(
+            "      ([cyan]/run[/], [cyan]/debug/trace[/]) on local dev, Cloud Run, or any ADK FastAPI host."
+        )
+        console.print(
+            "    [dim]>[/] [bold]Scoring[/] — every trace converges at Vertex's [cyan]client.evals.evaluate()[/]."
+        )
     else:
+        # No local agent. AE-only is a niche case (less common in practice);
+        # keep it short and offer the manual escape hatch only on demand.
         if ae_detection is not None:
             console.print(
-                "  [yellow]·[/] [bold]No local agent.py found nearby.[/]  "
-                "[dim](streamlined Agent Engine pass only — point[/] [cyan]--target-dir[/] [dim]at agent.py to also enable UserSim)[/]"
+                "  [yellow]·[/] [bold]No local agent.py found, but a deployed agent was detected.[/]  "
+                "[dim](you can still evaluate via the streamlined pass — point[/] "
+                "[cyan]--target-dir[/] [dim]at agent.py to also enable UserSim)[/]"
             )
         else:
             console.print(
-                "  [yellow]>[/] [bold]Couldn't auto-detect a local agent or a deployment here.[/]"
+                "  [yellow]>[/] [bold]Couldn't auto-detect a local agent here.[/]"
             )
             console.print()
             _pause()
@@ -1105,6 +921,43 @@ def _display_path_detection(search_dir: Path) -> "PathDetection":  # noqa: F821
                 "    [dim italic]Have non-ADK traces? See[/] [cyan]docs/reference.md[/] [dim italic]→ "
                 "Experimental & on the roadmap (BYOD ingest is in design).[/]"
             )
+
+            # Manual deployment-resource entry — only shown when nothing was
+            # auto-detected AND we're interactive. Keeps the operational
+            # escape hatch without bloating the happy path.
+            if not _pauses_disabled():
+                console.print()
+                console.print(
+                    "    [dim italic]If you have a deployed agent we couldn't find, paste its resource name (or skip):[/]"
+                )
+                console.print(
+                    "    [dim italic]Format:[/] [cyan]projects/<NUMBER>/locations/<REGION>/reasoningEngines/<ID>[/]"
+                )
+                try:
+                    manual = questionary.text(
+                        "    Resource name (Enter to skip):",
+                        default="",
+                    ).ask()
+                except (KeyboardInterrupt, EOFError):
+                    manual = None
+                if manual and manual.strip():
+                    stripped = manual.strip()
+                    if re.match(
+                        r"^projects/[^/]+/locations/[^/]+/reasoningEngines/[^/]+$",
+                        stripped,
+                    ):
+                        ae_detection = PathDetection(
+                            path="A",
+                            evidence="user-provided resource name",
+                            agent_engine_resource=stripped,
+                        )
+                        console.print(
+                            "    [green]>[/] [dim]Got it — streamlined pass available too.[/]"
+                        )
+                    else:
+                        console.print(
+                            "    [yellow]·[/] [dim]Doesn't look like a Reasoning Engines resource — skipping.[/]"
+                        )
 
     # Compose the unified PathDetection downstream code expects.
     if ae_detection is not None and local_detection is not None:
@@ -1203,7 +1056,8 @@ def _prompt_path_choice(detection) -> set[str]:  # noqa: ANN001
 def _prompt_agent_selection(agents: list[tuple[str, Path]], search_dir: Path) -> tuple[str, Path]:
     """Let the user select which discovered agent to scaffold for."""
     console.print()
-    console.print("  [bold]Step 2 — Selecting your agent[/]")
+    console.print(Rule("  Step 2/4: Selecting your agent  ", style="bold cyan"))
+    console.print()
     console.print("  [dim]The agent module is the folder containing your agent.py, tools, and prompts.[/]")
     console.print("  [dim]The eval/ folder will be created inside it.[/]")
     console.print()
@@ -1235,7 +1089,8 @@ def _prompt_agent_selection(agents: list[tuple[str, Path]], search_dir: Path) ->
 def _prompt_agent_name_manual() -> tuple[str, Path]:
     """Prompt for agent module path when no agents are discovered."""
     console.print()
-    console.print("  [bold]Step 2 — Selecting your agent[/]")
+    console.print(Rule("  Step 2/4: Selecting your agent  ", style="bold cyan"))
+    console.print()
     console.print()
     console.print("  [yellow]![/] No ADK agents found in the current directory tree.")
     console.print("  [dim]An ADK agent is identified by a folder containing an agent.py file.[/]")
@@ -1328,9 +1183,8 @@ def _prompt_metrics_choice(agent_dir: Path, agent_name: str) -> tuple[list[str],
     Returns (starter_metric_keys, custom_definitions_or_None, recommendations_or_None, agent_analysis_or_None).
     """
     console.print()
-    console.print(Rule(style="dim"))
+    console.print(Rule("  Step 4/4: Configuring the metrics that will score your agent  ", style="bold cyan"))
     console.print()
-    console.print("  [bold]Step 4 — Configuring the metrics that will score your agent[/]")
     console.print("  [dim]Deterministic metrics (latency, tokens, cost) are always included — they come for free[/]")
     console.print("  [dim]from the trace. Now we'll pick the LLM-as-judge metrics that grade content quality.[/]")
     _pause()

@@ -1070,8 +1070,12 @@ def _offer_dashboard(results_dir: Path, run_dashboard: bool | None) -> None:
         )
 
     if should_launch:
+        # Dashboard is an OPTIONAL post-pipeline bonus, not part of the
+        # numbered `phases` list. Don't fake it as "Phase N/N" — that
+        # double-counted with the View phase (both rendered as "Phase 5"
+        # when --dashboard was on alongside Analyze).
         console.print()
-        console.print(Rule("  Phase 5: Dashboard  ", style="bold cyan"))
+        console.print(Rule("  Bonus: Dashboard  ", style="bold cyan"))
         console.print("  [dim]Starting interactive dashboard with all evaluation runs.[/]")
         console.print()
 

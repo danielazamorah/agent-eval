@@ -12,13 +12,13 @@ For installation and getting started, see the [README](../README.md).
 2. [Mapping to the Vertex AI eval docs sidebar](#mapping-to-the-vertex-ai-eval-docs-sidebar)
 3. [Architecture overview](#architecture-overview)
    - [The metric families](#the-metric-families)
-   - [The two execution paths](#the-two-execution-paths)
-   - [Inference strategy per path (when we use `run_inference` and when we don't)](#inference-strategy-per-path)
+   - [Two evaluation surfaces](#two-evaluation-surfaces)
+   - [Which SDK call drives which command](#which-sdk-call-drives-which-command)
    - [Dataset row schema](#dataset-row-schema)
    - [Folder layout (legacy → new)](#folder-layout-legacy--new)
    - [Custom metric patterns](#custom-metric-patterns)
-3. [Authentication](#authentication)
-3. [CLI Reference](#cli-reference)
+4. [Authentication](#authentication)
+5. [CLI Reference](#cli-reference)
    - [init](#init)
    - [run](#run)
    - [report](#report) — open the HTML report
@@ -27,17 +27,17 @@ For installation and getting started, see the [README](../README.md).
    - [interact](#interact)
    - [evaluate](#evaluate)
    - [analyze](#analyze)
-   - [agent-engine](#agent-engine)
+   - [agent-engine](#agent-engine) *(currently being re-validated — see note in section)*
    - [import](#import)
    - [migrate](#migrate)
    - [convert](#convert)
    - [create-dataset](#create-dataset)
    - [dashboard](#dashboard)
-4. [Metrics](#metrics)
+6. [Metrics](#metrics)
    - [Deterministic Metrics](#deterministic-metrics)
    - [Managed Metrics (Vertex AI)](#managed-metrics-vertex-ai)
    - [Custom LLM-as-Judge Metrics](#custom-llm-as-judge-metrics)
-5. [Creating Custom Metrics](#creating-custom-metrics)
+7. [Creating Custom Metrics](#creating-custom-metrics)
    - [Basic Structure](#basic-structure)
    - [Dataset Mapping Constraint](#dataset-mapping-constraint)
    - [Available Source Columns](#available-source-columns)
@@ -47,25 +47,26 @@ For installation and getting started, see the [README](../README.md).
    - [Binary Decomposition](#binary-decomposition)
    - [Example: Trajectory Accuracy](#example-trajectory-accuracy)
    - [Example: Tool Usage Quality](#example-tool-usage-quality)
-6. [Interaction Modes](#interaction-modes)
+8. [Interaction Modes](#interaction-modes)
    - [ADK User Sim](#adk-user-sim)
    - [DIY Interactions](#diy-interactions)
-7. [Data Formats](#data-formats)
+9. [Data Formats](#data-formats)
    - [Golden Dataset](#golden-dataset)
    - [Conversation Scenarios](#conversation-scenarios)
    - [Session Input](#session-input)
    - [Processed JSONL Fields](#processed-jsonl-fields)
-8. [Output Files](#output-files)
-   - [eval_summary.json](#eval_summaryjson)
-   - [gemini_analysis.md](#gemini_analysismd)
-   - [OPTIMIZATION_LOG.md](#optimization_logmd)
-9. [Run Comparison](#run-comparison)
-10. [Managed Metrics Catalog](#managed-metrics-catalog)
-11. [Models and Pricing](#models-and-pricing)
-12. [ADK Optimization Patterns](#adk-optimization-patterns)
-13. [AI Assistant Integration](#ai-assistant-integration)
-14. [Troubleshooting](#troubleshooting)
-15. [Experimental & on the roadmap](#experimental--on-the-roadmap)
+10. [Output Files](#output-files)
+    - [report.html](#reporthtml) — the canonical viewing surface
+    - [eval_summary.json](#eval_summaryjson)
+    - [gemini_analysis.md](#gemini_analysismd)
+    - [OPTIMIZATION_LOG.md](#optimization_logmd)
+11. [Run Comparison](#run-comparison)
+12. [Managed Metrics Catalog](#managed-metrics-catalog)
+13. [Models and Pricing](#models-and-pricing)
+14. [ADK Optimization Patterns](#adk-optimization-patterns)
+15. [AI Assistant Integration](#ai-assistant-integration)
+16. [Troubleshooting](#troubleshooting)
+17. [Experimental & on the roadmap](#experimental--on-the-roadmap)
     - [BYOD — `agent-eval ingest-traces`](#byod-bring-your-own-data--agent-eval-ingest-traces)
     - [Other deferred items from the plan](#other-deferred-items-from-the-plan)
     - [SDK features `agent-eval` doesn't surface yet](#sdk-features-agent-eval-doesnt-surface-yet)
@@ -73,6 +74,13 @@ For installation and getting started, see the [README](../README.md).
 ---
 
 ## Why this design
+
+> **TL;DR — three problems the SDK-aligned refactor (April 2026) solved:**
+> 1. Hand-maintained "metrics that need a reference" lists kept going stale → introspect the SDK at runtime.
+> 2. CLI didn't mirror the Vertex docs → reorganized one-for-one against the docs sidebar.
+> 3. Two folders + two data shapes + unclear Agent Engine story → one canonical `tests/eval/dataset.jsonl` feeds every command.
+>
+> Skim the rest if you want the *why* behind these; jump to [CLI Reference](#cli-reference) if you just need the commands.
 
 `agent-eval` exists because we wanted to use the Vertex AI Generative AI Evaluation Service to evaluate our ADK agents — and we wanted the experience of *following the docs* to be the same as the experience of *using the CLI*. This section explains the three problems the SDK-aligned refactor (April 2026) addressed, so you understand the choices reflected in the rest of this doc.
 
@@ -816,6 +824,8 @@ See [Run Comparison](#run-comparison) for details on how comparison works.
 
 ### agent-engine
 
+> ⚠️ **Currently being re-validated.** We've recently started hitting an issue when sending the inference request via `create_evaluation_run()`. The local pipeline (`agent-eval run`) works as expected. If we don't get this fixed before publishing, the full investigation + recovery plan will move into `docs/FUTURE_WORK.md` for contributors to pick up. The command is documented here for completeness — feel free to skip ahead to the next section.
+
 The **streamlined Agent Engine pass** — for agents deployed to a Reasoning Engine. Wraps `client.evals.create_evaluation_run()` so Vertex handles inference, scoring, and GCS upload in one managed call. This is additive to the local pipeline; you don't choose between them.
 
 ```bash
@@ -1347,7 +1357,20 @@ The evaluation pipeline produces JSONL with these fields:
 
 ## Output Files
 
-Results are saved to `eval/results/<run-id>/`:
+Results are saved to `tests/eval/results/<run-id>/`. **Start with `report.html`** — every other file is also rendered into it.
+
+### report.html
+
+The canonical viewing surface. A single self-contained file (~25-1500 KB depending on dataset size) — Chart.js + marked.js via CDN, all data embedded as JSON. Email it, attach to a ticket, drop in Slack. Auto-generated by `agent-eval analyze` (and therefore `agent-eval run`); re-open anytime with `agent-eval report`. Four tabs:
+
+- **Overview** — 4 stat tiles (cost / wall-clock / cache / tokens), LLM-judge radar with the previous run overlaid as a dashed baseline, score table with Pass/Mixed/Low pills + Δ deltas, full deterministic metrics table, and a **simulation vs interaction** side-by-side breakdown when both sources have data.
+- **Per-Question** — color-graded heatmap (rows × LLM metrics) plus a deep-dive accordion per question: run-time metric strip, full conversation thread, every tool call (args + results, failures auto-expand and the section header flags how many failed), final session state, agent path, system instruction, tool declarations, thinking trace, per-metric rubric verdicts with reasoning.
+- **Iteration History** — Chart.js trend line built natively from each prior `eval_summary.json` plus per-iteration cards with deltas, git commit + branch + dirty flag.
+- **AI Analysis** — rendered `gemini_analysis.md` (markdown via marked.js).
+
+The raw `gemini_analysis.md`, `question_answer_log.md`, and `OPTIMIZATION_LOG.md` are still written to disk for tooling that wants markdown — but the HTML is the recommended viewing surface.
+
+
 
 ```
 eval/results/<run-id>/

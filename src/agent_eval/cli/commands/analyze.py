@@ -295,8 +295,22 @@ def analyze(results_dir, agent_dir, compare_to, focus, strategy_file, report_aud
 
     analyzer = Analyzer(config)
 
+    # Wrap analyzer.run() in a spinner so the multi-second Gemini call
+    # doesn't look like the CLI froze. Mirrors the pattern used 8x in
+    # init.py for other Gemini calls. Skipped under --skip-gemini since
+    # there's no slow blocking step in that case, and skipped when output
+    # isn't a TTY (CI / piped runs) so logs stay clean.
+    use_spinner = (not skip_gemini) and sys.stdout.isatty() and not _pauses_disabled()
     try:
-        analysis_result = analyzer.run()
+        if use_spinner:
+            with console.status(
+                "[bold blue]  Analyzing run with Gemini "
+                "[dim](compares to previous run, drafts diagnosis with code citations)[/][/]",
+                spinner="dots",
+            ):
+                analysis_result = analyzer.run()
+        else:
+            analysis_result = analyzer.run()
     except Exception as e:
         console.print(f"\n[bold red]Error during analysis:[/] {e}")
         import traceback
